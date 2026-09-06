@@ -15,17 +15,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub mod actor;
 pub mod decide;
 pub mod gateway;
+pub mod live_worker;
 pub mod ninja_sampler;
 pub mod poll;
 
 pub use actor::{
-    RuntimeCommand, RuntimeError, RuntimeEvent, RuntimeHandle, RuntimePaths, WatchRunState,
-    WatchStatus,
+    HideoutOutcome, RuntimeCommand, RuntimeError, RuntimeEvent, RuntimeHandle, RuntimePaths,
+    WatchRunState, WatchStatus,
 };
 pub use decide::{Decision, MatchedListing, coalesce, decide};
 pub use gateway::{
     GatewayError, GatewayEvent, GatewayHandle, GatewayMessage, GatewayReply, GatewayRequest,
     Priority, ReplyKind, RequestKind, RequestTag, SearchOutcome, TradeGateway, TradeTransport,
+};
+pub use live_worker::{
+    LiveConnector, LiveEvent, LiveOffReason, LiveRunState, LiveStream, LiveWorkerConfig,
+    LiveWorkerHandle, TungsteniteConnector, backoff_delay, jitter_for, next_attempt,
+    run_live_worker, spawn_live_worker,
 };
 pub use ninja_sampler::{
     SamplerConfig, SamplerError, SamplerEvent, SamplerHandle, SamplerPlan, SamplerStage,

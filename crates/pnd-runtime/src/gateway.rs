@@ -120,9 +120,13 @@ pub enum Priority {
 
 /// 请求的来源标签,原样跟着回信走 —— actor 靠它认出"这封回信是哪条搜索的
 /// 哪一步"。网关自己不看这里面的内容。
+///
+/// `alert_id` 是"去藏身处"那条链路用的:那次刷新 token 的 fetch 和随后的
+/// whisper 都不属于任何一轮轮询,回信要认的是提醒记录里的行号。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestTag {
     pub watch_id: Option<WatchId>,
+    pub alert_id: Option<i64>,
     pub label: &'static str,
 }
 
@@ -193,6 +197,9 @@ pub enum GatewayEvent {
     Budget {
         policy: String,
         usage: Vec<BucketUsage>,
+        /// 这条策略还要等几秒才放行下一封请求(界面上那句"N 秒后可用")。
+        /// `None` = 现在就能发,或者还没学到任何限速头。
+        next_allowed_in_secs: Option<u64>,
     },
     /// 带了 cookie,可服务端的限速规则里没有 `Account` —— 会话已经失效。
     SessionInvalid,
@@ -308,6 +315,19 @@ fn policy_for(kind: &RequestKind) -> &'static str {
         RequestKind::Whisper { .. } => WHISPER_POLICY_PLACEHOLDER,
     }
 }
+
+/// 这条策略还要等几秒。
+///
+/// 两种情况都回 `None`:现在就能发(等 0 秒不值得在界面上显示),以及限速器
+/// 给出一个荒唐的远未来 —— 那是"还有请求在途、上限还没学到"的哨兵值
+/// (见 `RateLimiter::next_request_time`),不是真的要等一万年。
+fn next_allowed_in(limiter: &mut RateLimiter, policy: &str, now: i64) -> Option<u64> {
+    let wait = limiter.next_request_time(policy, now).saturating_sub(now);
+    (wait > 0 && wait <= MAX_REPORTED_WAIT_SECS).then_some(wait as u64)
+}
+
+/// 超过一天的等待一律当"不知道"。真实的限速窗口最长 6 小时。
+const MAX_REPORTED_WAIT_SECS: i64 = 86_400;
 
 /// 这个响应是不是 Cloudflare 的拦截页;是的话整条队列停到什么时候。
 ///
@@ -542,9 +562,11 @@ impl TradeGateway {
         }
 
         let usage = self.limiter.budget_view(&policy, done_at);
+        let next_allowed_in_secs = next_allowed_in(&mut self.limiter, &policy, done_at);
         self.emit(GatewayEvent::Budget {
             policy: policy.clone(),
             usage,
+            next_allowed_in_secs,
         });
 
         if response.status == 429 {
@@ -656,6 +678,7 @@ mod gateway_tests {
                 reply: tx,
                 tag: RequestTag {
                     watch_id: None,
+                    alert_id: None,
                     label: "test",
                 },
             },
@@ -742,5 +765,106 @@ mod gateway_tests {
         assert_eq!(hold_until(403, false, 1_000), None);
         assert_eq!(hold_until(200, true, 1_000), None);
         assert_eq!(hold_until(429, true, 1_000), None);
+    }
+
+    /// 一个 429 之后,广播里必须带上"还要等几秒" —— 界面上那句
+    /// "next allowed in N s" 就是从这里来的。
+    #[test]
+    fn a_429_tells_the_ui_how_long_it_has_to_wait() {
+        /// 只会回 429 的假交易站,响应头是今天从服务端量到的那一组。
+        struct AlwaysRateLimited;
+
+        fn rate_limited() -> Result<TradeResponse, TransportError> {
+            let headers = [
+                ("X-Rate-Limit-Policy", "trade-search-request-limit"),
+                ("X-Rate-Limit-Rules", "Ip"),
+                ("X-Rate-Limit-Ip", "5:10:60,15:60:300"),
+                ("X-Rate-Limit-Ip-State", "5:10:60,6:60:0"),
+                ("Retry-After", "30"),
+            ];
+            Ok(TradeResponse {
+                status: 429,
+                body: b"{}".to_vec(),
+                rate: pnd_trade::parse_rate_headers(headers),
+                looks_like_html: false,
+            })
+        }
+
+        impl TradeTransport for AlwaysRateLimited {
+            fn search(
+                &self,
+                _league: &str,
+                _body_json: &str,
+                _session: Option<&str>,
+            ) -> Result<TradeResponse, TransportError> {
+                rate_limited()
+            }
+
+            fn fetch(
+                &self,
+                _ids: &[String],
+                _search_id: &str,
+                _session: Option<&str>,
+            ) -> Result<TradeResponse, TransportError> {
+                rate_limited()
+            }
+
+            fn whisper(
+                &self,
+                _token: &str,
+                _session: &str,
+                _referer: &str,
+            ) -> Result<TradeResponse, TransportError> {
+                rate_limited()
+            }
+        }
+
+        let (events_tx, events_rx) = channel();
+        let (reply_tx, _reply_rx) = channel();
+        let gateway = TradeGateway::start(
+            Box::new(AlwaysRateLimited),
+            Budget::default(),
+            None,
+            events_tx,
+        );
+        gateway.submit(GatewayRequest {
+            kind: search(),
+            priority: Priority::PollSearch,
+            reply: reply_tx,
+            tag: RequestTag {
+                watch_id: None,
+                alert_id: None,
+                label: "test",
+            },
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut seen: Vec<GatewayEvent> = Vec::new();
+        while std::time::Instant::now() < deadline {
+            match events_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(event) => {
+                    let done = matches!(event, GatewayEvent::Budget { .. });
+                    seen.push(event);
+                    if done {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        drop(gateway);
+
+        let waited = seen
+            .iter()
+            .find_map(|event| match event {
+                GatewayEvent::Budget {
+                    next_allowed_in_secs,
+                    ..
+                } => Some(*next_allowed_in_secs),
+                _ => None,
+            })
+            .expect("a Budget broadcast");
+        // 服务端说 Retry-After: 30,限速器再加一秒的安全垫。
+        assert_eq!(waited, Some(30), "saw {seen:#?}");
     }
 }

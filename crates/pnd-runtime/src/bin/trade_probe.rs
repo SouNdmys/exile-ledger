@@ -14,11 +14,20 @@
 //!     [--cap 20 --currency divine] [--rounds 3] [--session <POESESSID>] \
 //!     [--rates chaos=25.21,exalted=83.42]
 //!
-//! # 蹲价模式:起真的 actor(网关 + 轮询 + 判定 + 汇率线程),把事件流印出来
+//! # 蹲价模式:起真的 actor(网关 + 轮询 + live + 判定 + 汇率线程),把事件流印出来
 //! cargo run -p pnd-runtime --bin trade_probe -- \
 //!     --watch --minutes 3 --poll-seconds 60 \
-//!     --search <搜索URL或id> [--search <第二条>] [--cap 20 --currency divine]
+//!     --search <搜索URL或id> [--search <第二条>] [--cap 20 --currency divine] \
+//!     [--hideout <alert_id>]
 //! ```
+//!
+//! 蹲价模式每条状态行里都带着 live 那一头的档位(`live off` / `live connecting` /
+//! `live up 42s` / `live retry #2 in 18s` / `live disabled: no session`)。
+//! 没有 POESESSID 的机器上它就是 `live disabled: no session`,轮询照常跑 ——
+//! 这正是"没会话也要能安静地退回轮询"的取证。
+//!
+//! `--hideout <alert_id>` 发一条 `TravelToHideout` 命令。同样,没有会话的
+//! 机器上唯一能看到的是 `no session`,那就是预期输出。
 //!
 //! 蹲价模式里,探针**一行判定逻辑都没有**:它只是造一份内存里的 `AppSettings`、
 //! 起一个 [`RuntimeHandle`],然后把收到的事件翻译成人话。界面将来做的事和
@@ -37,7 +46,10 @@ use pnd_domain::{
     judge, parse_search_reference, search_page_url, search_request_body,
 };
 use pnd_ninja::client::NinjaClient;
-use pnd_runtime::actor::{RuntimeEvent, RuntimeHandle, RuntimePaths, WatchStatus};
+use pnd_runtime::actor::{
+    HideoutOutcome, RuntimeCommand, RuntimeEvent, RuntimeHandle, RuntimePaths, WatchStatus,
+};
+use pnd_runtime::live_worker::{LiveOffReason, LiveRunState};
 use pnd_runtime::now_secs;
 use pnd_settings::{AppSettings, WatchEntry};
 use pnd_trade::client::{MAX_FETCH_IDS, TradeClient, parse_search_response};
@@ -62,7 +74,7 @@ const USAGE: &str = "usage: trade_probe --search <url|id> [--league \"Forbidden 
 [--cap 20] [--currency divine] [--rounds 1] [--session <POESESSID>] \
 [--rates chaos=25.21,exalted=83.42]\n       \
 trade_probe --watch --minutes 3 [--poll-seconds 60] --search <url|id> [--search <url|id>] \
-[--cap 20] [--currency divine] [--session <POESESSID>]";
+[--cap 20] [--currency divine] [--session <POESESSID>] [--hideout <alert_id>]";
 
 /// 蹲价模式里多久抽一次事件。事件通道是无界的,抽得慢只是屏幕上晚一点看到,
 /// 不会丢。
@@ -218,6 +230,17 @@ fn run_watch(args: &Args) -> Result<(), String> {
 
     let handle = RuntimeHandle::start(settings, RuntimePaths::in_memory())
         .map_err(|error| error.to_string())?;
+
+    // `--hideout` 是给"点一次去藏身处"这条链路取证用的。库开在内存里,
+    // 所以这个号一般查不到东西 —— 没有会话的机器上会先撞上 NoSession,
+    // 那正是这台机器上的预期输出。
+    if let Some(alert_id) = args.hideout {
+        println!("{} hideout   asking for alert {alert_id}", stamp());
+        handle
+            .try_send(RuntimeCommand::TravelToHideout { alert_id })
+            .map_err(|error| error.to_string())?;
+    }
+
     let deadline = Instant::now() + Duration::from_secs(args.minutes * 60);
     while Instant::now() < deadline {
         match handle.try_next_event() {
@@ -247,8 +270,25 @@ fn print_event(event: &RuntimeEvent, labels: &BTreeMap<String, String>) {
                 describe_status(status)
             );
         }
-        RuntimeEvent::Budget { policy, usage } => {
-            println!("{at} budget    {policy}: {}", describe_budget(usage));
+        RuntimeEvent::Budget {
+            policy,
+            usage,
+            next_allowed_in_secs,
+        } => {
+            println!(
+                "{at} budget    {policy}: {}{}",
+                describe_budget(usage),
+                match next_allowed_in_secs {
+                    Some(secs) => format!("  next allowed in {secs}s"),
+                    None => String::new(),
+                }
+            );
+        }
+        RuntimeEvent::HideoutResult { alert_id, outcome } => {
+            println!(
+                "{at} hideout   alert {alert_id}: {}",
+                describe_hideout(outcome)
+            );
         }
         RuntimeEvent::ListingMatched(matched) => {
             let listing = &matched.headline;
@@ -282,9 +322,52 @@ fn print_event(event: &RuntimeEvent, labels: &BTreeMap<String, String>) {
     }
 }
 
+/// 一次"去藏身处"的结果翻译成人话。这个探针跑在没有 POESESSID 的机器上时,
+/// 唯一能看到的就是 `NoSession` —— 那正是预期输出。
+fn describe_hideout(outcome: &HideoutOutcome) -> String {
+    match outcome {
+        HideoutOutcome::Sent => "sent — the game should show a travel invite".to_string(),
+        HideoutOutcome::NoSession => {
+            "no session — /whisper needs a POESESSID in settings.json".to_string()
+        }
+        HideoutOutcome::TokenMissing => {
+            "no hideout_token on that listing (it was fetched anonymously)".to_string()
+        }
+        HideoutOutcome::Refreshed => "token was stale — fetched a fresh one, retrying".to_string(),
+        HideoutOutcome::Failed { status, message } => {
+            format!("failed (status {status}): {message}")
+        }
+    }
+}
+
+/// live 那一头的档位。`describe_status` 会把它接在轮询档位后面。
+fn describe_live(state: LiveRunState) -> String {
+    let now = now_secs();
+    match state {
+        LiveRunState::Off => "live off".to_string(),
+        LiveRunState::Disabled(reason) => format!("live disabled: {}", live_reason(reason)),
+        LiveRunState::Connecting => "live connecting".to_string(),
+        LiveRunState::Connected { since } => format!("live up {}s", (now - since).max(0)),
+        LiveRunState::Backoff { until, attempt } => {
+            format!("live retry #{attempt} in {}s", (until - now).max(0))
+        }
+        LiveRunState::Held { until } => {
+            format!("live held (cloudflare) {}s", (until - now).max(0))
+        }
+    }
+}
+
+fn live_reason(reason: LiveOffReason) -> &'static str {
+    match reason {
+        LiveOffReason::NoSession => "no session",
+        LiveOffReason::TooMany => "too many live connections",
+        LiveOffReason::SessionInvalid => "session invalid",
+    }
+}
+
 fn describe_status(status: &WatchStatus) -> String {
     let now = now_secs();
-    let mut parts = vec![format!("{:?}", status.state)];
+    let mut parts = vec![format!("{:?}", status.state), describe_live(status.live)];
     if let Some(at) = status.next_poll_at {
         parts.push(format!("next in {}s", (at - now).max(0)));
     }
@@ -644,6 +727,8 @@ struct Args {
     watch: bool,
     minutes: u64,
     poll_seconds: u64,
+    /// `--hideout <alert_id>`:蹲价模式下发一条 `TravelToHideout` 命令。
+    hideout: Option<i64>,
 }
 
 impl Args {
@@ -665,6 +750,7 @@ impl Args {
         let mut watch = false;
         let mut minutes: u64 = 3;
         let mut poll_seconds: u64 = 300;
+        let mut hideout: Option<i64> = None;
 
         let mut args = args.peekable();
         while let Some(flag) = args.next() {
@@ -705,6 +791,13 @@ impl Args {
                         return Err("--rounds must be at least 1".to_string());
                     }
                 }
+                "--hideout" => {
+                    let raw = value()?;
+                    hideout = Some(
+                        raw.parse::<i64>()
+                            .map_err(|_| format!("--hideout wants an alert id, got {raw:?}"))?,
+                    );
+                }
                 "--session" => session = Some(value()?),
                 "--rates" => rates = Some(parse_rates(&value()?)?),
                 "-h" | "--help" => return Err("help".to_string()),
@@ -728,6 +821,7 @@ impl Args {
             // 低于 60 秒对交易站不礼貌;`AppSettings::normalize` 也会兜这一下,
             // 这里先兜是为了打印出来的数就是真正会用的数。
             poll_seconds: poll_seconds.max(60),
+            hideout,
         })
     }
 }

@@ -160,7 +160,7 @@ impl AppShell {
                 self.watch_status.insert(watch_id, status);
                 self.watches_dirty = true;
             }
-            RuntimeEvent::Budget { policy, usage } => {
+            RuntimeEvent::Budget { policy, usage, .. } => {
                 self.budget.insert(policy, usage);
             }
             RuntimeEvent::ListingMatched(matched) => {
@@ -186,6 +186,11 @@ impl AppShell {
                 self.watches_dirty = true;
                 // 暗金榜那一列写的是"N exalted ≈ M divine",换算就靠这份汇率。
                 self.uniques_dirty = true;
+            }
+            // 去藏身处的结果先只进日志;卡片脚注和提醒表的显示是下一步。
+            RuntimeEvent::HideoutResult { alert_id, outcome } => {
+                self.push_log(format!("hideout: alert {alert_id} → {outcome:?}"));
+                self.refresh_alerts_soon();
             }
             RuntimeEvent::Log(line) => self.push_log(line),
             RuntimeEvent::Fault(line) => {
