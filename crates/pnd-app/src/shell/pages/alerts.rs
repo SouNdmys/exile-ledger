@@ -9,15 +9,15 @@
 
 use gpui::{Context, ParentElement, SharedString, Styled, div, px};
 use gpui_component::button::Button;
-use gpui_component::{Sizable as _, Size};
+use gpui_component::{Disableable as _, Sizable as _, Size};
 
 use pnd_runtime::RuntimeCommand;
 use pnd_storage::{AlertRow, AlertSource};
 
 use super::{Cell, TableContent, column, number_column};
 use crate::i18n::Text;
-use crate::shell::link::local_stamp;
-use crate::shell::{AppShell, page_heading, panel, table};
+use crate::shell::link::{hideout_action_text, local_stamp};
+use crate::shell::{AppShell, hint, page_heading, panel, table};
 
 /// 提醒表的列。行由 [`table_content_for`] 填。
 pub fn table_content(text: &'static Text) -> TableContent {
@@ -28,7 +28,8 @@ pub fn table_content(text: &'static Text) -> TableContent {
             number_column("price", text.alerts_col_price, 90.),
             column("seller", text.alerts_col_seller, 150.),
             column("source", text.alerts_col_source, 70.),
-            column("action", text.alerts_col_action, 140.),
+            // "去藏身处:正在换 token" 是这一列里最长的一句,窄了会被裁掉。
+            column("action", text.alerts_col_action, 200.),
         ],
         rows: Vec::new(),
         empty: text.alerts_empty.into(),
@@ -63,14 +64,16 @@ fn alert_cells(row: &AlertRow, text: &'static Text) -> Vec<Cell> {
 
 /// "动作"那一格。
 ///
-/// 动作码是 `pnd-app` 自己写进去的(卡片按钮和这一页共用),所以这里认得全;
-/// 认不出来的原样显示 —— 以后加了新动作忘了翻译,至少看得出发生过什么。
+/// 动作码有两个来源:界面自己写的("open"/"copy")和 runtime 写的
+/// (`HideoutOutcome::action()` 那几个 `hideout_*`)。两边都认得;认不出来的
+/// 原样显示 —— 以后加了新动作忘了翻译,至少看得出发生过什么。
 fn action_text(row: &AlertRow, text: &'static Text) -> String {
     match row.last_action.as_deref() {
         Some("open") => text.alerts_action_opened.to_owned(),
         Some("copy") => text.alerts_action_copied.to_owned(),
-        Some("hideout_unavailable") => text.alerts_action_hideout_unavailable.to_owned(),
-        Some(other) => other.to_owned(),
+        Some(other) => {
+            hideout_action_text(other, text).map_or_else(|| other.to_owned(), ToOwned::to_owned)
+        }
         None if row.dismissed_at.is_some() => text.alerts_action_dismissed.to_owned(),
         None => text.alerts_action_none.to_owned(),
     }
@@ -83,6 +86,9 @@ impl AppShell {
             || text.common_select_row.to_owned(),
             |row| format!("{} · {}", local_stamp(row.fired_at), row.item_name),
         );
+        // 去藏身处必须带会话:没有 cookie 就把按钮变灰,并在下面说明为什么。
+        // 让它能按、按了再回一句"没有会话",是白让人点一下。
+        let no_session = self.settings.poesessid.trim().is_empty();
         div()
             .flex()
             .flex_col()
@@ -129,6 +135,7 @@ impl AppShell {
                         Button::new("alert-hideout")
                             .label(text.alerts_hideout)
                             .with_size(Size::Small)
+                            .disabled(no_session)
                             .on_click(
                                 cx.listener(|this, _, _, cx| this.hideout_selected_alert(cx)),
                             ),
@@ -142,6 +149,7 @@ impl AppShell {
                             ),
                     ),
             )
+            .children(no_session.then(|| hint(text.alerts_hideout_needs_session)))
     }
 
     /// 表格里选中的那条提醒。
@@ -177,15 +185,13 @@ impl AppShell {
         cx.notify();
     }
 
-    /// 去藏身处是第二阶段的功能。这里只说一句并记一笔,**不发任何请求**。
+    /// 给这条提醒的卖家发一次传送请求。**按一次发一次**,程序自己不会补第二次。
     fn hideout_selected_alert(&mut self, cx: &mut Context<Self>) {
-        let text = self.text();
         let Some(alert_id) = self.selected_alert(cx).map(|row| row.alert_id) else {
             self.select_an_alert_first(cx);
             return;
         };
-        self.set_notice(text.notice_hideout_phase_two.to_owned());
-        self.record_action(alert_id, "hideout_unavailable");
+        self.travel_to_hideout(alert_id);
         cx.notify();
     }
 
@@ -270,11 +276,42 @@ mod alerts_page_tests {
         for (code, shown) in [
             ("open", "opened"),
             ("copy", "whisper copied"),
-            ("hideout_unavailable", "hideout: phase 2"),
+            ("hideout_sent", "hideout: sent"),
+            ("hideout_no_session", "hideout: no session"),
             ("something-new", "something-new"),
         ] {
             row.last_action = Some(code.to_string());
             assert_eq!(action_text(&row, text), shown);
+        }
+    }
+
+    /// runtime 写进 `last_action` 的每一个码,这一页都得认得。
+    ///
+    /// 码是 `HideoutOutcome::action()` 定的:直接遍历它,而不是照着抄一份
+    /// 清单 —— 抄的那份迟早会落后,而落后的表现是动作列上突然冒出
+    /// `hideout_token_missing` 这种给机器看的字。
+    #[test]
+    fn every_hideout_outcome_code_has_a_translation() {
+        let outcomes = [
+            pnd_runtime::HideoutOutcome::Sent,
+            pnd_runtime::HideoutOutcome::NoSession,
+            pnd_runtime::HideoutOutcome::TokenMissing,
+            pnd_runtime::HideoutOutcome::Refreshed,
+            pnd_runtime::HideoutOutcome::Failed {
+                status: 503,
+                message: "busy".to_string(),
+            },
+        ];
+        for language in i18n::LANGUAGES {
+            let text = i18n::text(language);
+            let mut row = row();
+            for outcome in &outcomes {
+                let code = outcome.action();
+                row.last_action = Some(code.to_string());
+                let shown = action_text(&row, text);
+                assert_ne!(shown, code, "{language} 的 {code} 没翻译");
+                assert!(!shown.trim().is_empty());
+            }
         }
     }
 }

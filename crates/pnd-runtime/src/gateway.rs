@@ -130,12 +130,31 @@ pub struct RequestTag {
     pub label: &'static str,
 }
 
-/// 三种请求。请求体已经拼好了:网关不认识查询 JSON 长什么样。
+/// 四种请求。请求体已经拼好了:网关不认识查询 JSON 长什么样。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestKind {
-    Search { league: String, body_json: String },
-    Fetch { ids: Vec<String>, search_id: String },
-    Whisper { token: String, referer: String },
+    Search {
+        league: String,
+        body_json: String,
+    },
+    /// 和 `Search` 发的是一模一样的请求,只是**要的东西不同**:回信里带的
+    /// 不是挂单 id,而是这次响应的限速规则名 —— 设置页上那个"测试会话"
+    /// 就靠规则里有没有 `Account` 判断 cookie 还活着没有。
+    ///
+    /// 单独一种而不是复用 `Search`:限速头是每封响应都有的东西,让所有
+    /// 搜索回信都拖着一份规则名,只为了一个按钮,不划算。
+    SessionCheck {
+        league: String,
+        body_json: String,
+    },
+    Fetch {
+        ids: Vec<String>,
+        search_id: String,
+    },
+    Whisper {
+        token: String,
+        referer: String,
+    },
 }
 
 /// 一封投进网关邮箱的请求。`reply` 是回信地址:谁投的谁给一个 `Sender`,
@@ -154,6 +173,20 @@ pub struct SearchOutcome {
     pub id: String,
     pub total: u64,
     pub result: Vec<String>,
+}
+
+/// 一次会话检查看到的东西。
+///
+/// 只有限速头这一样:响应体是什么不重要(哪怕交易站回一句"没找到"也行),
+/// 重要的是服务端按哪些规则给这次请求限速。带了 cookie 却只回 `Ip`,
+/// 就说明它根本没认出这个会话。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCheckOutcome {
+    pub status: u16,
+    /// 服务端说的规则名(`Ip`、`Account`…)。没有限速头时是空的。
+    pub rules: Vec<String>,
+    /// 规则里有 `Account` —— 也就是"这个 POESESSID 还认得出来"。
+    pub mentions_account: bool,
 }
 
 /// 一次请求失败的原因。分这几类是因为上层的处置不同:`Transport` 和 `Status`
@@ -177,6 +210,7 @@ pub enum GatewayError {
 #[derive(Debug)]
 pub enum ReplyKind {
     Search(Result<SearchOutcome, GatewayError>),
+    SessionCheck(Result<SessionCheckOutcome, GatewayError>),
     Fetch(Result<Vec<ListingSummary>, GatewayError>),
     /// whisper 只回一个状态码:200 = 发出去了,503 多半是 token 过期。
     Whisper(Result<u16, GatewayError>),
@@ -310,7 +344,8 @@ fn pick_runnable(
 /// whisper 用占位串(见 [`WHISPER_POLICY_PLACEHOLDER`])。
 fn policy_for(kind: &RequestKind) -> &'static str {
     match kind {
-        RequestKind::Search { .. } => SEARCH_POLICY,
+        // 会话检查发的就是一次 search,它当然要从 search 的预算里出。
+        RequestKind::Search { .. } | RequestKind::SessionCheck { .. } => SEARCH_POLICY,
         RequestKind::Fetch { .. } => FETCH_POLICY,
         RequestKind::Whisper { .. } => WHISPER_POLICY_PLACEHOLDER,
     }
@@ -515,7 +550,8 @@ impl TradeGateway {
 
         let ticket = self.limiter.insert_request(&policy, now);
         let response = match &pending.request.kind {
-            RequestKind::Search { league, body_json } => {
+            RequestKind::Search { league, body_json }
+            | RequestKind::SessionCheck { league, body_json } => {
                 self.transport.search(league, body_json, session.as_deref())
             }
             RequestKind::Fetch { ids, search_id } => {
@@ -592,6 +628,18 @@ impl TradeGateway {
             return;
         }
 
+        // 会话检查问的是限速头,不是响应体:服务端就算回一句 400,头里
+        // 有没有 `Account` 一样说明了 cookie 的死活,所以它不走下面那条
+        // "非 2xx 就当失败"的路。
+        if matches!(pending.request.kind, RequestKind::SessionCheck { .. }) {
+            let kind = ReplyKind::SessionCheck(Ok(session_check_outcome(&response)));
+            let _ = pending.request.reply.send(GatewayReply {
+                tag: pending.request.tag,
+                kind,
+            });
+            return;
+        }
+
         if !response.is_success() {
             self.reply(pending, GatewayError::Status(response.status));
             return;
@@ -635,9 +683,24 @@ impl TradeGateway {
     }
 }
 
+/// 一封响应 → 会话检查要的那三样。没有限速头(响应根本不是交易站回的)
+/// 就是"没有规则",调用方据此说"看不出来"。
+fn session_check_outcome(response: &TradeResponse) -> SessionCheckOutcome {
+    let rate = response.rate.as_ref();
+    SessionCheckOutcome {
+        status: response.status,
+        rules: rate.map(|rate| rate.rules.clone()).unwrap_or_default(),
+        mentions_account: rate.is_some_and(pnd_trade::RateHeaders::mentions_account),
+    }
+}
+
 /// 2xx 响应 → 解析好的回信。解析失败也是一封回信,不是 panic。
 fn success_reply(kind: &RequestKind, response: &TradeResponse) -> ReplyKind {
     match kind {
+        // `execute` 在到这儿之前就把会话检查回掉了。
+        RequestKind::SessionCheck { .. } => {
+            ReplyKind::SessionCheck(Ok(session_check_outcome(response)))
+        }
         RequestKind::Search { .. } => ReplyKind::Search(
             parse_search_response(&response.body)
                 .map(|parsed| SearchOutcome {
@@ -658,6 +721,7 @@ fn success_reply(kind: &RequestKind, response: &TradeResponse) -> ReplyKind {
 fn error_reply(kind: &RequestKind, error: GatewayError) -> ReplyKind {
     match kind {
         RequestKind::Search { .. } => ReplyKind::Search(Err(error)),
+        RequestKind::SessionCheck { .. } => ReplyKind::SessionCheck(Err(error)),
         RequestKind::Fetch { .. } => ReplyKind::Fetch(Err(error)),
         RequestKind::Whisper { .. } => ReplyKind::Whisper(Err(error)),
     }
@@ -706,6 +770,14 @@ mod gateway_tests {
     fn policy_names_follow_the_request_kind() {
         assert_eq!(policy_for(&search()), SEARCH_POLICY);
         assert_eq!(policy_for(&fetch()), FETCH_POLICY);
+        // 会话检查花的是 search 的额度:它就是一次 search。
+        assert_eq!(
+            policy_for(&RequestKind::SessionCheck {
+                league: "Forbidden Rites".to_string(),
+                body_json: "{}".to_string()
+            }),
+            SEARCH_POLICY
+        );
         assert_eq!(
             policy_for(&RequestKind::Whisper {
                 token: "t".to_string(),
@@ -756,6 +828,40 @@ mod gateway_tests {
         let queue = vec![pending(Priority::User, 0, 150, search())];
         assert_eq!(pick_runnable(&queue, &BTreeMap::new(), 100), None);
         assert_eq!(pick_runnable(&queue, &BTreeMap::new(), 150), Some(0));
+    }
+
+    /// 会话检查只看限速头:规则里有 `Account` 就是认得,没有就是不认得,
+    /// 连限速头都没有(响应压根不是交易站回的)就两样都没有。
+    #[test]
+    fn a_session_check_reads_the_rule_names_off_the_headers() {
+        let response = |rules: &str| TradeResponse {
+            status: 200,
+            body: b"{}".to_vec(),
+            rate: pnd_trade::parse_rate_headers([
+                ("X-Rate-Limit-Policy", SEARCH_POLICY),
+                ("X-Rate-Limit-Rules", rules),
+            ]),
+            looks_like_html: false,
+        };
+
+        let good = session_check_outcome(&response("Ip,Account"));
+        assert!(good.mentions_account);
+        assert_eq!(good.rules, ["Ip", "Account"]);
+        assert_eq!(good.status, 200);
+
+        let anonymous = session_check_outcome(&response("Ip"));
+        assert!(!anonymous.mentions_account);
+        assert_eq!(anonymous.rules, ["Ip"]);
+
+        let headerless = session_check_outcome(&TradeResponse {
+            status: 403,
+            body: b"{}".to_vec(),
+            rate: None,
+            looks_like_html: false,
+        });
+        assert!(!headerless.mentions_account);
+        assert!(headerless.rules.is_empty());
+        assert_eq!(headerless.status, 403);
     }
 
     #[test]

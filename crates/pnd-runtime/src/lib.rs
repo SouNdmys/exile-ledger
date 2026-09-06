@@ -26,7 +26,8 @@ pub use actor::{
 pub use decide::{Decision, MatchedListing, coalesce, decide};
 pub use gateway::{
     GatewayError, GatewayEvent, GatewayHandle, GatewayMessage, GatewayReply, GatewayRequest,
-    Priority, ReplyKind, RequestKind, RequestTag, SearchOutcome, TradeGateway, TradeTransport,
+    Priority, ReplyKind, RequestKind, RequestTag, SearchOutcome, SessionCheckOutcome, TradeGateway,
+    TradeTransport,
 };
 pub use live_worker::{
     LiveConnector, LiveEvent, LiveOffReason, LiveRunState, LiveStream, LiveWorkerConfig,

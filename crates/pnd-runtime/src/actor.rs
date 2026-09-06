@@ -34,7 +34,7 @@ use thiserror::Error;
 use crate::decide::{Decision, MatchedListing, coalesce, decide};
 use crate::gateway::{
     GatewayError, GatewayEvent, GatewayHandle, GatewayReply, GatewayRequest, Priority, ReplyKind,
-    RequestKind, RequestTag, SearchOutcome, TradeGateway, TradeTransport,
+    RequestKind, RequestTag, SearchOutcome, SessionCheckOutcome, TradeGateway, TradeTransport,
 };
 use crate::live_worker::{
     LiveConnector, LiveEvent, LiveOffReason, LiveRunState, LiveWorkerConfig, LiveWorkerHandle,
@@ -60,6 +60,8 @@ const LIVE_FETCH_LABEL: &str = "live-fetch";
 /// "去藏身处"链路上的两步。
 const HIDEOUT_FETCH_LABEL: &str = "hideout-fetch";
 const HIDEOUT_WHISPER_LABEL: &str = "hideout-whisper";
+/// 设置页那个"测试会话"发出去的一次搜索。
+const SESSION_CHECK_LABEL: &str = "session-check";
 
 /// hideout_token 超过这么久就当它过期了,点按钮时先重新 fetch 一次。
 /// 计划里定的 10 分钟 —— 那是个短命 JWT。
@@ -105,6 +107,9 @@ pub enum RuntimeCommand {
     TravelToHideout {
         alert_id: i64,
     },
+    /// 设置页上的"测试会话":拿现在这个 POESESSID 发一次搜索,看服务端
+    /// 认不认它。花掉一次 search 额度,所以也只在用户点的时候发。
+    TestSession,
     Shutdown,
 }
 
@@ -199,6 +204,12 @@ pub enum RuntimeEvent {
     HideoutResult {
         alert_id: i64,
         outcome: HideoutOutcome,
+    },
+    /// 一次"测试会话"的结果。`detail` 是给人看的技术细节(状态码 + 规则名),
+    /// 界面把它原样挂在按钮旁边 —— 不认得的失败也就有话可说。
+    SessionChecked {
+        valid: bool,
+        detail: String,
     },
     /// POESESSID 失效了,程序已经停用它。
     SessionInvalid,
@@ -627,6 +638,7 @@ impl RuntimeActor {
             RuntimeCommand::TravelToHideout { alert_id } => {
                 self.travel_to_hideout(alert_id, now);
             }
+            RuntimeCommand::TestSession => self.test_session(),
             RuntimeCommand::Shutdown => self.shutdown = true,
         }
     }
@@ -1110,20 +1122,29 @@ impl RuntimeActor {
 
     fn handle_reply(&mut self, reply: GatewayReply) {
         let now = now_secs();
+        let GatewayReply { tag, kind } = reply;
+        // 会话检查既不属于哪条搜索,也不属于哪条提醒:它自己认自己。
+        let kind = match kind {
+            ReplyKind::SessionCheck(result) => {
+                self.on_session_checked(&result);
+                return;
+            }
+            other => other,
+        };
         // "去藏身处"那两步不属于任何一轮轮询,先认它。
-        if let Some(alert_id) = reply.tag.alert_id {
-            self.on_hideout_reply(alert_id, reply.kind, now);
+        if let Some(alert_id) = tag.alert_id {
+            self.on_hideout_reply(alert_id, kind, now);
             return;
         }
-        let Some(watch_id) = reply.tag.watch_id.clone() else {
+        let Some(watch_id) = tag.watch_id.clone() else {
             return;
         };
         if !self.watches.contains_key(&watch_id) {
             // 这条搜索在请求飞在路上的时候被删了,回信直接丢掉。
             return;
         }
-        let from_live = reply.tag.label == LIVE_FETCH_LABEL;
-        match reply.kind {
+        let from_live = tag.label == LIVE_FETCH_LABEL;
+        match kind {
             ReplyKind::Search(Ok(outcome)) => self.on_search(&watch_id, outcome, now),
             ReplyKind::Fetch(Ok(listings)) if from_live => {
                 self.on_live_fetch(&watch_id, listings, now);
@@ -1137,8 +1158,9 @@ impl RuntimeActor {
             ReplyKind::Search(Err(error)) | ReplyKind::Fetch(Err(error)) => {
                 self.on_poll_failed(&watch_id, &error, now);
             }
-            // 走到这里的 whisper 一定带着 alert_id,上面已经拦掉了。
-            ReplyKind::Whisper(_) => {}
+            // 走到这里的 whisper 一定带着 alert_id,会话检查更是上面就
+            // 认掉了,两种都轮不到这里。
+            ReplyKind::Whisper(_) | ReplyKind::SessionCheck(_) => {}
         }
     }
 
@@ -1459,8 +1481,8 @@ impl RuntimeActor {
                 };
                 self.finish_hideout(alert_id, outcome);
             }
-            // 这条链路上不会有 search。
-            ReplyKind::Search(_) => {}
+            // 这条链路上不会有 search,也不会有会话检查。
+            ReplyKind::Search(_) | ReplyKind::SessionCheck(_) => {}
         }
     }
 
@@ -1498,6 +1520,46 @@ impl RuntimeActor {
             "set_last_action",
         );
         self.emit(RuntimeEvent::HideoutResult { alert_id, outcome });
+    }
+
+    // ---- 测试会话 ----------------------------------------------------
+
+    /// 用户在设置页点了"测试会话"。
+    ///
+    /// 发一次真的 search(带着 cookie),然后只看响应的限速规则里有没有
+    /// `Account` —— 这是判断一个 POESESSID 还活着没有的唯一可靠信号。
+    /// 代价是 6 小时 299 次里的一次,所以只有点一下才发。
+    fn test_session(&mut self) {
+        if usable_session(&self.settings, self.session_ok).is_none() {
+            // 一个请求都不发:没 cookie 可试,或者它刚刚已经被服务端拒过。
+            self.emit(RuntimeEvent::SessionChecked {
+                valid: false,
+                detail: "no usable POESESSID in settings".to_string(),
+            });
+            return;
+        }
+        let (league, body_json) =
+            session_check_request(&self.settings.watches, &self.settings.league, |watch_id| {
+                self.watches
+                    .get(watch_id)
+                    .and_then(|runtime| runtime.query_body.clone())
+            });
+        self.gateway.submit(GatewayRequest {
+            kind: RequestKind::SessionCheck { league, body_json },
+            // 用户正看着按钮等结果,排在队列最前面。
+            priority: Priority::User,
+            reply: self.replies.clone(),
+            tag: RequestTag {
+                watch_id: None,
+                alert_id: None,
+                label: SESSION_CHECK_LABEL,
+            },
+        });
+    }
+
+    fn on_session_checked(&mut self, result: &Result<SessionCheckOutcome, GatewayError>) {
+        let (valid, detail) = session_check_report(result);
+        self.emit(RuntimeEvent::SessionChecked { valid, detail });
     }
 
     // ---- 网关广播 ----------------------------------------------------
@@ -1709,6 +1771,59 @@ fn usable_token(token: Option<&str>, fetched_at: Option<i64>, now: i64) -> Optio
     (now - fetched_at <= HIDEOUT_TOKEN_MAX_AGE_SECS).then(|| token.to_string())
 }
 
+/// 测试会话拿什么去问:(联赛, 请求体)。
+///
+/// 借用户自己第一条启用着的搜索 —— 那个查询一定是合法的,而且它本来就是
+/// 这个程序会发的东西。一条搜索都没有(或者粘进来的 id 还没解开)才退回
+/// [`probe_body`]。纯函数:`body_of` 把"这条搜索的请求体在哪儿"这件事
+/// 留给调用方,于是这一段不用碰 actor 的内部状态也测得动。
+fn session_check_request(
+    watches: &[WatchEntry],
+    league: &str,
+    body_of: impl Fn(&WatchId) -> Option<String>,
+) -> (String, String) {
+    for entry in watches {
+        if !entry.enabled {
+            continue;
+        }
+        if let Some(body) = body_of(&entry.id) {
+            return (entry.league.clone(), body);
+        }
+    }
+    (league.to_string(), probe_body())
+}
+
+/// 没有搜索可借时用的探针查询:在线的 Divine Orb,按价升序。
+///
+/// 挑它是因为任何联赛都有人在卖(所以不会因为"没有结果"而看不出会话死活),
+/// 而且它和用户蹲的东西毫无关系,不会往去重表里塞奇怪的挂单。
+fn probe_body() -> String {
+    search_request_body(r#"{"status":{"option":"online"},"type":"Divine Orb"}"#)
+}
+
+/// 一次会话检查的回信 → (会话还能用吗, 给人看的细节)。
+///
+/// 判据只有一条:限速规则里有没有 `Account`。带着 cookie 发出去的请求,
+/// 服务端只按 `Ip` 限速就说明它压根没认出这个会话。
+fn session_check_report(result: &Result<SessionCheckOutcome, GatewayError>) -> (bool, String) {
+    match result {
+        Ok(outcome) => {
+            let rules = if outcome.rules.is_empty() {
+                "no rate-limit rules".to_string()
+            } else {
+                format!("rules: {}", outcome.rules.join(", "))
+            };
+            (
+                outcome.mentions_account,
+                format!("HTTP {} · {rules}", outcome.status),
+            )
+        }
+        // 请求根本没发出去(网络断了、被 Cloudflare 拦了、关机取消了):
+        // 这不是"会话坏了",但也确实没验成,照实说。
+        Err(error) => (false, error.to_string()),
+    }
+}
+
 /// 提醒历史里的一行 → 一次"去藏身处"的起点。
 fn flow_for(row: &AlertRow) -> HideoutFlow {
     HideoutFlow {
@@ -1773,6 +1888,9 @@ mod actor_tests {
         whisper_statuses: VecDeque<u16>,
         /// fetch 回来的挂单带不带 hideout_token(真实世界里取决于带没带 cookie)。
         hideout_token: Option<String>,
+        /// search 响应的 `X-Rate-Limit-Rules` 写什么。`None` = 不给限速头。
+        /// 会话检查看的就是这一行。
+        rate_rules: Option<String>,
     }
 
     /// 假交易站:不打网络,search 回两个写死的 id,fetch 按你问的 id 现编。
@@ -1833,8 +1951,28 @@ mod actor_tests {
             _body_json: &str,
             _session: Option<&str>,
         ) -> Result<TradeResponse, pnd_trade::TransportError> {
-            self.log.lock().unwrap().searches += 1;
-            ok(r#"{"id":"SEARCHID","total":2,"result":["one","two"]}"#)
+            let rules = {
+                let mut log = self.log.lock().unwrap();
+                log.searches += 1;
+                log.rate_rules.clone()
+            };
+            let body = r#"{"id":"SEARCHID","total":2,"result":["one","two"]}"#;
+            let Some(rules) = rules else {
+                return ok(body);
+            };
+            Ok(TradeResponse {
+                status: 200,
+                body: body.as_bytes().to_vec(),
+                // 窗口给得很大(6 小时 600 次):测试要的是规则名,不是让
+                // 限速器真的按 10 秒 5 次去卡下一封请求。
+                rate: pnd_trade::parse_rate_headers([
+                    ("X-Rate-Limit-Policy", pnd_trade::SEARCH_POLICY),
+                    ("X-Rate-Limit-Rules", rules.as_str()),
+                    ("X-Rate-Limit-Ip", "600:21600:3600"),
+                    ("X-Rate-Limit-Ip-State", "1:21600:0"),
+                ]),
+                looks_like_html: false,
+            })
         }
 
         fn fetch(
@@ -2468,6 +2606,157 @@ mod actor_tests {
             None,
             "不知道什么时候拿的,就当它过期"
         );
+    }
+
+    // ---- 测试会话 ----------------------------------------------------
+
+    /// 一份"有 cookie、没有搜索"的设置。没有搜索就没有轮询,于是这几个
+    /// 测试里发出去的唯一一封请求就是那次会话检查。
+    fn session_settings(rules: &str) -> (AppSettings, Box<FakeTrade>, Arc<Mutex<TradeLog>>) {
+        let mut settings = settings();
+        settings.watches.clear();
+        settings.poesessid = "cookie".to_string();
+        let (transport, log) = FakeTrade::new();
+        log.lock().unwrap().rate_rules = Some(rules.to_string());
+        (settings, transport, log)
+    }
+
+    fn session_result(handle: &RuntimeHandle, seen: &mut Vec<RuntimeEvent>) -> (bool, String) {
+        handle.try_send(RuntimeCommand::TestSession).unwrap();
+        let event = wait_for(
+            handle,
+            seen,
+            |event| matches!(event, RuntimeEvent::SessionChecked { .. }),
+            "a SessionChecked",
+        );
+        let RuntimeEvent::SessionChecked { valid, detail } = event else {
+            unreachable!()
+        };
+        (valid, detail)
+    }
+
+    /// 服务端按 `Account` 限速 = 它认出了这个 cookie。
+    #[test]
+    fn a_session_check_passes_when_the_rules_mention_account() {
+        let (settings, transport, log) = session_settings("Ip,Account");
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::in_memory(), transport).unwrap();
+
+        let mut seen = Vec::new();
+        wait_for(&handle, &mut seen, |e| *e == RuntimeEvent::Ready, "Ready");
+        let (valid, detail) = session_result(&handle, &mut seen);
+
+        assert!(valid, "{detail}");
+        assert!(detail.contains("Account"), "{detail}");
+        assert_eq!(
+            log.lock().unwrap().searches,
+            1,
+            "一次点击只该花掉一次 search 额度"
+        );
+    }
+
+    /// 带着 cookie 发出去,回来的规则里只有 `Ip`:服务端根本没认出这个会话。
+    #[test]
+    fn a_session_check_fails_when_the_cookie_is_not_recognised() {
+        let (settings, transport, log) = session_settings("Ip");
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::in_memory(), transport).unwrap();
+
+        let mut seen = Vec::new();
+        wait_for(&handle, &mut seen, |e| *e == RuntimeEvent::Ready, "Ready");
+        let (valid, detail) = session_result(&handle, &mut seen);
+
+        assert!(!valid, "{detail}");
+        assert!(detail.contains("Ip"), "{detail}");
+        assert_eq!(log.lock().unwrap().searches, 1);
+    }
+
+    /// 设置里根本没有 cookie:一句话说清楚,一个请求都不发。
+    #[test]
+    fn a_session_check_without_a_cookie_never_leaves_the_house() {
+        let (transport, log) = FakeTrade::new();
+        let mut settings = settings();
+        settings.watches.clear();
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::in_memory(), transport).unwrap();
+
+        let mut seen = Vec::new();
+        wait_for(&handle, &mut seen, |e| *e == RuntimeEvent::Ready, "Ready");
+        let (valid, detail) = session_result(&handle, &mut seen);
+
+        assert!(!valid);
+        assert!(detail.contains("POESESSID"), "{detail}");
+        assert_eq!(log.lock().unwrap().searches, 0, "没 cookie 就别发请求");
+    }
+
+    /// 有搜索就借它的查询;一条都没有才用那件"在线的 Divine Orb"。
+    #[test]
+    fn the_session_check_borrows_the_first_enabled_watch() {
+        let watches = vec![
+            WatchEntry {
+                id: WatchId("off".to_string()),
+                league: "Standard".to_string(),
+                enabled: false,
+                ..WatchEntry::default()
+            },
+            WatchEntry {
+                id: WatchId("on".to_string()),
+                league: "Forbidden Rites".to_string(),
+                ..WatchEntry::default()
+            },
+        ];
+        let bodies = |id: &WatchId| (id.as_str() == "on").then(|| "{\"query\":1}".to_string());
+
+        let (league, body) = session_check_request(&watches, "Whatever", bodies);
+        assert_eq!(league, "Forbidden Rites", "停用的那条不算");
+        assert_eq!(body, "{\"query\":1}");
+
+        // 一条搜索都没有:退回探针查询,联赛用设置里那个。
+        let (league, body) = session_check_request(&[], "Forbidden Rites", |_| None);
+        assert_eq!(league, "Forbidden Rites");
+        assert_eq!(body, probe_body());
+        // 搜索还没解开(粘错了的 id)时也一样。
+        let (_, body) = session_check_request(&watches, "Forbidden Rites", |_| None);
+        assert_eq!(body, probe_body());
+    }
+
+    /// 探针查询就是计划里写死的那一句,不多不少。
+    #[test]
+    fn the_probe_query_is_one_online_divine_orb() {
+        assert_eq!(
+            probe_body(),
+            r#"{"query":{"status":{"option":"online"},"type":"Divine Orb"},"sort":{"price":"asc"}}"#
+        );
+    }
+
+    /// 结论只看规则名;请求压根没发出去的时候,照实说是哪种失败。
+    #[test]
+    fn the_session_report_reads_the_rules_and_never_guesses() {
+        let outcome = |rules: &[&str], mentions_account: bool| {
+            Ok(SessionCheckOutcome {
+                status: 200,
+                rules: rules.iter().map(|rule| (*rule).to_string()).collect(),
+                mentions_account,
+            })
+        };
+
+        let (valid, detail) = session_check_report(&outcome(&["Ip", "Account"], true));
+        assert!(valid);
+        assert_eq!(detail, "HTTP 200 · rules: Ip, Account");
+
+        let (valid, detail) = session_check_report(&outcome(&["Ip"], false));
+        assert!(!valid);
+        assert_eq!(detail, "HTTP 200 · rules: Ip");
+
+        // 没有限速头 = 这封响应根本不是交易站的限速接口回的。
+        let (valid, detail) = session_check_report(&outcome(&[], false));
+        assert!(!valid);
+        assert_eq!(detail, "HTTP 200 · no rate-limit rules");
+
+        let (valid, detail) =
+            session_check_report(&Err(GatewayError::Transport("dns failed".to_string())));
+        assert!(!valid);
+        assert!(detail.contains("dns failed"), "{detail}");
     }
 
     #[test]

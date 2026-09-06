@@ -310,6 +310,16 @@ fn print_event(event: &RuntimeEvent, labels: &BTreeMap<String, String>) {
             );
             println!("{at}           whisper: {}", listing.whisper);
         }
+        RuntimeEvent::SessionChecked { valid, detail } => {
+            println!(
+                "{at} session   {} — {detail}",
+                if *valid {
+                    "recognised"
+                } else {
+                    "not recognised"
+                }
+            );
+        }
         RuntimeEvent::SessionInvalid => println!("{at} session   the POESESSID was rejected"),
         RuntimeEvent::CloudflareBlocked { until } => {
             println!(

@@ -318,26 +318,40 @@ impl AppShell {
             ],
         );
 
-        let session =
-            section(
-                text.settings_section_session,
-                vec![
-                    field_row()
-                        .child(field_label(text.settings_poesessid))
-                        .child(input_box(320., &form.poesessid, read_only))
-                        .child(
-                            Button::new("settings-test-session")
-                                .label(text.settings_test_session)
-                                .with_size(Size::Small)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.not_wired_yet("session test", cx)
-                                })),
-                        ),
-                    field_row()
-                        .child(field_label(""))
-                        .child(hint(text.settings_poesessid_hint)),
-                ],
-            );
+        // 测的是**存下来**的那个 cookie(后台手上就是它),所以框里刚打的字
+        // 得先按保存才算数。没存过 cookie 或者上一次检查还没回来时,按钮是灰的。
+        let no_session = self.settings.poesessid.trim().is_empty();
+        let checking = self.session_check_busy;
+        let session_line = self.session_check_line.clone();
+        let session = section(
+            text.settings_section_session,
+            vec![
+                field_row()
+                    .child(field_label(text.settings_poesessid))
+                    .child(input_box(320., &form.poesessid, read_only))
+                    .child(
+                        Button::new("settings-test-session")
+                            .label(text.settings_test_session)
+                            .with_size(Size::Small)
+                            .disabled(no_session || checking)
+                            .on_click(cx.listener(|this, _, _, cx| this.test_session(cx))),
+                    )
+                    .child(
+                        div()
+                            .text_size(fs(FS_11))
+                            .text_color(muted())
+                            .child(SharedString::from(session_line)),
+                    ),
+                field_row()
+                    .child(field_label(""))
+                    // 一次检查 = 一次搜索请求,而搜索预算 6 小时只有 299 次:
+                    // 按钮的代价要写在按钮旁边。
+                    .child(hint(text.settings_test_session_hint)),
+                field_row()
+                    .child(field_label(""))
+                    .child(hint(text.settings_poesessid_hint)),
+            ],
+        );
 
         let watcher = section(
             text.settings_section_watcher,
@@ -474,6 +488,19 @@ impl AppShell {
                     )
                     .children(read_only.then(|| hint(text.settings_read_only))),
             )
+    }
+
+    /// 拿存下来的 cookie 去问交易站一次:你还认得它吗。
+    ///
+    /// 一次点击 = 一次搜索请求。按钮在检查回来之前是灰的,所以手快点两下
+    /// 不会变成两次请求 —— 预算是 6 小时 299 次,不该让一个按钮白吃。
+    fn test_session(&mut self, cx: &mut Context<Self>) {
+        let text = self.text();
+        if self.send_runtime(pnd_runtime::RuntimeCommand::TestSession) {
+            self.session_check_busy = true;
+            self.session_check_line = text.settings_session_checking.to_owned();
+        }
+        cx.notify();
     }
 
     /// 把表单里的值收回设置结构体、规整、写盘,并把结果说出来。

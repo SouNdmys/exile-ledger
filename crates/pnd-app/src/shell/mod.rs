@@ -219,6 +219,13 @@ pub struct AppShell {
     pub(crate) watch_status: BTreeMap<WatchId, WatchStatus>,
     /// 每条限速策略的用量。键是策略名(`trade-search-request-limit` 这些)。
     pub(crate) budget: BTreeMap<String, Vec<BucketUsage>>,
+    /// 每条策略还要等几秒才放行下一封请求。没有这一项 = 现在就能发。
+    pub(crate) budget_next_allowed: BTreeMap<String, u64>,
+    /// 一次"测试会话"正在路上。按钮据此变灰 —— 那一下要花掉一次搜索额度,
+    /// 手快点两下就是两次。
+    pub(crate) session_check_busy: bool,
+    /// 上一次测试会话的结论,画在设置页那个按钮旁边。
+    pub(crate) session_check_line: String,
     pub(crate) rates: CurrencyRates,
     /// 弹过的卡片:卡片按钮事件只带一个 alert_id,靠它找回是哪一批命中。
     pub(crate) shown_cards: BTreeMap<i64, MatchedListing>,
@@ -427,6 +434,9 @@ impl AppShell {
             sampler_line: String::new(),
             watch_status: BTreeMap::new(),
             budget: BTreeMap::new(),
+            budget_next_allowed: BTreeMap::new(),
+            session_check_busy: false,
+            session_check_line: String::new(),
             rates: CurrencyRates::none(),
             shown_cards: BTreeMap::new(),
             alert_rows: Vec::new(),

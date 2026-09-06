@@ -10,8 +10,8 @@
 //!   一次 tick 取到 `None` 为止;界面线程不等任何后台线程。
 //! - **后台起不来不等于程序完蛋。** actor 或卡片没起来,程序照常开窗,
 //!   状态行上说清楚哪一半没了。
-//! - **游戏内的动作永远是用户点的。** "去藏身处"在这里只是一句提示 +
-//!   一条历史记录,不发任何私聊/传送请求(那是第二阶段的事)。
+//! - **游戏内的动作永远是用户点的。** "去藏身处"按一下发一条命令,发完就
+//!   等结果;界面自己永远不发第二次,后台也不会替谁重试到底。
 
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,8 @@ use pnd_platform_win::{
     ValidatedWave, built_in_alert_wave, open_url,
 };
 use pnd_runtime::{
-    MatchedListing, RuntimeCommand, RuntimeEvent, RuntimeHandle, RuntimePaths, now_secs,
+    HideoutOutcome, MatchedListing, RuntimeCommand, RuntimeEvent, RuntimeHandle, RuntimePaths,
+    now_secs,
 };
 use pnd_settings::AppSettings;
 use pnd_trade::{BucketUsage, FETCH_POLICY, SEARCH_POLICY};
@@ -160,7 +161,21 @@ impl AppShell {
                 self.watch_status.insert(watch_id, status);
                 self.watches_dirty = true;
             }
-            RuntimeEvent::Budget { policy, usage, .. } => {
+            RuntimeEvent::Budget {
+                policy,
+                usage,
+                next_allowed_in_secs,
+            } => {
+                // "还要等几秒"只在真的要等的时候留着:等 0 秒不值得占预算条
+                // 上的一格,而一个过期的秒数比没有更糟。
+                match next_allowed_in_secs {
+                    Some(seconds) => {
+                        self.budget_next_allowed.insert(policy.clone(), seconds);
+                    }
+                    None => {
+                        self.budget_next_allowed.remove(&policy);
+                    }
+                }
                 self.budget.insert(policy, usage);
             }
             RuntimeEvent::ListingMatched(matched) => {
@@ -187,10 +202,24 @@ impl AppShell {
                 // 暗金榜那一列写的是"N exalted ≈ M divine",换算就靠这份汇率。
                 self.uniques_dirty = true;
             }
-            // 去藏身处的结果先只进日志;卡片脚注和提醒表的显示是下一步。
             RuntimeEvent::HideoutResult { alert_id, outcome } => {
                 self.push_log(format!("hideout: alert {alert_id} → {outcome:?}"));
+                self.on_hideout_result(alert_id, &outcome);
+                // 结果落在提醒历史的 `last_action` 上,但写的是 actor 线程。
                 self.refresh_alerts_soon();
+            }
+            RuntimeEvent::SessionChecked { valid, detail } => {
+                self.push_log(format!("session check: valid={valid} ({detail})"));
+                self.session_check_busy = false;
+                let word = if valid {
+                    text.settings_session_ok
+                } else {
+                    text.settings_session_bad
+                };
+                // 技术细节(状态码 + 规则名)跟在后面:测出来不认的时候,
+                // 那一串是唯一能拿去查的东西。
+                self.session_check_line = format!("{word} · {detail}");
+                self.set_notice(word.to_owned());
             }
             RuntimeEvent::Log(line) => self.push_log(line),
             RuntimeEvent::Fault(line) => {
@@ -233,10 +262,10 @@ impl AppShell {
                 self.record_action(alert_id, "copy");
             }
             CardButton::Tertiary => {
-                // 第二阶段才有的按钮。**不发任何请求** —— 程序永远不自动私聊、
-                // 不自动传送,这一条在计划里是硬规矩。
-                self.set_notice(text.notice_hideout_phase_two.to_owned());
-                self.record_action(alert_id, "hideout_unavailable");
+                // **一次点击 = 一条命令**。程序自己永远不发这条命令,也永远
+                // 不重试到底 —— 计划里那句"每个游戏内动作都是你自己点一次"
+                // 就是这里。结果由 `HideoutResult` 事件写回卡片脚注。
+                self.travel_to_hideout(alert_id);
             }
             CardButton::Dismiss => {
                 self.dismiss_card_batch(alert_id);
@@ -247,6 +276,44 @@ impl AppShell {
                 }
                 self.set_notice(text.notice_dismissed.to_owned());
             }
+        }
+    }
+
+    /// 请后台给这条提醒的卖家发一次传送请求。
+    ///
+    /// 卡片按钮和提醒记录页那个按钮都走这一句。它只投一条命令就返回:
+    /// 交易站那边要跑几个来回(token 过期了还要先换一个)是 actor 的事,
+    /// 界面等 `HideoutResult` 就好。
+    /// 没有会话时也照发不误 —— runtime 会立刻回一句 `NoSession`,**一个请求
+    /// 都不会出去**。让它走一遍的好处是答案落在同一个地方:卡片脚注、状态行、
+    /// 提醒历史的动作列,而不是界面自己编一句、库里什么都没记。
+    pub(crate) fn travel_to_hideout(&mut self, alert_id: i64) {
+        self.send_runtime(RuntimeCommand::TravelToHideout { alert_id });
+    }
+
+    /// 一次"去藏身处"有了进展。
+    ///
+    /// 结局(发出去了 / 没会话 / 没 token / 失败)写进卡片脚注 —— 卡片就在
+    /// 屏幕角落上,而按钮是在那儿按的,答案理应回到同一个地方。中间步骤
+    /// ("正在换 token")只进状态行:为了一句过程去改卡片,下一秒又被结局
+    /// 盖掉,只会闪一下。
+    fn on_hideout_result(&mut self, alert_id: i64, outcome: &HideoutOutcome) {
+        let text = self.text();
+        let line = hideout_text(outcome, text);
+        self.set_notice(line.clone());
+        if !outcome.is_final() {
+            return;
+        }
+        let Some(matched) = self.shown_cards.get(&alert_id).cloned() else {
+            // 卡片早就收起来了(或者这一下是在提醒记录页点的):
+            // 状态行和提醒历史里都有,不用再找一张卡片出来。
+            return;
+        };
+        let card_text = card_text_for(&matched, text, &line);
+        if let Some(card) = &self.alert_card
+            && let Err(error) = card.update(alert_id, card_text)
+        {
+            self.push_log(format!("alert card update failed: {error}"));
         }
     }
 
@@ -512,6 +579,43 @@ pub(crate) fn card_text_for(
     })
 }
 
+/// 一次"去藏身处"的结局 → 一句人话。
+///
+/// 纯函数带测试:这句话会同时出现在卡片脚注、状态行和提醒记录页,而这四种
+/// 结局里有三种是"没成",用户凭这一句判断下一步该干嘛(去网页点 Travel、
+/// 还是先去设置页粘 cookie)。
+#[must_use]
+pub(crate) fn hideout_text(outcome: &HideoutOutcome, text: &'static Text) -> String {
+    match outcome {
+        HideoutOutcome::Sent => text.hideout_sent.to_owned(),
+        HideoutOutcome::NoSession => text.hideout_no_session.to_owned(),
+        HideoutOutcome::TokenMissing => text.hideout_token_missing.to_owned(),
+        HideoutOutcome::Refreshed => text.hideout_refreshing.to_owned(),
+        // 状态码是失败时唯一的线索(503 = token 过期,403 = 会话不对):
+        // 吞掉它等于让人只能重试到死。
+        HideoutOutcome::Failed { status, .. } => {
+            i18n::fill(text.hideout_failed_status, &[&status.to_string()])
+        }
+    }
+}
+
+/// 提醒历史里那个动作码 → 同一句人话。
+///
+/// 码是 `HideoutOutcome::action()` 写进库的,所以这里认得全;认不出来的
+/// 交给调用方原样显示。
+#[must_use]
+pub(crate) fn hideout_action_text(action: &str, text: &'static Text) -> Option<&'static str> {
+    match action {
+        "hideout_sent" => Some(text.hideout_sent),
+        "hideout_no_session" => Some(text.hideout_no_session),
+        "hideout_token_missing" => Some(text.hideout_token_missing),
+        "hideout_refreshing" => Some(text.hideout_refreshing),
+        // 库里只有一个"失败"的码,状态码没存下来,所以这一条不带括号。
+        "hideout_failed" => Some(text.hideout_failed),
+        _ => None,
+    }
+}
+
 /// 卖家在不在线。
 fn presence(listing: &ListingSummary, text: &'static Text) -> &'static str {
     match (listing.online, listing.afk) {
@@ -702,6 +806,44 @@ mod link_tests {
     #[test]
     fn an_unparsable_timestamp_is_shown_as_is() {
         assert_eq!(age_text("whenever", &i18n::ENGLISH), "whenever");
+    }
+
+    /// 五种进展各说各的话,而且失败那句必须带上状态码:503(token 过期)
+    /// 和 403(会话不对)要做的下一步完全不同。
+    #[test]
+    fn every_hideout_outcome_says_something_of_its_own() {
+        let outcomes = [
+            HideoutOutcome::Sent,
+            HideoutOutcome::NoSession,
+            HideoutOutcome::TokenMissing,
+            HideoutOutcome::Refreshed,
+            HideoutOutcome::Failed {
+                status: 503,
+                message: "busy".to_string(),
+            },
+        ];
+        for language in i18n::LANGUAGES {
+            let text = i18n::text(language);
+            let mut lines: Vec<String> = outcomes
+                .iter()
+                .map(|outcome| hideout_text(outcome, text))
+                .collect();
+            assert!(lines.iter().all(|line| !line.trim().is_empty()));
+            assert!(lines[4].contains("503"), "{}", lines[4]);
+            lines.sort();
+            let count = lines.len();
+            lines.dedup();
+            assert_eq!(lines.len(), count, "{language} 里有两种结局撞词了");
+        }
+    }
+
+    /// 结局要能塞进卡片脚注 —— 那一行有长度上限,超了整张卡片就构造不出来。
+    #[test]
+    fn a_hideout_result_fits_the_card_footer() {
+        let text = &i18n::ENGLISH;
+        let footer = hideout_text(&HideoutOutcome::TokenMissing, text);
+        let card = card_text_for(&matched(0), text, &footer);
+        assert_eq!(card.footer, "hideout: no token");
     }
 
     #[test]

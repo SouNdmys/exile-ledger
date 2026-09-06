@@ -20,7 +20,7 @@ use gpui_component::switch::Switch;
 use gpui_component::{Sizable as _, Size, StyledExt as _};
 
 use pnd_domain::{Price, WatchId, parse_search_reference};
-use pnd_runtime::{RuntimeCommand, WatchRunState, WatchStatus};
+use pnd_runtime::{LiveOffReason, LiveRunState, RuntimeCommand, WatchRunState, WatchStatus};
 use pnd_settings::{AppSettings, WatchEntry};
 use pnd_trade::{FETCH_POLICY, SEARCH_POLICY};
 
@@ -125,7 +125,10 @@ pub fn table_content(text: &'static Text) -> TableContent {
             column("label", text.watches_col_label, 200.),
             column("league", text.watches_col_league, 130.),
             number_column("cap", text.watches_col_cap, 90.),
-            column("status", text.watches_col_status, 150.),
+            // 这一格现在同时写轮询和 live 两件事:量过最长的一句
+            // ("polling · next in 15 min · live disabled: session invalid"),
+            // 窄一点就会把"为什么没连上"那半句裁掉。
+            column("status", text.watches_col_status, 360.),
             column("last_poll", text.watches_col_last_poll, 120.),
             number_column("hits", text.watches_col_hits_today, 80.),
         ],
@@ -209,7 +212,40 @@ fn status_tone(state: WatchRunState) -> Tone {
     }
 }
 
-/// 状态词 + 下一轮倒计时。停用的那条不写倒计时:它没有下一轮。
+/// live 那一头现在怎么样,一句话。
+///
+/// 轮询状态只有五个词,说不清"秒推为什么没连上" —— 而那恰恰是用户最常问的:
+/// 勾了 Live 却没反应,到底是没粘 cookie、被上限挤下来了,还是正在退避重连。
+pub(crate) fn live_text(live: LiveRunState, text: &'static Text, now: i64) -> String {
+    match live {
+        LiveRunState::Off => text.live_off.to_owned(),
+        LiveRunState::Disabled(reason) => {
+            i18n::fill(text.live_disabled, &[live_reason(reason, text)])
+        }
+        LiveRunState::Connecting => text.live_connecting.to_owned(),
+        LiveRunState::Connected { since } => {
+            i18n::fill(text.live_connected_since, &[&local_clock(since)])
+        }
+        LiveRunState::Backoff { until, attempt } => i18n::fill(
+            text.live_backoff,
+            &[&countdown_text(until - now, text), &attempt.to_string()],
+        ),
+        LiveRunState::Held { until } => i18n::fill(text.live_held_until, &[&local_clock(until)]),
+    }
+}
+
+fn live_reason(reason: LiveOffReason, text: &'static Text) -> &'static str {
+    match reason {
+        LiveOffReason::NoSession => text.live_reason_no_session,
+        LiveOffReason::TooMany => text.live_reason_too_many,
+        LiveOffReason::SessionInvalid => text.live_reason_session_invalid,
+    }
+}
+
+/// 状态词 + 下一轮倒计时 + live 档位。
+///
+/// 停用的那条只写一个词:它既没有下一轮,也没有 live 连接,多写的每一段
+/// 都是在描述一件没在发生的事。
 fn status_text(
     state: WatchRunState,
     status: Option<&WatchStatus>,
@@ -220,13 +256,19 @@ fn status_text(
     if state == WatchRunState::Disabled {
         return word.to_owned();
     }
-    match status.and_then(|status| status.next_poll_at) {
-        Some(next) => format!(
-            "{word} · {}",
-            i18n::fill(text.watches_next_in, &[&countdown_text(next - now, text)])
-        ),
-        None => word.to_owned(),
+    let mut line = word.to_owned();
+    if let Some(next) = status.and_then(|status| status.next_poll_at) {
+        line.push_str(" · ");
+        line.push_str(&i18n::fill(
+            text.watches_next_in,
+            &[&countdown_text(next - now, text)],
+        ));
     }
+    if let Some(status) = status {
+        line.push_str(" · ");
+        line.push_str(&live_text(status.live, text, now));
+    }
+    line
 }
 
 /// 框里的字。
@@ -451,8 +493,24 @@ impl AppShell {
                 text.budget_fetch,
                 self.budget_text(FETCH_POLICY),
             ))
+            // 限速器把下一封请求压住的时候,这一句是"程序看起来没在动"
+            // 的唯一解释。不用等的时候它不出现。
+            .children(self.next_allowed_text().map(hint))
             .child(div().flex_grow())
             .child(hint(self.rates_text()))
+    }
+
+    /// 两条策略里等得最久的那一句"{} 秒后可再请求"。
+    fn next_allowed_text(&self) -> Option<String> {
+        let text = self.text();
+        let waiting = [SEARCH_POLICY, FETCH_POLICY]
+            .into_iter()
+            .filter_map(|policy| self.budget_next_allowed.get(policy).copied())
+            .max()?;
+        Some(i18n::fill(
+            text.budget_next_allowed,
+            &[&waiting.to_string()],
+        ))
     }
 
     /// 一条策略的"用掉 / 允许"。还没发过请求就没有限速头,也就没有数字。
@@ -613,12 +671,6 @@ impl AppShell {
         self.apply_settings_to_runtime();
         true
     }
-
-    /// 还没接线的按钮:说一句"下一步才有",而不是假装什么都没发生。
-    pub(crate) fn not_wired_yet(&mut self, what: &str, cx: &mut Context<Self>) {
-        self.set_notice(format!("not wired yet: {what}"));
-        cx.notify();
-    }
 }
 
 /// 预算条上的一格:名字 + 数字。
@@ -672,6 +724,7 @@ mod watches_page_tests {
             WatchId("w-1".to_string()),
             WatchStatus {
                 state: WatchRunState::Polling,
+                live: LiveRunState::Disabled(LiveOffReason::NoSession),
                 next_poll_at: Some(1_000_090),
                 last_poll_at: Some(1_000_000),
                 hits_today: 4,
@@ -690,11 +743,14 @@ mod watches_page_tests {
         assert_eq!(rows[0][2].text(), "20 divine");
     }
 
-    /// 状态那一格要同时回答"现在在干嘛"和"下一轮什么时候"。
+    /// 状态那一格要同时回答三件事:现在在干嘛、下一轮什么时候、秒推怎么样。
     #[test]
-    fn the_status_cell_carries_the_countdown() {
+    fn the_status_cell_carries_the_countdown_and_the_live_state() {
         let rows = watch_rows(&settings(), &status(), &i18n::ENGLISH, 1_000_000);
-        assert_eq!(rows[0][3].text(), "polling · next in 1 min");
+        assert_eq!(
+            rows[0][3].text(),
+            "polling · next in 1 min · live disabled: no session"
+        );
         assert_eq!(
             rows[0][4].text(),
             crate::shell::link::local_clock(1_000_000)
@@ -726,5 +782,54 @@ mod watches_page_tests {
                 assert!(!status_word(state, text).trim().is_empty());
             }
         }
+    }
+
+    /// live 的每一档都得说得出话来,而且两档不能长得一样 —— "为什么没连上"
+    /// 分不清的话,这一列就白加了。
+    #[test]
+    fn every_live_state_reads_differently_in_both_languages() {
+        let states = [
+            LiveRunState::Off,
+            LiveRunState::Disabled(LiveOffReason::NoSession),
+            LiveRunState::Disabled(LiveOffReason::TooMany),
+            LiveRunState::Disabled(LiveOffReason::SessionInvalid),
+            LiveRunState::Connecting,
+            LiveRunState::Connected { since: 1_000_000 },
+            LiveRunState::Backoff {
+                until: 1_000_030,
+                attempt: 2,
+            },
+            LiveRunState::Held { until: 1_000_300 },
+        ];
+        for language in i18n::LANGUAGES {
+            let text = i18n::text(language);
+            let mut lines: Vec<String> = states
+                .iter()
+                .map(|state| live_text(*state, text, 1_000_000))
+                .collect();
+            assert!(lines.iter().all(|line| !line.trim().is_empty()));
+            lines.sort();
+            let count = lines.len();
+            lines.dedup();
+            assert_eq!(lines.len(), count, "{language} 里有两档 live 撞词了");
+        }
+    }
+
+    /// 退避那一档要同时说清"还要等多久"和"这是第几次" —— 没有次数的话,
+    /// 一条连不上的搜索看起来和一条刚断一次的一模一样。
+    #[test]
+    fn the_backoff_line_carries_the_countdown_and_the_attempt() {
+        let line = live_text(
+            LiveRunState::Backoff {
+                until: 1_000_030,
+                attempt: 3,
+            },
+            &i18n::ENGLISH,
+            1_000_000,
+        );
+        assert_eq!(line, "live retry in 30 s (attempt 3)");
+        // 停用的搜索不写 live:它没有下一轮,也没有连接。
+        let rows = watch_rows(&settings(), &status(), &i18n::ENGLISH, 1_000_000);
+        assert_eq!(rows[1][3].text(), "disabled");
     }
 }
