@@ -9,9 +9,10 @@ rust-version.workspace = true
 description = "SQLite persistence: watch state, alert history, ninja sampling cache"
 
 [dependencies]
-# pnd-ninja 的依赖等第 9 步真的写 ninja.rs 时再加回来:
-# 现在挂着它只会让 watch.rs 的编译被隔壁半成品的 crate 卡住。
 pnd-domain = { path = "../pnd-domain" }
+# ninja.rs 存的就是 pnd-ninja 算出来的东西(分区、样本名单、词缀统计、参考价),
+# 所以这一层直接拿它的类型当行结构,不再平行维护一套。
+pnd-ninja = { path = "../pnd-ninja" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
