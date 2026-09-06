@@ -18,3 +18,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+# `live_probe` 要能被 Ctrl+C 干净地打断(发一个 Close 帧再走),
+# 而 Windows 上装控制台处理器只能靠平台 API。ctrlc 就是那一层薄封装。
+ctrlc = "3.5"

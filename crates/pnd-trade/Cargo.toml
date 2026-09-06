@@ -14,3 +14,14 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
+# Live Search 的 WebSocket。默认特性只带 `handshake`，这里额外挑
+# `rustls-tls-webpki-roots`：和 ureq 一样走 rustls（不碰 schannel/native-tls），
+# 根证书用编译进来的 webpki-roots，省掉一次读 Windows 证书store 的失败面。
+# `cargo tree -d -p pnd-trade` 必须仍然只有一份 rustls 0.23 和一份 ring。
+tungstenite = { version = "0.30", default-features = false, features = [
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
+# 握手请求是手搓的（见 live.rs），要直接用 http 的 builder。
+# 版本跟着 ureq 已经在用的 http 1.x，不引入第二份。
+http = "1"

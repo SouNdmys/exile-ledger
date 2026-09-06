@@ -5,6 +5,7 @@ use thiserror::Error;
 
 pub mod client;
 pub mod listing;
+pub mod live;
 pub mod rate_limit;
 
 pub use client::{
@@ -12,6 +13,11 @@ pub use client::{
     parse_search_response, search_url, whisper_url,
 };
 pub use listing::parse_fetch_response;
+pub use live::{
+    DEFAULT_READ_TIMEOUT, LiveConfig, LiveError, LiveMessage, LiveSession,
+    MAX_LIVE_CONNECTIONS_PER_ACCOUNT, ProtocolError, live_ws_url, parse_live_message,
+    reconnect_delay,
+};
 pub use rate_limit::{
     BucketUsage, Budget, FETCH_POLICY, RateHeaders, RateLimiter, SEARCH_POLICY, backoff_after_429,
     parse_rate_headers,
