@@ -1,0 +1,97 @@
+//! 挂单摘要:从 fetch 接口那一大坨 JSON 里,只留下卡片和列表要用的字段。
+//!
+//! 为什么要摘一遍而不是原样传:上层(runtime、UI、SQLite)都不该认识交易站的
+//! JSON 形状,接口哪天加字段改字段,只动 `pnd-trade` 里的解析,这里不受影响。
+
+use serde::{Deserialize, Serialize};
+
+use crate::price::Price;
+
+/// 一条蹲价搜索的 id。包一层是为了别把它和挂单 id、搜索 id 这些同样是字符串的东西弄混。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WatchId(pub String);
+
+impl WatchId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for WatchId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// 一条挂单里我们关心的部分。
+///
+/// `price` 是 `Option`:交易站允许挂"仅供展示"的无价单,那种直接判 `Unpriced`,不提醒。
+/// 两个 token 只有带 POESESSID 请求时才有,而且是短命 JWT —— 存下来只为"去藏身处"
+/// 按钮点下去那一刻能用,过期就重新 fetch。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ListingSummary {
+    pub id: String,
+    pub item_name: String,
+    pub type_line: String,
+    pub price: Option<Price>,
+    pub account: String,
+    pub character: String,
+    pub online: bool,
+    pub afk: bool,
+    pub indexed: String,
+    pub whisper: String,
+    pub whisper_token: Option<String>,
+    pub hideout_token: Option<String>,
+    pub icon: String,
+}
+
+impl ListingSummary {
+    /// 一行短标签,给探针输出和提醒卡片标题用(界面正文文案仍然走 `pnd-app` 的 i18n)。
+    pub fn short_label(&self) -> String {
+        let price = match &self.price {
+            Some(price) => price.display(),
+            None => "no price".to_string(),
+        };
+        format!("{} · {}", self.item_name, price)
+    }
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+    use crate::price::Currency;
+
+    fn sample(price: Option<Price>) -> ListingSummary {
+        ListingSummary {
+            id: "abc".to_string(),
+            item_name: "Choir of the Storm".to_string(),
+            type_line: "Lapis Amulet".to_string(),
+            price,
+            account: "SomeSeller".to_string(),
+            character: "SomeChar".to_string(),
+            online: true,
+            afk: false,
+            indexed: "2026-09-06T12:00:00Z".to_string(),
+            whisper: "@SomeChar Hi, I'd like to buy...".to_string(),
+            whisper_token: None,
+            hideout_token: None,
+            icon: "https://web.poecdn.com/image/item.png".to_string(),
+        }
+    }
+
+    #[test]
+    fn short_label_covers_priced_and_unpriced() {
+        let priced = sample(Some(Price::new(15_000, Currency::Divine)));
+        assert_eq!(priced.short_label(), "Choir of the Storm · 15 divine");
+        assert_eq!(sample(None).short_label(), "Choir of the Storm · no price");
+    }
+
+    #[test]
+    fn watch_id_is_a_transparent_string() {
+        let id = WatchId("w-1".to_string());
+        assert_eq!(id.to_string(), "w-1");
+        assert_eq!(serde_json::to_string(&id).unwrap(), r#""w-1""#);
+        assert_eq!(serde_json::from_str::<WatchId>(r#""w-1""#).unwrap(), id);
+    }
+}
