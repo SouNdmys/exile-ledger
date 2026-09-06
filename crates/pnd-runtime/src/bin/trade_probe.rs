@@ -8,24 +8,38 @@
 //!
 //! 用法:
 //! ```text
+//! # 一次性模式:自己走一遍 search → fetch → 判定,把每一步都印出来
 //! cargo run -p pnd-runtime --bin trade_probe -- \
 //!     --league "Forbidden Rites" --search <搜索URL或id> \
 //!     [--cap 20 --currency divine] [--rounds 3] [--session <POESESSID>] \
 //!     [--rates chaos=25.21,exalted=83.42]
+//!
+//! # 蹲价模式:起真的 actor(网关 + 轮询 + 判定 + 汇率线程),把事件流印出来
+//! cargo run -p pnd-runtime --bin trade_probe -- \
+//!     --watch --minutes 3 --poll-seconds 60 \
+//!     --search <搜索URL或id> [--search <第二条>] [--cap 20 --currency divine]
 //! ```
+//!
+//! 蹲价模式里,探针**一行判定逻辑都没有**:它只是造一份内存里的 `AppSettings`、
+//! 起一个 [`RuntimeHandle`],然后把收到的事件翻译成人话。界面将来做的事和
+//! 这里一模一样,所以这个模式跑通,界面接线就只剩画画面了。
 //!
 //! `--session` 里的 POESESSID **永远不会被打印出来**,只会以"带会话/匿名"
 //! 一个词的形式出现在输出里。
 
+use std::collections::BTreeMap;
 use std::process::ExitCode;
 use std::thread::sleep;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use pnd_domain::{
     Currency, CurrencyRates, ListingSummary, Price, PriceCap, SearchRef, Verdict, decode_search_id,
     judge, parse_search_reference, search_page_url, search_request_body,
 };
 use pnd_ninja::client::NinjaClient;
+use pnd_runtime::actor::{RuntimeEvent, RuntimeHandle, RuntimePaths, WatchStatus};
+use pnd_runtime::now_secs;
+use pnd_settings::{AppSettings, WatchEntry};
 use pnd_trade::client::{MAX_FETCH_IDS, TradeClient, parse_search_response};
 use pnd_trade::listing::parse_fetch_response;
 use pnd_trade::rate_limit::{
@@ -46,7 +60,13 @@ const MIN_ROUND_GAP_SECS: u64 = 5;
 
 const USAGE: &str = "usage: trade_probe --search <url|id> [--league \"Forbidden Rites\"] \
 [--cap 20] [--currency divine] [--rounds 1] [--session <POESESSID>] \
-[--rates chaos=25.21,exalted=83.42]";
+[--rates chaos=25.21,exalted=83.42]\n       \
+trade_probe --watch --minutes 3 [--poll-seconds 60] --search <url|id> [--search <url|id>] \
+[--cap 20] [--currency divine] [--session <POESESSID>]";
+
+/// 蹲价模式里多久抽一次事件。事件通道是无界的,抽得慢只是屏幕上晚一点看到,
+/// 不会丢。
+const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
 
 fn main() -> ExitCode {
     let args = match Args::parse(std::env::args().skip(1)) {
@@ -67,8 +87,15 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> Result<(), String> {
-    let search_ref = parse_search_reference(&args.search, &args.league)
-        .ok_or_else(|| format!("could not read a search reference out of {:?}", args.search))?;
+    if args.watch {
+        return run_watch(args);
+    }
+    let raw = &args.searches[0];
+    if args.searches.len() > 1 {
+        println!("(one-shot mode only uses the first --search; pass --watch to run several)");
+    }
+    let search_ref = parse_search_reference(raw, &args.league)
+        .ok_or_else(|| format!("could not read a search reference out of {raw:?}"))?;
     let query_json = decode_search_id(&search_ref.search_id).map_err(|e| e.to_string())?;
     let request_body = search_request_body(&query_json);
 
@@ -132,6 +159,185 @@ fn run(args: &Args) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// 蹲价模式:开真的 actor,只负责把事件翻译成人话
+// ---------------------------------------------------------------------
+
+/// `--watch`:造一份内存里的设置,起 actor,盯 N 分钟。
+///
+/// 库开在内存里(`RuntimePaths::in_memory`),所以跑完什么都不留 ——
+/// 这是探针,不该往用户真正的提醒历史里塞测试数据。
+fn run_watch(args: &Args) -> Result<(), String> {
+    let cap = args
+        .cap()
+        .unwrap_or_else(|| Price::new(0, Currency::parse(&args.currency)));
+    let mut settings = AppSettings {
+        league: args.league.clone(),
+        poesessid: args.session.clone().unwrap_or_default(),
+        ..AppSettings::default()
+    };
+    settings.watcher.poll_interval_seconds = args.poll_seconds;
+
+    // 搜索列表和"哪个 uuid 是哪条搜索"的对照表一起建:事件里只带 WatchId,
+    // 屏幕上要显示的是人能认出来的标签。
+    let mut labels: BTreeMap<String, String> = BTreeMap::new();
+    for raw in &args.searches {
+        let search_ref = parse_search_reference(raw, &args.league)
+            .ok_or_else(|| format!("could not read a search reference out of {raw:?}"))?;
+        let query_json = decode_search_id(&search_ref.search_id).map_err(|e| e.to_string())?;
+        let label = label_from_query(&query_json, &search_ref);
+        let entry = WatchEntry::new(label.clone(), &search_ref, cap.clone());
+        labels.insert(entry.id.to_string(), label);
+        settings.watches.push(entry);
+    }
+    settings.normalize();
+
+    println!("league       {}", settings.league);
+    println!(
+        "session      {}",
+        if settings.poesessid.is_empty() {
+            "no (anonymous)"
+        } else {
+            "yes (POESESSID sent, never printed)"
+        }
+    );
+    println!("price cap    {}", cap.display());
+    if cap.amount_milli <= 0 {
+        println!("             (a cap of 0 can never be hit — pass --cap to see ListingMatched)");
+    }
+    println!(
+        "poll every   {} s   (watch database: in memory, nothing is kept)",
+        settings.watcher.poll_interval_seconds
+    );
+    for entry in &settings.watches {
+        println!("watch        {} · {}", entry.label, entry.search_id);
+    }
+    println!("running for  {} minutes\n", args.minutes);
+
+    let handle = RuntimeHandle::start(settings, RuntimePaths::in_memory())
+        .map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(args.minutes * 60);
+    while Instant::now() < deadline {
+        match handle.try_next_event() {
+            Some(event) => print_event(&event, &labels),
+            None => sleep(DRAIN_INTERVAL),
+        }
+    }
+    // 关机的路上还会掉出几个事件(最后一轮的状态),一并抽干再走。
+    drop(handle);
+    println!("\n{} watch window finished.", stamp());
+    Ok(())
+}
+
+/// 一行事件。时间戳是本地时钟,方便和游戏里、网页上看到的时间对上。
+fn print_event(event: &RuntimeEvent, labels: &BTreeMap<String, String>) {
+    let at = stamp();
+    match event {
+        RuntimeEvent::Ready => println!("{at} ready"),
+        RuntimeEvent::RatesUpdated(rates) => println!("{at} rates     {}", describe_rates(rates)),
+        RuntimeEvent::WatchStatus { watch_id, status } => {
+            println!(
+                "{at} watch     {} {}",
+                labels
+                    .get(watch_id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| watch_id.to_string()),
+                describe_status(status)
+            );
+        }
+        RuntimeEvent::Budget { policy, usage } => {
+            println!("{at} budget    {policy}: {}", describe_budget(usage));
+        }
+        RuntimeEvent::ListingMatched(matched) => {
+            let listing = &matched.headline;
+            println!(
+                "{at} MATCH     {} · {} · {} ({}){}  [cap {}]",
+                matched.label,
+                listing
+                    .price
+                    .as_ref()
+                    .map_or_else(|| "no price".to_string(), Price::display),
+                listing.item_name,
+                listing.account,
+                if matched.extra > 0 {
+                    format!("  +{} more", matched.extra)
+                } else {
+                    String::new()
+                },
+                matched.cap.display()
+            );
+            println!("{at}           whisper: {}", listing.whisper);
+        }
+        RuntimeEvent::SessionInvalid => println!("{at} session   the POESESSID was rejected"),
+        RuntimeEvent::CloudflareBlocked { until } => {
+            println!(
+                "{at} blocked   cloudflare — holding for {} s",
+                (until - now_secs()).max(0)
+            );
+        }
+        RuntimeEvent::Log(message) => println!("{at} log       {message}"),
+        RuntimeEvent::Fault(message) => println!("{at} FAULT     {message}"),
+    }
+}
+
+fn describe_status(status: &WatchStatus) -> String {
+    let now = now_secs();
+    let mut parts = vec![format!("{:?}", status.state)];
+    if let Some(at) = status.next_poll_at {
+        parts.push(format!("next in {}s", (at - now).max(0)));
+    }
+    if let Some(total) = status.last_total {
+        parts.push(format!("{total} listed"));
+    }
+    parts.push(format!("hits today {}", status.hits_today));
+    if status.failures > 0 {
+        parts.push(format!("failures {}", status.failures));
+    }
+    if let Some(error) = &status.last_error {
+        parts.push(format!("error: {error}"));
+    }
+    parts.join("  ")
+}
+
+/// 预算行只印 6 小时那个桶:短窗口的桶几乎总是 1/1,长的那个才是
+/// "今天还能查多少次"的答案。
+fn describe_budget(usage: &[BucketUsage]) -> String {
+    let six_hours = usage.iter().find(|bucket| bucket.window_secs == 21_600);
+    match six_hours {
+        Some(bucket) => format!(
+            "{}s {}/{} (server {})",
+            bucket.window_secs, bucket.used, bucket.allowed, bucket.server_limit
+        ),
+        None if usage.is_empty() => "(nothing learned yet)".to_string(),
+        None => usage
+            .iter()
+            .map(render_usage)
+            .collect::<Vec<_>>()
+            .join("  "),
+    }
+}
+
+/// 搜索 id 解出来的查询里通常带着物品名,拿它当标签比印一串 uuid 强。
+fn label_from_query(query_json: &str, search_ref: &SearchRef) -> String {
+    serde_json::from_str::<serde_json::Value>(query_json)
+        .ok()
+        .and_then(|query| {
+            query
+                .get("name")
+                .and_then(|name| name.as_str().map(str::to_string))
+                .or_else(|| {
+                    query
+                        .get("type")
+                        .and_then(|kind| kind.as_str().map(str::to_string))
+                })
+        })
+        .unwrap_or_else(|| search_ref.search_id.chars().take(12).collect())
+}
+
+fn stamp() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
 enum RoundOutcome {
@@ -405,13 +611,6 @@ fn to_milli(value: Option<f64>) -> Option<i64> {
 // 限速器 + 时钟
 // ---------------------------------------------------------------------
 
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// 限速器说这条策略还要等几秒。
 fn limiter_wait(limiter: &mut RateLimiter, policy: &str) -> u64 {
     let now = now_secs();
@@ -435,12 +634,16 @@ fn wait_for_budget(limiter: &mut RateLimiter, policy: &str, label: &str) {
 
 struct Args {
     league: String,
-    search: String,
+    /// 可以给多条:蹲价模式里每条就是一行搜索,一次性模式只看第一条。
+    searches: Vec<String>,
     cap: Option<f64>,
     currency: String,
     rounds: u32,
     session: Option<String>,
     rates: Option<CurrencyRates>,
+    watch: bool,
+    minutes: u64,
+    poll_seconds: u64,
 }
 
 impl Args {
@@ -453,19 +656,38 @@ impl Args {
     /// 而且探针的参数形状随时会变,少一个依赖少一次对齐。
     fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
         let mut league = "Forbidden Rites".to_string();
-        let mut search: Option<String> = None;
+        let mut searches: Vec<String> = Vec::new();
         let mut cap: Option<f64> = None;
         let mut currency = Currency::Divine.code().to_string();
         let mut rounds: u32 = 1;
         let mut session: Option<String> = None;
         let mut rates: Option<CurrencyRates> = None;
+        let mut watch = false;
+        let mut minutes: u64 = 3;
+        let mut poll_seconds: u64 = 300;
 
         let mut args = args.peekable();
         while let Some(flag) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
             match flag.as_str() {
                 "--league" => league = value()?,
-                "--search" => search = Some(value()?),
+                "--search" => searches.push(value()?),
+                "--watch" => watch = true,
+                "--minutes" => {
+                    let raw = value()?;
+                    minutes = raw
+                        .parse::<u64>()
+                        .map_err(|_| format!("--minutes wants a whole number, got {raw:?}"))?;
+                    if minutes == 0 {
+                        return Err("--minutes must be at least 1".to_string());
+                    }
+                }
+                "--poll-seconds" => {
+                    let raw = value()?;
+                    poll_seconds = raw
+                        .parse::<u64>()
+                        .map_err(|_| format!("--poll-seconds wants a whole number, got {raw:?}"))?;
+                }
                 "--cap" => {
                     let raw = value()?;
                     cap = Some(
@@ -490,14 +712,22 @@ impl Args {
             }
         }
 
+        if searches.is_empty() {
+            return Err("--search is required".to_string());
+        }
         Ok(Args {
             league,
-            search: search.ok_or("--search is required")?,
+            searches,
             cap,
             currency,
             rounds,
             session,
             rates,
+            watch,
+            minutes,
+            // 低于 60 秒对交易站不礼貌;`AppSettings::normalize` 也会兜这一下,
+            // 这里先兜是为了打印出来的数就是真正会用的数。
+            poll_seconds: poll_seconds.max(60),
         })
     }
 }
