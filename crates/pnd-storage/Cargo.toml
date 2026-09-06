@@ -1,0 +1,18 @@
+[package]
+name = "pnd-storage"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SQLite persistence: watch state, alert history, ninja sampling cache"
+
+[dependencies]
+pnd-domain = { path = "../pnd-domain" }
+pnd-ninja = { path = "../pnd-ninja" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "pnd-runtime"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Actor thread orchestrating the trade gateway, polling, live search, and ninja sampling"
+
+[dependencies]
+pnd-domain = { path = "../pnd-domain" }
+pnd-trade = { path = "../pnd-trade" }
+pnd-ninja = { path = "../pnd-ninja" }
+pnd-storage = { path = "../pnd-storage" }
+pnd-settings = { path = "../pnd-settings" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true

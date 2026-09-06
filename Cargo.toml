@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pnd-app",
+    "crates/pnd-domain",
+    "crates/pnd-ninja",
+    "crates/pnd-platform-win",
+    "crates/pnd-runtime",
+    "crates/pnd-settings",
+    "crates/pnd-storage",
+    "crates/pnd-trade",
+]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["SouNd <soundmys1994@gmail.com>"]
+edition = "2024"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/SouNdmys/POE-Ninja-Data"
+rust-version = "1.88"
+
+[workspace.dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "serde", "std"] }
+thiserror = "2.0.18"
+uuid = { version = "1.22.0", features = ["serde", "v4"] }
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+ureq = { version = "3.4", default-features = false, features = ["rustls", "gzip", "win-system-proxy"] }
+windows = "0.61.3"
+gpui = "0.2"
+gpui-component = "0.5"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"
+opt-level = "s"

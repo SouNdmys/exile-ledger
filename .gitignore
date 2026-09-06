@@ -1,0 +1,8 @@
+.vs/
+.idea/
+target/
+target-*/
+artifacts/
+*.user
+*.suo
+target/package/

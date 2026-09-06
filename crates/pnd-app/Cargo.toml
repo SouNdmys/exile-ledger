@@ -1,0 +1,32 @@
+[package]
+name = "pnd-app"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "POE Ninja Data GPUI desktop front end"
+default-run = "pnd-app"
+
+[lib]
+name = "pnd_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pnd-app"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+pnd-domain = { path = "../pnd-domain" }
+pnd-trade = { path = "../pnd-trade" }
+pnd-ninja = { path = "../pnd-ninja" }
+pnd-storage = { path = "../pnd-storage" }
+pnd-settings = { path = "../pnd-settings" }
+pnd-runtime = { path = "../pnd-runtime" }
+pnd-platform-win = { path = "../pnd-platform-win" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
