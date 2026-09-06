@@ -36,7 +36,7 @@ use pnd_ninja::aggregate::aggregate_mods;
 use pnd_ninja::character::CharacterDetail;
 use pnd_ninja::client::{NinjaClient, NinjaError};
 use pnd_ninja::economy::UNIQUE_TYPES;
-use pnd_ninja::index_state::LeagueBuild;
+use pnd_ninja::index_state::{IndexState, LeagueBuild};
 use pnd_ninja::plan::{
     Partition, PartitionTier, SampleOptions, SampledCharacter, class_skill_partitions,
     first_pass_partitions, query_from_key,
@@ -278,6 +278,20 @@ pub fn should_skip(
 pub fn character_limit(sample_target: u32, already_done: u32, max_characters: Option<u32>) -> u32 {
     let remaining = sample_target.saturating_sub(already_done);
     max_characters.map_or(remaining, |cap| cap.min(remaining))
+}
+
+/// 这一轮该按哪个联赛短名去问 poe.ninja。
+///
+/// 界面手上只有 `settings.json` 里那个显示名(`Forbidden Rites`),短名是
+/// [`league_url_guess`](pnd_ninja::index_state::league_url_guess) 猜的。但
+/// index-state 每条快照都同时带着显示名和短名 —— **手上有它就别再猜**:
+/// 猜法只是规律,没有任何接口承诺过,猜错一次的代价是整轮采样以
+/// `UnknownLeague` 收场,而正确答案就在刚读回来的那份 JSON 里。
+fn resolve_league_url(index: &IndexState, league_name: &str, guessed: &str) -> String {
+    index
+        .league_url_for_name(league_name)
+        .unwrap_or(guessed)
+        .to_owned()
 }
 
 /// 距离下一次请求还该等多久。
@@ -734,18 +748,21 @@ impl<'a> Sampler<'a> {
     /// 读 index-state / build-index-state,决定这一轮挂在哪个 version 上,落一行快照。
     fn open_snapshot(&mut self, latest: Option<&SnapshotRow>) -> Result<LeagueBuild, SamplerError> {
         let index = self.fetch(NinjaClient::index_state)?;
+        // 手上有 index-state 了,就别再用猜出来的短名(见 `resolve_league_url`)。
+        let league_url =
+            resolve_league_url(&index, &self.config.league_name, &self.config.league_url);
         let fresh = index
-            .snapshot_for_url(&self.config.league_url)
-            .ok_or_else(|| SamplerError::UnknownLeague(self.config.league_url.clone()))?
+            .snapshot_for_url(&league_url)
+            .ok_or_else(|| SamplerError::UnknownLeague(league_url.clone()))?
             .clone();
 
         let builds = self.fetch(NinjaClient::build_index_state)?;
         let league = builds
             .league_builds
             .iter()
-            .find(|entry| entry.league_url == self.config.league_url)
+            .find(|entry| entry.league_url == league_url)
             .cloned()
-            .ok_or_else(|| SamplerError::UnknownLeague(self.config.league_url.clone()))?;
+            .ok_or_else(|| SamplerError::UnknownLeague(league_url.clone()))?;
 
         // 续跑时**沿用库里那个 version**:分区和统计都是按 version 存的,
         // 换成刚读回来的新号等于把跑了一半的工作全作废重来一遍。
@@ -1100,6 +1117,7 @@ fn label(key: &str) -> &str {
 #[cfg(test)]
 mod ninja_sampler_tests {
     use super::*;
+    use pnd_ninja::index_state::SnapshotVersion;
     use pnd_ninja::search::{Column, DictionaryRef, Facet, FacetEntry};
 
     fn snapshot(stage: SnapshotStage, started_at: i64, finished_at: Option<i64>) -> SnapshotRow {
@@ -1220,6 +1238,40 @@ mod ninja_sampler_tests {
             .expect("row");
         assert_eq!(row.stage, SnapshotStage::Aggregated);
         assert!(row.finished_at.is_some());
+    }
+
+    /// 联赛短名以 index-state 说的为准。
+    ///
+    /// 界面手上只有显示名,短名是猜出来的(去掉非字母数字再小写)。这个猜法
+    /// 对 `Forbidden Rites` 是对的,但它只是规律不是承诺 —— 猜错了的话
+    /// `snapshot_for_url` 找不到东西,整轮采样以 `UnknownLeague` 收场,
+    /// 而 poe.ninja 明明在同一份 index-state 里把正确答案写着。
+    #[test]
+    fn the_league_short_name_comes_from_the_index_when_the_name_matches() {
+        let index = IndexState {
+            snapshot_versions: vec![SnapshotVersion {
+                url: "fr2".to_owned(),
+                name: "Forbidden Rites".to_owned(),
+                ..SnapshotVersion::default()
+            }],
+            ..IndexState::default()
+        };
+
+        // 猜出来的 `forbiddenrites` 是错的,但显示名对得上。
+        assert_eq!(
+            resolve_league_url(&index, "Forbidden Rites", "forbiddenrites"),
+            "fr2"
+        );
+        // 大小写不该影响(用户在设置里怎么打的都算)。
+        assert_eq!(
+            resolve_league_url(&index, "forbidden rites", "forbiddenrites"),
+            "fr2"
+        );
+        // 这一轮没索引这个联赛:名字查不到,只能用猜的那个。
+        assert_eq!(
+            resolve_league_url(&index, "Runes of Aldur", "runesofaldur"),
+            "runesofaldur"
+        );
     }
 
     #[test]
