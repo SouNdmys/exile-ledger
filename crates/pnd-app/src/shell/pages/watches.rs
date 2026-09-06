@@ -237,7 +237,8 @@ fn text_of(input: &Entity<InputState>, cx: &App) -> String {
 /// 千分整数 → 人看的小数(和 `Price::display` 同一套规矩,但不带货币名)。
 ///
 /// 汇率是"1 divine 换多少 chaos",货币名写在模板里,数字这边只出数字。
-fn milli_text(milli: i64) -> String {
+/// 暗金热度页的参考价(exalted × 1000)也是这个规矩,所以它借这一份。
+pub(crate) fn milli_text(milli: i64) -> String {
     let whole = milli / 1000;
     let frac = (milli % 1000).unsigned_abs();
     if frac == 0 {

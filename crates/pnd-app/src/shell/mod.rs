@@ -1,36 +1,39 @@
 //! 外壳:左边五个导航按钮,右边当前页,底下一条状态行。
 //!
-//! 蹲价页、提醒记录页和设置页现在画的都是真数据:搜索列表来自
-//! `settings.json`,运行状态和预算来自 `pnd-runtime` 的 actor,提醒历史
-//! 来自 `watch.sqlite`。ninja 那两页仍然是示例数据(第 9 / 12 步接)。
+//! 五页画的都是真数据:搜索列表来自 `settings.json`,运行状态和预算来自
+//! `pnd-runtime` 的 actor,提醒历史来自 `watch.sqlite`,暗金热度和词缀热度
+//! 来自 `ninja.sqlite` 里那份采样缓存。
 //!
-//! `tick` 是外壳唯一的心跳(120ms)。运行时事件和卡片按钮的回声都从这里
-//! 抽干,理由和兄弟项目一样:GPUI 的视图只能在它自己的线程上改,后台线程
-//! 只能把消息塞进通道,总得有人定期来取。接线本身在 [`link`] 里。
+//! `tick` 是外壳唯一的心跳(120ms)。运行时事件、卡片按钮的回声、ninja
+//! 采样的进度都从这里抽干,理由和兄弟项目一样:GPUI 的视图只能在它自己的
+//! 线程上改,后台线程只能把消息塞进通道,总得有人定期来取。交易那一侧的
+//! 接线在 [`link`] 里,ninja 那一侧在 [`ninja`] 里。
 
 pub mod link;
+pub mod ninja;
 pub mod pages;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
+    App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
     ParentElement, Render, SharedString, Styled, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::select::{SearchableVec, SelectItem, SelectState};
+use gpui_component::select::{SearchableVec, SelectEvent, SelectItem, SelectState};
 use gpui_component::table::TableState;
 use gpui_component::{IndexPath, Selectable as _, Sizable as _, Size, StyledExt as _};
 
 use pnd_domain::{CurrencyRates, WatchId};
 use pnd_platform_win::AlertCardService;
-use pnd_runtime::{MatchedListing, RuntimeHandle, WatchStatus, now_secs};
-use pnd_storage::{AlertRow, WatchStore};
+use pnd_runtime::{MatchedListing, RuntimeHandle, SamplerHandle, WatchStatus, now_secs};
+use pnd_storage::{AlertRow, NinjaStore, WatchStore};
 use pnd_trade::BucketUsage;
 
 use crate::i18n;
 use crate::theme::*;
+use ninja::NinjaData;
 use pages::SimpleTable;
 
 /// 状态行只显示最后一条,但留一小段历史,方便将来做"日志"抽屉。
@@ -201,6 +204,16 @@ pub struct AppShell {
     pub(crate) alert_card: Option<AlertCardService>,
     /// 提醒记录页自己的一条库连接(actor 那条在别的线程上,不能共用)。
     pub(crate) alerts_store: Option<WatchStore>,
+    /// ninja 两页自己的一条库连接。采样线程另开一条,WAL 让两边互不打断。
+    pub(crate) ninja_store: Option<NinjaStore>,
+    /// 正在跑的那一轮采样。`None` = 这个进程还没按过刷新。
+    ///
+    /// 句柄的 `Drop` 会取消并等线程收摊,所以它挂在这儿就等于"关窗即停手"。
+    pub(crate) sampler: Option<SamplerHandle>,
+    /// 采样线程还在跑。刷新按钮据此变灰。
+    pub(crate) sampler_busy: bool,
+    /// 采样最近说的那句话,画在暗金热度页的脚注上。
+    pub(crate) sampler_line: String,
 
     /// 每条搜索现在跑到哪一步。actor 每次状态有变就整份广播,这里只管存最新的。
     pub(crate) watch_status: BTreeMap<WatchId, WatchStatus>,
@@ -211,12 +224,24 @@ pub struct AppShell {
     pub(crate) shown_cards: BTreeMap<i64, MatchedListing>,
     /// 提醒记录页当前显示的那些行。
     pub(crate) alert_rows: Vec<AlertRow>,
+    /// ninja 缓存在界面这边的那份副本。
+    pub(crate) ninja: NinjaData,
     /// 新增搜索表单下面那行红字。空串 = 没有错。
     pub(crate) watch_error: String,
 
-    /// 表格内容要重建了。行是每次整份换掉的,没有这两个标志就得每拍重建。
+    /// 表格内容要重建了。行是每次整份换掉的,没有这四个标志就得每拍重建。
     pub(crate) watches_dirty: bool,
     pub(crate) alerts_dirty: bool,
+    pub(crate) uniques_dirty: bool,
+    pub(crate) mods_dirty: bool,
+    /// ninja 那几个下拉的选项要重造了(数据换了或者语言换了)。
+    ///
+    /// 单独一个标志是因为重造下拉要 `&mut Window`,而 tick 手上没有窗口;
+    /// 真正的重造放在 render 里做。
+    pub(crate) ninja_filters_dirty: bool,
+    /// 两页各自的"显示全部"开关。
+    pub(crate) uniques_show_all: bool,
+    pub(crate) mods_show_all: bool,
     /// 到这个时刻重读一次提醒历史(等 actor 把命令写进库)。
     pub(crate) alerts_refresh_at: Option<Instant>,
     /// 上一次重建蹲价表时的秒数。倒计时每秒动一次,不必每拍动。
@@ -230,9 +255,7 @@ pub struct AppShell {
     pub(crate) uniques_table: Entity<TableState<SimpleTable>>,
     pub(crate) mods_table: Entity<TableState<SimpleTable>>,
 
-    pub(crate) uniques_league_select: ChoiceSelect,
-    pub(crate) uniques_class_select: ChoiceSelect,
-    pub(crate) uniques_skill_select: ChoiceSelect,
+    pub(crate) uniques_partition_select: ChoiceSelect,
     pub(crate) mods_slot_select: ChoiceSelect,
     pub(crate) mods_rarity_select: ChoiceSelect,
     pub(crate) mods_kind_select: ChoiceSelect,
@@ -300,6 +323,17 @@ impl AppShell {
                 None
             }
         };
+        // ninja 那个库是纯缓存:打不开只是两页空着,剩下的功能一个都不少。
+        let ninja_store = match NinjaStore::open(crate::ninja_db_path()) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                startup.push(format!("could not open the ninja cache: {error}"));
+                if notice.is_empty() {
+                    notice = text.ninja_store_missing.to_owned();
+                }
+                None
+            }
+        };
         for line in startup {
             log.push_back(line);
         }
@@ -330,20 +364,49 @@ impl AppShell {
         let uniques_table = new_table(pages::ninja_uniques::table_content(text), window, cx);
         let mods_table = new_table(pages::ninja_mods::table_content(text), window, cx);
 
-        let uniques_league_select = choice_select(
-            pages::ninja_uniques::league_choices(&settings),
-            &settings.league,
+        // 四个下拉先按空数据造出来:库还没读呢。第一次 render 时
+        // `sync_ninja_filters` 会拿真数据把它们重造一遍。
+        let uniques_partition_select = choice_select(
+            pages::ninja_uniques::partition_choices(&[], text),
+            "",
             window,
             cx,
         );
-        let uniques_class_select =
-            choice_select(pages::ninja_uniques::class_choices(text), "", window, cx);
-        let uniques_skill_select =
-            choice_select(pages::ninja_uniques::skill_choices(text), "", window, cx);
-        let mods_slot_select = choice_select(pages::ninja_mods::slot_choices(text), "", window, cx);
+        let mods_slot_select =
+            choice_select(pages::ninja_mods::slot_choices(&[], text), "", window, cx);
         let mods_rarity_select =
-            choice_select(pages::ninja_mods::rarity_choices(text), "", window, cx);
-        let mods_kind_select = choice_select(pages::ninja_mods::kind_choices(text), "", window, cx);
+            choice_select(pages::ninja_mods::rarity_choices(&[], text), "", window, cx);
+        let mods_kind_select =
+            choice_select(pages::ninja_mods::kind_choices(&[], text), "", window, cx);
+
+        // 换一次筛选器 = 换一份要画的行。分区那个还要回库里重查一次:
+        // 每个分区的暗金榜和分母都不一样。
+        cx.subscribe(
+            &uniques_partition_select,
+            |this: &mut AppShell, _, event, cx| {
+                let SelectEvent::Confirm(Some(value)) = event else {
+                    return;
+                };
+                if this.ninja.selected_partition == value.as_ref() {
+                    return;
+                }
+                this.ninja.selected_partition = value.to_string();
+                this.reload_ninja_uniques();
+                cx.notify();
+            },
+        )
+        .detach();
+        for select in [&mods_slot_select, &mods_rarity_select, &mods_kind_select] {
+            cx.subscribe(select, |this: &mut AppShell, _, event, cx| {
+                if matches!(event, SelectEvent::Confirm(_)) {
+                    this.mods_dirty = true;
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
+
+        let ninja = NinjaData::empty(ninja::league_url_for(&settings.league));
 
         let mut shell = Self {
             focus_handle: cx.focus_handle(),
@@ -358,15 +421,25 @@ impl AppShell {
             runtime,
             alert_card,
             alerts_store,
+            ninja_store,
+            sampler: None,
+            sampler_busy: false,
+            sampler_line: String::new(),
             watch_status: BTreeMap::new(),
             budget: BTreeMap::new(),
             rates: CurrencyRates::none(),
             shown_cards: BTreeMap::new(),
             alert_rows: Vec::new(),
+            ninja,
             watch_error: String::new(),
-            // 两张表现在还是空的(列已经有了):第一拍就会填上真数据。
+            // 四张表现在还是空的(列已经有了):第一拍就会填上真数据。
             watches_dirty: true,
             alerts_dirty: true,
+            uniques_dirty: true,
+            mods_dirty: true,
+            ninja_filters_dirty: true,
+            uniques_show_all: false,
+            mods_show_all: false,
             alerts_refresh_at: None,
             last_second: 0,
             settings_form,
@@ -375,14 +448,13 @@ impl AppShell {
             alerts_table,
             uniques_table,
             mods_table,
-            uniques_league_select,
-            uniques_class_select,
-            uniques_skill_select,
+            uniques_partition_select,
             mods_slot_select,
             mods_rarity_select,
             mods_kind_select,
         };
         shell.refresh_alerts();
+        shell.reload_ninja();
         shell
     }
 
@@ -437,6 +509,14 @@ impl AppShell {
             self.rebuild_alerts_table(cx);
             changed = true;
         }
+        if self.uniques_dirty {
+            self.rebuild_uniques_table(cx);
+            changed = true;
+        }
+        if self.mods_dirty {
+            self.rebuild_mods_table(cx);
+            changed = true;
+        }
 
         if let Some(at) = self.notice_at
             && at.elapsed() >= NOTICE_LIFETIME
@@ -484,6 +564,81 @@ impl AppShell {
         });
     }
 
+    /// 暗金表 = 选中分区的 `items` 分面 × 经济接口的参考价。
+    fn rebuild_uniques_table(&mut self, cx: &mut Context<Self>) {
+        self.uniques_dirty = false;
+        let content = pages::ninja_uniques::table_content_for(
+            &self.ninja.uniques,
+            &self.rates,
+            self.uniques_show_all,
+            self.text(),
+        );
+        self.uniques_table.update(cx, |state, cx| {
+            state.delegate_mut().set_content(content);
+            state.refresh(cx);
+        });
+    }
+
+    /// 词缀表 = 这一轮的统计,按三个下拉筛一遍。
+    fn rebuild_mods_table(&mut self, cx: &mut Context<Self>) {
+        self.mods_dirty = false;
+        let (slot, rarity, kind) = self.mods_filters(cx);
+        let content = pages::ninja_mods::table_content_for(
+            &self.ninja.mods,
+            &slot,
+            &rarity,
+            &kind,
+            self.mods_show_all,
+            self.text(),
+        );
+        self.mods_table.update(cx, |state, cx| {
+            state.delegate_mut().set_content(content);
+            state.refresh(cx);
+        });
+    }
+
+    /// 词缀页三个下拉现在选的是什么。空串 = "全部"。
+    pub(crate) fn mods_filters(&self, cx: &App) -> (String, String, String) {
+        (
+            selected_value(&self.mods_slot_select, cx),
+            selected_value(&self.mods_rarity_select, cx),
+            selected_value(&self.mods_kind_select, cx),
+        )
+    }
+
+    /// ninja 那几个下拉:数据换了(采样跑完)或者语言换了就重造一遍。
+    ///
+    /// 只能在 render 里做 —— 上游的下拉换选项要 `&mut Window`,而心跳
+    /// 手上只有一个 `Context`。
+    fn sync_ninja_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.ninja_filters_dirty {
+            return;
+        }
+        self.ninja_filters_dirty = false;
+        let text = self.text();
+        let partitions = pages::ninja_uniques::partition_choices(&self.ninja.partition_keys, text);
+        let slots = pages::ninja_mods::slot_choices(&self.ninja.mods, text);
+        let rarities = pages::ninja_mods::rarity_choices(&self.ninja.mods, text);
+        let kinds = pages::ninja_mods::kind_choices(&self.ninja.mods, text);
+        let partition = self.ninja.selected_partition.clone();
+
+        relabel_select(
+            &self.uniques_partition_select.clone(),
+            partitions,
+            Some(&partition),
+            window,
+            cx,
+        );
+        for (select, items) in [
+            (self.mods_slot_select.clone(), slots),
+            (self.mods_rarity_select.clone(), rarities),
+            (self.mods_kind_select.clone(), kinds),
+        ] {
+            // `None` = 留着用户现在筛的那一档:换个界面语言不该把它清回"全部"。
+            relabel_select(&select, items, None, window, cx);
+        }
+    }
+
     /// 换语言之后,把语言烘进去的那些东西重造一遍。
     ///
     /// 表头和下拉选项在造出来的那一刻就把文字复制走了,之后不会自己跟着
@@ -496,48 +651,13 @@ impl AppShell {
         self.language = self.settings.ui_language.clone();
         let text = self.text();
 
-        // 蹲价表和提醒表连行带列一起重建(表头和格子里的状态词都跟着语言走),
-        // 走各自的 rebuild;剩下两张还是示例数据,原地换一份就行。
+        // 四张表连行带列一起重建(表头和格子里的状态词都跟着语言走),
+        // 走各自的 rebuild;ninja 那几个下拉交给 `sync_ninja_filters`。
         self.watches_dirty = true;
         self.alerts_dirty = true;
-        for (table, content) in [
-            (
-                &self.uniques_table,
-                pages::ninja_uniques::table_content(text),
-            ),
-            (&self.mods_table, pages::ninja_mods::table_content(text)),
-        ] {
-            table.update(cx, |state, cx| {
-                state.delegate_mut().set_content(content);
-                state.refresh(cx);
-            });
-        }
-
-        let selects = [
-            (
-                self.uniques_class_select.clone(),
-                pages::ninja_uniques::class_choices(text),
-            ),
-            (
-                self.uniques_skill_select.clone(),
-                pages::ninja_uniques::skill_choices(text),
-            ),
-            (
-                self.mods_slot_select.clone(),
-                pages::ninja_mods::slot_choices(text),
-            ),
-            (
-                self.mods_rarity_select.clone(),
-                pages::ninja_mods::rarity_choices(text),
-            ),
-            (
-                self.mods_kind_select.clone(),
-                pages::ninja_mods::kind_choices(text),
-            ),
-        ];
-        for (select, items) in selects {
-            relabel_select(&select, items, None, window, cx);
-        }
+        self.uniques_dirty = true;
+        self.mods_dirty = true;
+        self.ninja_filters_dirty = true;
 
         self.watches_form.relabel(&self.settings, text, window, cx);
         self.settings_form.relabel(&self.settings, text, window, cx);
@@ -595,6 +715,7 @@ impl AppShell {
 impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_language(window, cx);
+        self.sync_ninja_filters(window, cx);
         let text = self.text();
 
         let body = match self.page {
@@ -655,6 +776,27 @@ impl Render for AppShell {
             )
             .child(self.status_bar())
     }
+}
+
+impl Drop for AppShell {
+    /// 关窗时先请采样线程停手。
+    ///
+    /// 它可能正睡在一个 60 秒的退避里,而句柄自己的 `Drop` 紧接着要 join 它;
+    /// 先立标志,那一觉最多再睡 100 毫秒就醒。
+    fn drop(&mut self) {
+        if let Some(sampler) = &self.sampler {
+            sampler.cancel();
+        }
+    }
+}
+
+/// 一个下拉现在选的值。没选中就是空串 —— 每个下拉的第一项都是"全部",
+/// 空串本来就是它的值。
+pub(crate) fn selected_value(select: &ChoiceSelect, cx: &App) -> String {
+    select
+        .read(cx)
+        .selected_value()
+        .map_or_else(String::new, ToString::to_string)
 }
 
 /// 页面通用的一块面板。

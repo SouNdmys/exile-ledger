@@ -4,9 +4,10 @@
 //! **一个** `TableDelegate`,页面各自给它列和行 —— 四份几乎一样的委托
 //! 抄下来,以后改一次表格外观就要改四处,总有一处会忘。
 //!
-//! 蹲价页和提醒记录页的行是真数据(设置 + actor 状态 + `watch.sqlite`),
-//! ninja 那两页还是写死的示例数据 —— 它不是占位横杠:列宽、对齐、颜色都要
-//! 拿真实长度的字去量,空表量不出来。
+//! 四页的行现在都是真数据:蹲价和提醒记录来自设置 + actor 状态 +
+//! `watch.sqlite`,暗金热度和词缀热度来自 `ninja.sqlite` 里的采样缓存。
+//! 每一页的"行构造器"都是纯函数(输入是数据,输出是格子),所以列宽、
+//! 对齐、每一格写什么都测得动。
 
 pub mod alerts;
 pub mod ninja_mods;
@@ -219,6 +220,37 @@ mod pages_tests {
         watches::table_content_for(&settings, &status, text, 1_000_000)
     }
 
+    /// 一件暗金 + 它的参考价,拿来量暗金榜。
+    fn unique_content(text: &'static i18n::Text) -> TableContent {
+        let rows = vec![crate::shell::ninja::UniqueRow {
+            name: "Wake of Destruction".to_string(),
+            users: 7_464,
+            share_percent: 11.42,
+            price_milli: Some(29_900),
+            listings: Some(131),
+            change_percent: Some(-4.5),
+        }];
+        ninja_uniques::table_content_for(&rows, &pnd_domain::CurrencyRates::none(), false, text)
+    }
+
+    /// 一行词缀统计,拿来量词缀表。
+    fn mod_content(text: &'static i18n::Text) -> TableContent {
+        let stats = vec![pnd_ninja::aggregate::SlotModStat {
+            slot: "BodyArmour".to_string(),
+            rarity: "Rare".to_string(),
+            mod_kind: "explicit".to_string(),
+            stat_id: "base_maximum_life".to_string(),
+            mod_family: "IncreasedLife".to_string(),
+            characters: 13,
+            occurrences: 13,
+            sample_size: 47,
+            p25: Some(108.0),
+            p50: Some(176.0),
+            p75: Some(211.0),
+        }];
+        ninja_mods::table_content_for(&stats, "BodyArmour", "", "", false, text)
+    }
+
     /// 一条提醒历史,拿来量提醒表。
     fn alert_content(text: &'static i18n::Text) -> TableContent {
         let rows = vec![AlertRow {
@@ -251,8 +283,8 @@ mod pages_tests {
             for (name, content) in [
                 ("watches", watch_content(text)),
                 ("alerts", alert_content(text)),
-                ("uniques", ninja_uniques::table_content(text)),
-                ("mods", ninja_mods::table_content(text)),
+                ("uniques", unique_content(text)),
+                ("mods", mod_content(text)),
             ] {
                 assert!(!content.columns.is_empty(), "{name} 一列都没有");
                 assert!(
@@ -270,14 +302,16 @@ mod pages_tests {
         }
     }
 
-    /// 上面那条只在"有行"时才检查得到东西 —— 两个真数据的行构造器要是
-    /// 哪天返回了空表,它会一声不响地通过。这条守住"确实造出了行"。
+    /// 上面那条只在"有行"时才检查得到东西 —— 行构造器要是哪天返回了空表,
+    /// 它会一声不响地通过。这条守住"确实造出了行"。
     #[test]
     fn the_real_row_builders_produce_rows() {
         for language in i18n::LANGUAGES {
             let text = i18n::text(language);
             assert_eq!(watch_content(text).rows.len(), 1);
             assert_eq!(alert_content(text).rows.len(), 1);
+            assert_eq!(unique_content(text).rows.len(), 1);
+            assert_eq!(mod_content(text).rows.len(), 1);
         }
     }
 }

@@ -47,7 +47,7 @@ pub fn watch_db_path() -> PathBuf {
     redirect(&pnd_storage::default_watch_db_path(), DATA_DIR_ENV)
 }
 
-/// ninja 采样缓存的位置(第 9 步才有人用,先按同一套规矩定下来)。
+/// ninja 采样缓存的位置。界面这一侧只读它,采样线程另开一条连接写它。
 #[must_use]
 pub fn ninja_db_path() -> PathBuf {
     redirect(&pnd_storage::default_ninja_db_path(), DATA_DIR_ENV)

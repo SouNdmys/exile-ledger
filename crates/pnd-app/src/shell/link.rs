@@ -6,8 +6,8 @@
 //! 借用形状都不一样,混在一个文件里每加一个事件都要重读整页。
 //!
 //! 三条纪律:
-//! - **抽干,不阻塞。** 两个事件源都是 `try_*`,一次 tick 取到 `None` 为止;
-//!   界面线程不等任何后台线程。
+//! - **抽干,不阻塞。** 三个事件源(actor、卡片、ninja 采样)都是 `try_*`,
+//!   一次 tick 取到 `None` 为止;界面线程不等任何后台线程。
 //! - **后台起不来不等于程序完蛋。** actor 或卡片没起来,程序照常开窗,
 //!   状态行上说清楚哪一半没了。
 //! - **游戏内的动作永远是用户点的。** "去藏身处"在这里只是一句提示 +
@@ -146,6 +146,9 @@ impl AppShell {
             self.on_card_event(event, cx);
             changed = true;
         }
+        // ninja 采样是第三个事件源。它和交易那两条完全无关(不碰交易站、
+        // 不碰 actor),只是同样需要有人定期来取。
+        changed |= self.drain_sampler_events();
         changed
     }
 
@@ -181,6 +184,8 @@ impl AppShell {
             RuntimeEvent::RatesUpdated(rates) => {
                 self.rates = rates;
                 self.watches_dirty = true;
+                // 暗金榜那一列写的是"N exalted ≈ M divine",换算就靠这份汇率。
+                self.uniques_dirty = true;
             }
             RuntimeEvent::Log(line) => self.push_log(line),
             RuntimeEvent::Fault(line) => {

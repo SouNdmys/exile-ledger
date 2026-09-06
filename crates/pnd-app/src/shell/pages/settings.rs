@@ -507,6 +507,8 @@ impl AppShell {
         self.settings_form.write_back(&settings, window, cx);
         // 联赛、语言之类改完,蹲价表那几列跟着变。
         self.watches_dirty = true;
+        // 换了联赛就等于换了一份 ninja 缓存:库里的行都是按联赛短名分的。
+        self.resync_ninja_league();
         cx.notify();
     }
 
