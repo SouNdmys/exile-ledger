@@ -215,6 +215,25 @@ pub struct CharacterRow {
     pub fetched_at: Option<i64>,
 }
 
+/// 暗金榜上的一行:人气(builds 的 `items` 分面)+ 参考价(经济接口)。
+///
+/// 两张表在库里就拼好了。一行一次 [`NinjaStore::unique_price`] 也能拼出来,
+/// 但全联赛有四百多件暗金,那就是四百多次查询;`LEFT JOIN` 一次就够。
+///
+/// 价格那三格是 `Option`:没有价格的暗金照样要上榜(新出的、或者压根没人挂单),
+/// 只是价格那几列写"—"。
+#[derive(Debug, Clone, PartialEq)]
+pub struct UniqueUsagePriced {
+    pub name: String,
+    /// 这个分区里有多少个角色穿着它。
+    pub users: u64,
+    /// 参考价,exalted × 1000。
+    pub price_milli: Option<i64>,
+    pub listings: Option<i64>,
+    /// 7 天涨跌,百分比。价格表里有这件东西、但 `sparkLine` 是空的时候也是 `None`。
+    pub change_percent: Option<f64>,
+}
+
 /// 一件暗金的参考价快照。价格单位是 exalted × 1000。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UniquePriceRow {
@@ -635,6 +654,23 @@ impl NinjaStore {
         rarity: Option<&str>,
         min_share_percent: f64,
     ) -> Result<Vec<SlotModStat>, StorageError> {
+        self.slot_mods_of_kind(league_url, version, slot, rarity, None, min_share_percent)
+    }
+
+    /// 同一张表,再多一个词缀类型的筛子(`explicit` / `implicit` / `rune` / …)。
+    ///
+    /// 类型是主键的一维,所以在库里筛比读回来再筛便宜。分成一个兄弟函数而不是
+    /// 给 [`slot_mods`](Self::slot_mods) 加参数:那个签名有三个调用方,
+    /// 其中大部分本来就不关心类型。
+    pub fn slot_mods_of_kind(
+        &self,
+        league_url: &str,
+        version: &str,
+        slot: Option<&str>,
+        rarity: Option<&str>,
+        mod_kind: Option<&str>,
+        min_share_percent: f64,
+    ) -> Result<Vec<SlotModStat>, StorageError> {
         let mut statement = self.conn.prepare(
             "SELECT slot, rarity, mod_kind, stat_id, mod_family,
                     characters, occurrences, sample_size, p25, p50, p75
@@ -642,11 +678,19 @@ impl NinjaStore {
              WHERE league_url = ?1 AND version = ?2
                AND (?3 IS NULL OR slot = ?3)
                AND (?4 IS NULL OR rarity = ?4)
-               AND CAST(characters AS REAL) * 100.0 / MAX(sample_size, 1) >= ?5
+               AND (?5 IS NULL OR mod_kind = ?5)
+               AND CAST(characters AS REAL) * 100.0 / MAX(sample_size, 1) >= ?6
              ORDER BY slot, rarity, mod_kind, characters DESC, stat_id",
         )?;
         let rows = statement.query_map(
-            params![league_url, version, slot, rarity, min_share_percent],
+            params![
+                league_url,
+                version,
+                slot,
+                rarity,
+                mod_kind,
+                min_share_percent
+            ],
             slot_mod_from_row,
         )?;
         collect(rows)
@@ -674,6 +718,53 @@ impl NinjaStore {
             let (entry, count) = row?;
             if !is_rarity_bucket(&entry) {
                 out.push((entry, to_u64(count)));
+            }
+        }
+        Ok(out)
+    }
+
+    /// 同一份榜,价格在库里就拼好了。
+    ///
+    /// 挑价格的规矩和 [`unique_price`](Self::unique_price) 一模一样:同名不同底子时
+    /// 取挂单最多的那条,打平了按底子名定序。这里用窗口函数在子查询里先排好名次,
+    /// 只让第一名参与 `JOIN` —— 不这么做的话,`Berek's Grip` 这种一名多底的
+    /// 会在榜上出现好几行。
+    pub fn unique_usage_with_prices(
+        &self,
+        league_url: &str,
+        version: &str,
+        partition_key: &str,
+    ) -> Result<Vec<UniqueUsagePriced>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT facets.entry, facets.count,
+                    prices.primary_value_milli, prices.listing_count, prices.total_change
+             FROM ninja_facets AS facets
+             LEFT JOIN (
+                 SELECT name, primary_value_milli, listing_count, total_change,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY name ORDER BY listing_count DESC, base_type
+                        ) AS seat
+                 FROM ninja_unique_prices
+                 WHERE league_url = ?1
+             ) AS prices ON prices.name = facets.entry AND prices.seat = 1
+             WHERE facets.league_url = ?1 AND facets.version = ?2
+               AND facets.partition_key = ?3 AND facets.facet = 'items'
+             ORDER BY facets.count DESC, facets.entry",
+        )?;
+        let rows = statement.query_map(params![league_url, version, partition_key], |row| {
+            Ok(UniqueUsagePriced {
+                name: row.get(0)?,
+                users: to_u64(row.get::<_, i64>(1)?),
+                price_milli: row.get(2)?,
+                listings: row.get(3)?,
+                change_percent: row.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let row = row?;
+            if !is_rarity_bucket(&row.name) {
+                out.push(row);
             }
         }
         Ok(out)
@@ -1203,6 +1294,100 @@ mod ninja_tests {
         );
     }
 
+    /// 榜和价格在库里就拼好:同一份行,同一个顺序,少四百多次查询。
+    ///
+    /// 三件事必须成立:没有价格的暗金照样上榜(三格是 `None`)、顺序还是人多的在前、
+    /// 一名多底子时挑的还是挂单最多的那条(和 `unique_price` 同一条规矩)。
+    #[test]
+    fn unique_usage_with_prices_joins_the_two_tables_in_sql() {
+        let store = store();
+        store
+            .enqueue_partitions(LEAGUE, VERSION, &partitions())
+            .expect("enqueue");
+        let facets = vec![
+            ("items".to_owned(), "Rare Ring".to_owned(), 44_000u64),
+            ("items".to_owned(), "Wake of Destruction".to_owned(), 7_158),
+            ("items".to_owned(), "Berek's Grip".to_owned(), 6_413),
+            // 经济接口里查不到的那件:新出的,或者压根没人挂单。
+            ("items".to_owned(), "Beira's Anguish".to_owned(), 2_000),
+            ("skills".to_owned(), "Spark".to_owned(), 3_000),
+        ];
+        store
+            .complete_partition(LEAGUE, VERSION, "", 61_390, &facets, &[], 5_000)
+            .expect("complete");
+        store
+            .replace_unique_prices(
+                LEAGUE,
+                "UniqueAccessories",
+                &[
+                    // 同一个名字两个底子:挂单少的那条不该被当成市价。
+                    price_line("Berek's Grip", "Coral Ring", 10.0, 2),
+                    price_line("Berek's Grip", "Two-Stone Ring", 240.0, 24),
+                ],
+                9_000,
+            )
+            .expect("prices");
+        store
+            .replace_unique_prices(
+                LEAGUE,
+                "UniqueWeapons",
+                &[price_line(
+                    "Wake of Destruction",
+                    "Wrapped Greathelm",
+                    3.25,
+                    900,
+                )],
+                9_000,
+            )
+            .expect("prices");
+
+        let rows = store
+            .unique_usage_with_prices(LEAGUE, VERSION, "")
+            .expect("usage");
+        assert_eq!(
+            rows,
+            vec![
+                UniqueUsagePriced {
+                    name: "Wake of Destruction".to_owned(),
+                    users: 7_158,
+                    price_milli: Some(3_250),
+                    listings: Some(900),
+                    change_percent: Some(-4.5),
+                },
+                UniqueUsagePriced {
+                    name: "Berek's Grip".to_owned(),
+                    users: 6_413,
+                    price_milli: Some(240_000),
+                    listings: Some(24),
+                    change_percent: Some(-4.5),
+                },
+                UniqueUsagePriced {
+                    name: "Beira's Anguish".to_owned(),
+                    users: 2_000,
+                    price_milli: None,
+                    listings: None,
+                    change_percent: None,
+                },
+            ],
+            "人多的在前;没挂单的照样上榜,只是价格三格空着"
+        );
+
+        // 和老函数说的是同一件事,只是多带了价格。
+        assert_eq!(
+            store.unique_usage(LEAGUE, VERSION, "").expect("usage"),
+            rows.iter()
+                .map(|row| (row.name.clone(), row.users))
+                .collect::<Vec<_>>()
+        );
+
+        assert!(
+            store
+                .unique_usage_with_prices(LEAGUE, VERSION, "nosuchpartition")
+                .expect("usage")
+                .is_empty()
+        );
+    }
+
     #[test]
     fn characters_move_from_pending_to_done_or_failed() {
         let store = store();
@@ -1374,6 +1559,80 @@ mod ninja_tests {
                 .slot_mods(LEAGUE, "other-version", None, None, 0.0)
                 .expect("read")
                 .is_empty()
+        );
+    }
+
+    /// 词缀类型是主键的一维,所以在库里筛得动:要"只看后缀词缀"就不必把
+    /// 符文和铭刻也读回来。
+    #[test]
+    fn item_mods_can_be_narrowed_to_one_kind() {
+        let store = store();
+        let of_kind = |kind: &str, stat_id: &str, characters: u32| SlotModStat {
+            mod_kind: kind.to_owned(),
+            ..stat("Ring", "Rare", stat_id, characters, 1_000)
+        };
+        let stats = vec![
+            of_kind("explicit", "base_maximum_life", 900),
+            of_kind("explicit", "base_fire_damage_resistance_%", 700),
+            of_kind("rune", "local_physical_damage_+%", 600),
+            of_kind("implicit", "base_chaos_damage_resistance_%", 500),
+            // 占比 1%:阈值和类型筛子要能叠在一起用。
+            of_kind("explicit", "base_movement_velocity_+%", 10),
+        ];
+        store
+            .replace_item_mods(LEAGUE, VERSION, &stats)
+            .expect("replace");
+
+        let explicit = store
+            .slot_mods_of_kind(LEAGUE, VERSION, None, None, Some("explicit"), 0.0)
+            .expect("read");
+        assert_eq!(
+            explicit
+                .iter()
+                .map(|row| row.stat_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "base_maximum_life",
+                "base_fire_damage_resistance_%",
+                "base_movement_velocity_+%",
+            ]
+        );
+
+        let runes = store
+            .slot_mods_of_kind(LEAGUE, VERSION, None, None, Some("rune"), 0.0)
+            .expect("read");
+        assert_eq!(runes.len(), 1);
+        assert_eq!(runes[0].mod_kind, "rune");
+
+        // 类型和部位、稀有度、阈值是"和"的关系。
+        let common = store
+            .slot_mods_of_kind(
+                LEAGUE,
+                VERSION,
+                Some("Ring"),
+                Some("Rare"),
+                Some("explicit"),
+                2.0,
+            )
+            .expect("read");
+        assert_eq!(common.len(), 2, "占比 1% 的那条被阈值挡掉");
+
+        // 不认识的类型给空,而不是悄悄退回全部。
+        assert!(
+            store
+                .slot_mods_of_kind(LEAGUE, VERSION, None, None, Some("enchant"), 0.0)
+                .expect("read")
+                .is_empty()
+        );
+
+        // `None` 就是不筛:和老的 `slot_mods` 一字不差。
+        assert_eq!(
+            store
+                .slot_mods_of_kind(LEAGUE, VERSION, None, None, None, 0.0)
+                .expect("read"),
+            store
+                .slot_mods(LEAGUE, VERSION, None, None, 0.0)
+                .expect("read")
         );
     }
 

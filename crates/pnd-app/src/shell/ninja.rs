@@ -7,7 +7,9 @@
 //! 三件事在这里定:
 //!
 //! - **联赛短名。** builds 接口认 `forbiddenrites`,`settings.json` 里存的是
-//!   显示名 `Forbidden Rites`,中间差一个 [`league_url_for`]。
+//!   显示名 `Forbidden Rites`,中间差一个 [`league_url_guess`]。界面手上没有
+//!   index-state(那是采样线程去取的),所以这里只能猜;真正的答案由
+//!   `IndexState::league_url_for_name` 在采样线程里给出。
 //! - **一次读齐。** 换筛选器、翻页都不该再打一次库:开一次连接把这一轮的
 //!   快照、分区清单、暗金榜、词缀统计全读进内存(几千行而已),之后全在内存里筛。
 //! - **采样线程的生死。** 句柄挂在 `AppShell` 上,丢掉它就是取消 + 收摊;
@@ -19,6 +21,7 @@ use gpui::Context;
 
 use pnd_ninja::aggregate::SlotModStat;
 use pnd_ninja::economy::UNIQUE_TYPES;
+use pnd_ninja::index_state::league_url_guess;
 use pnd_ninja::plan::query_from_key;
 use pnd_runtime::{SamplerConfig, SamplerEvent, SamplerHandle, SamplerStage};
 use pnd_settings::AppSettings;
@@ -85,19 +88,6 @@ impl NinjaData {
     pub fn version(&self) -> Option<&str> {
         self.snapshot.as_ref().map(|row| row.version.as_str())
     }
-}
-
-/// 显示名 → builds 接口的联赛短名:`Forbidden Rites` → `forbiddenrites`。
-///
-/// 两个名字是 poe.ninja 自己分开的:经济接口要显示名,builds 接口要短名。
-/// `settings.json` 里只存显示名,所以短名得在这儿算出来。
-#[must_use]
-pub fn league_url_for(league: &str) -> String {
-    league
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|character| character.to_ascii_lowercase())
-        .collect()
 }
 
 /// 分区键 → 人话。库里存的是查询串(`class=Deadeye&skills=Snipe`),
@@ -191,6 +181,9 @@ pub fn load(
 }
 
 /// 一个分区的暗金榜:人气 × 参考价。换个分区只用重跑这一段。
+///
+/// 拼价格是库里的 `LEFT JOIN` 干的,不是这里一行一句 SQL:全联赛四百多件暗金,
+/// 一行一次查询就是四百多次往返,换一次分区筛选器界面要卡一下。
 pub fn load_uniques(
     store: &NinjaStore,
     league_url: &str,
@@ -198,19 +191,18 @@ pub fn load_uniques(
     partition_key: &str,
 ) -> Result<(Option<u64>, Vec<UniqueRow>), StorageError> {
     let total = store.partition_total(league_url, version, partition_key)?;
-    let usage = store.unique_usage(league_url, version, partition_key)?;
-    let mut rows = Vec::with_capacity(usage.len());
-    for (name, users) in usage {
-        let price = store.unique_price(league_url, &name)?;
-        rows.push(UniqueRow {
-            users,
-            share_percent: share_percent(users, total),
-            price_milli: price.as_ref().map(|row| row.primary_value_milli),
-            listings: price.as_ref().map(|row| row.listing_count),
-            change_percent: price.as_ref().and_then(|row| row.total_change),
-            name,
-        });
-    }
+    let rows = store
+        .unique_usage_with_prices(league_url, version, partition_key)?
+        .into_iter()
+        .map(|row| UniqueRow {
+            name: row.name,
+            users: row.users,
+            share_percent: share_percent(row.users, total),
+            price_milli: row.price_milli,
+            listings: row.listings,
+            change_percent: row.change_percent,
+        })
+        .collect();
     Ok((total, rows))
 }
 
@@ -226,7 +218,7 @@ pub fn load_uniques(
 #[must_use]
 pub fn sampler_config(settings: &AppSettings, db_path: PathBuf) -> SamplerConfig {
     SamplerConfig {
-        league_url: league_url_for(&settings.league),
+        league_url: league_url_guess(&settings.league),
         league_name: settings.league.clone(),
         tuning: settings.ninja.clone(),
         user_agent: settings.user_agent(),
@@ -403,7 +395,7 @@ impl AppShell {
 
     /// 联赛改了就换一份缓存视图 —— 库里的行是按联赛短名分的。
     pub(crate) fn resync_ninja_league(&mut self) {
-        let league_url = league_url_for(&self.settings.league);
+        let league_url = league_url_guess(&self.settings.league);
         if league_url == self.ninja.league_url {
             return;
         }
@@ -431,16 +423,6 @@ mod ninja_tests {
             p50: Some(176.0),
             p75: Some(211.0),
         }
-    }
-
-    /// builds 接口只认小写去空格的短名,而设置里存的是带空格的显示名。
-    #[test]
-    fn the_league_short_name_drops_spaces_and_case() {
-        assert_eq!(league_url_for("Forbidden Rites"), "forbiddenrites");
-        assert_eq!(league_url_for("Standard"), "standard");
-        // 撇号和连字符也不在短名里(poe.ninja 自己就是这么拼的)。
-        assert_eq!(league_url_for("Rise of the Abyssal"), "riseoftheabyssal");
-        assert_eq!(league_url_for(""), "");
     }
 
     /// 分区键在下拉里必须是人话:一串 `class=X&skills=Y` 没人认得出

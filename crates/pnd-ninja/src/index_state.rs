@@ -64,6 +64,35 @@ impl IndexState {
             .iter()
             .find(|snapshot| snapshot.url == url)
     }
+
+    /// 显示名 → 接口用的短名,**问 poe.ninja 自己要答案**。
+    ///
+    /// `snapshotVersions` 每一条都同时带着两个名字,所以只要这一轮拿到过
+    /// index-state,短名就不用猜。手上没有 index-state 的调用方(比如界面,
+    /// 它只有 `settings.json` 里那个显示名)才退回 [`league_url_guess`]。
+    ///
+    /// 大小写不敏感:用户在设置里打的是"forbidden rites"也该认出来。
+    #[must_use]
+    pub fn league_url_for_name(&self, name: &str) -> Option<&str> {
+        self.snapshot_versions
+            .iter()
+            .find(|snapshot| snapshot.name.eq_ignore_ascii_case(name))
+            .map(|snapshot| snapshot.url.as_str())
+    }
+}
+
+/// 显示名 → 短名的**猜法**:去掉所有非字母数字,再全小写。
+/// `Forbidden Rites` → `forbiddenrites`,`Berek's Grip` 里的撇号一样掉。
+///
+/// 这是猜测不是事实:poe.ninja 的短名由它自己定,规律上一直是这个,但没有
+/// 任何接口承诺过。手上有 [`IndexState`] 时一律用 [`IndexState::league_url_for_name`],
+/// 这个函数只在拿不到 index-state 时兜底。
+#[must_use]
+pub fn league_url_guess(name: &str) -> String {
+    name.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
 }
 
 /// 一个职业在某联赛里的占比。`trend` 是 poe.ninja 自己的涨跌标记。
@@ -147,6 +176,42 @@ mod index_state_tests {
         assert_eq!(snapshot.snapshot_name, "forbidden-rites");
         assert_eq!(snapshot.time_machine_labels, ["hour-6", "day-1"]);
         assert!(state.snapshot_for_url("nosuchleague").is_none());
+    }
+
+    /// 猜法的规矩:空格、撇号、连字符全掉,剩下的全小写。
+    #[test]
+    fn the_guessed_short_name_drops_everything_but_letters_and_digits() {
+        assert_eq!(league_url_guess("Forbidden Rites"), "forbiddenrites");
+        assert_eq!(league_url_guess("Standard"), "standard");
+        assert_eq!(league_url_guess("Hardcore SSF"), "hardcoressf");
+        // 撇号、连字符、点号都不在短名里(poe.ninja 自己就是这么拼的)。
+        assert_eq!(league_url_guess("Berek's Grip League"), "bereksgripleague");
+        assert_eq!(league_url_guess("Rise of the Abyssal"), "riseoftheabyssal");
+        assert_eq!(league_url_guess("Fate-of the Vaal"), "fateofthevaal");
+        assert_eq!(league_url_guess("Settlers 2"), "settlers2");
+        assert_eq!(league_url_guess(""), "");
+    }
+
+    /// 有 index-state 在手就不用猜:两个名字本来就并排写在 `snapshotVersions` 里。
+    #[test]
+    fn a_known_league_resolves_its_short_name_instead_of_guessing() {
+        let state: IndexState = serde_json::from_str(INDEX_STATE_JSON).unwrap();
+        assert_eq!(
+            state.league_url_for_name("Forbidden Rites"),
+            Some("forbiddenrites")
+        );
+        assert_eq!(
+            state.league_url_for_name("Runes of Aldur"),
+            Some("runesofaldur")
+        );
+        // 用户在设置里打的大小写不该决定采样能不能跑起来。
+        assert_eq!(
+            state.league_url_for_name("forbidden rites"),
+            Some("forbiddenrites")
+        );
+        // 这一轮没被索引的联赛给 `None`,而不是一个查不到东西的猜测。
+        assert_eq!(state.league_url_for_name("Fate of the Vaal"), None);
+        assert_eq!(IndexState::default().league_url_for_name("Standard"), None);
     }
 
     #[test]

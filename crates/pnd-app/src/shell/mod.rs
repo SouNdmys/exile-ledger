@@ -406,7 +406,7 @@ impl AppShell {
             .detach();
         }
 
-        let ninja = NinjaData::empty(ninja::league_url_for(&settings.league));
+        let ninja = NinjaData::empty(pnd_ninja::index_state::league_url_guess(&settings.league));
 
         let mut shell = Self {
             focus_handle: cx.focus_handle(),
