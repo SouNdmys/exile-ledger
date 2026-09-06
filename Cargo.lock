@@ -4198,6 +4198,7 @@ dependencies = [
 name = "pnd-settings"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "pnd-domain",
  "serde",
  "serde_json",
@@ -4211,7 +4212,6 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "pnd-domain",
- "pnd-ninja",
  "rusqlite",
  "serde",
  "serde_json",
