@@ -1,0 +1,13 @@
+# OCR production assets and catalog data are SHA-256 pinned; Git must never rewrite
+# their line endings or the runtime integrity checks will fail.
+assets/ocr/PP-OCRv5_mobile_rec.onnx binary
+assets/ocr/ppocrv5_dict.txt binary
+crates/ptt-catalog/data/** binary
+tests/screenshots/*.png binary
+tests/screenshots/*.jpg binary
+
+# The app icon is handed to rc.exe verbatim at build time. Git's binary
+# heuristic happens to guess right on an .ico, but core.autocrlf is on in this
+# repo and a guess that ever goes the other way costs the exe its icon with no
+# error louder than a cargo:warning.
+crates/ptt-app/assets/icon.ico binary
