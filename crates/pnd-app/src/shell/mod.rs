@@ -1,16 +1,17 @@
 //! 外壳:左边五个导航按钮,右边当前页,底下一条状态行。
 //!
-//! 这一步只把版式和设置页做成真的。蹲价 / 提醒 / 暗金 / 词缀四页画的是
-//! **写死的示例数据** —— 先把列、按钮、筛选器的位置定下来,第 7b 步把
-//! runtime 的事件接上去,替换的只是数据来源,不是版式。
+//! 蹲价页、提醒记录页和设置页现在画的都是真数据:搜索列表来自
+//! `settings.json`,运行状态和预算来自 `pnd-runtime` 的 actor,提醒历史
+//! 来自 `watch.sqlite`。ninja 那两页仍然是示例数据(第 9 / 12 步接)。
 //!
-//! `tick` 是外壳唯一的心跳(120ms)。运行时事件、卡片按钮的回声将来都从
-//! 这里抽干,理由和兄弟项目一样:GPUI 的视图只能在它自己的线程上改,后台
-//! 线程只能把消息塞进通道,总得有人定期来取。
+//! `tick` 是外壳唯一的心跳(120ms)。运行时事件和卡片按钮的回声都从这里
+//! 抽干,理由和兄弟项目一样:GPUI 的视图只能在它自己的线程上改,后台线程
+//! 只能把消息塞进通道,总得有人定期来取。接线本身在 [`link`] 里。
 
+pub mod link;
 pub mod pages;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -21,6 +22,12 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::select::{SearchableVec, SelectItem, SelectState};
 use gpui_component::table::TableState;
 use gpui_component::{IndexPath, Selectable as _, Sizable as _, Size, StyledExt as _};
+
+use pnd_domain::{CurrencyRates, WatchId};
+use pnd_platform_win::AlertCardService;
+use pnd_runtime::{MatchedListing, RuntimeHandle, WatchStatus, now_secs};
+use pnd_storage::{AlertRow, WatchStore};
+use pnd_trade::BucketUsage;
 
 use crate::i18n;
 use crate::theme::*;
@@ -188,6 +195,33 @@ pub struct AppShell {
     pub(crate) notice: String,
     notice_at: Option<Instant>,
 
+    /// 后台 actor。`None` = 它没起来(库打不开之类),程序照常能看历史、改设置。
+    pub(crate) runtime: Option<RuntimeHandle>,
+    /// 提醒卡片线程。`None` = 没有卡片,提醒只落在提醒记录页。
+    pub(crate) alert_card: Option<AlertCardService>,
+    /// 提醒记录页自己的一条库连接(actor 那条在别的线程上,不能共用)。
+    pub(crate) alerts_store: Option<WatchStore>,
+
+    /// 每条搜索现在跑到哪一步。actor 每次状态有变就整份广播,这里只管存最新的。
+    pub(crate) watch_status: BTreeMap<WatchId, WatchStatus>,
+    /// 每条限速策略的用量。键是策略名(`trade-search-request-limit` 这些)。
+    pub(crate) budget: BTreeMap<String, Vec<BucketUsage>>,
+    pub(crate) rates: CurrencyRates,
+    /// 弹过的卡片:卡片按钮事件只带一个 alert_id,靠它找回是哪一批命中。
+    pub(crate) shown_cards: BTreeMap<i64, MatchedListing>,
+    /// 提醒记录页当前显示的那些行。
+    pub(crate) alert_rows: Vec<AlertRow>,
+    /// 新增搜索表单下面那行红字。空串 = 没有错。
+    pub(crate) watch_error: String,
+
+    /// 表格内容要重建了。行是每次整份换掉的,没有这两个标志就得每拍重建。
+    pub(crate) watches_dirty: bool,
+    pub(crate) alerts_dirty: bool,
+    /// 到这个时刻重读一次提醒历史(等 actor 把命令写进库)。
+    pub(crate) alerts_refresh_at: Option<Instant>,
+    /// 上一次重建蹲价表时的秒数。倒计时每秒动一次,不必每拍动。
+    last_second: i64,
+
     pub(crate) settings_form: pages::settings::SettingsForm,
     pub(crate) watches_form: pages::watches::WatchesForm,
 
@@ -206,7 +240,7 @@ pub struct AppShell {
 
 impl AppShell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let settings_store = pnd_settings::SettingsStore::release_default();
+        let settings_store = crate::settings_store();
         let loaded = settings_store.load();
         let mut settings = loaded.settings;
         // 手改坏的值在这里就拉回可用范围:后面每一页都直接读 `settings`,
@@ -236,6 +270,39 @@ impl AppShell {
             pnd_settings::LoadStatus::Loaded | pnd_settings::LoadStatus::Defaults => false,
         };
         log.push_back(format!("settings: {}", settings_store.path().display()));
+
+        // 后台三件套。每一件失败都只是少一半功能,不该拦着窗口开出来:
+        // actor 没起来还能看历史、改设置;卡片没起来提醒仍然进记录页。
+        let mut startup: Vec<String> = Vec::new();
+        let runtime = link::start_runtime(&settings, &mut startup);
+        if runtime.is_none() && notice.is_empty() {
+            notice = i18n::fill(
+                text.notice_runtime_failed,
+                &[startup.last().map_or("", String::as_str)],
+            );
+        }
+        let alert_card = match link::start_alert_card(&settings, &mut startup) {
+            Ok(card) => Some(card),
+            Err(error) => {
+                startup.push(format!("alert card failed to start: {error}"));
+                if notice.is_empty() {
+                    notice = i18n::fill(text.notice_card_failed, &[&error.to_string()]);
+                }
+                None
+            }
+        };
+        // 界面这一侧的库连接是只读用途(提醒历史),但 SQLite 的连接本来就
+        // 是读写的;WAL + busy_timeout 让它和 actor 那条互不打断。
+        let alerts_store = match WatchStore::open(crate::watch_db_path()) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                startup.push(format!("could not open the alert history: {error}"));
+                None
+            }
+        };
+        for line in startup {
+            log.push_back(line);
+        }
 
         // 120ms 心跳。频率照兄弟项目:比一帧慢得多,又快到让"点了按钮"和
         // "屏幕上有反应"之间看不出间隔。视图没了(窗口关掉)`update` 会报错,
@@ -278,7 +345,7 @@ impl AppShell {
             choice_select(pages::ninja_mods::rarity_choices(text), "", window, cx);
         let mods_kind_select = choice_select(pages::ninja_mods::kind_choices(text), "", window, cx);
 
-        Self {
+        let mut shell = Self {
             focus_handle: cx.focus_handle(),
             page: Page::Watches,
             language,
@@ -288,6 +355,20 @@ impl AppShell {
             log,
             notice,
             notice_at: None,
+            runtime,
+            alert_card,
+            alerts_store,
+            watch_status: BTreeMap::new(),
+            budget: BTreeMap::new(),
+            rates: CurrencyRates::none(),
+            shown_cards: BTreeMap::new(),
+            alert_rows: Vec::new(),
+            watch_error: String::new(),
+            // 两张表现在还是空的(列已经有了):第一拍就会填上真数据。
+            watches_dirty: true,
+            alerts_dirty: true,
+            alerts_refresh_at: None,
+            last_second: 0,
             settings_form,
             watches_form,
             watches_table,
@@ -300,7 +381,9 @@ impl AppShell {
             mods_slot_select,
             mods_rarity_select,
             mods_kind_select,
-        }
+        };
+        shell.refresh_alerts();
+        shell
     }
 
     /// 当前语言的文案目录。每个页面第一行都是它。
@@ -329,23 +412,76 @@ impl AppShell {
     }
 
     /// 外壳的心跳,120ms 一次。
+    ///
+    /// 一拍里做四件事:抽干后台事件、到点重读提醒历史、把变了的表重建、
+    /// 让那句一次性通知到点消失。**只在真有东西变了的时候** `notify` 一次:
+    /// 每拍无条件重画会让一个挂在游戏旁边的窗口白烧 GPU。
     fn tick(&mut self, cx: &mut Context<Self>) {
-        // step 7b: drain runtime + card events here
-        //
-        // 第 7b 步在这里 `try_recv` 抽干 `RuntimeEvent`(轮询状态、预算用量、
-        // `ListingMatched`)和提醒卡片线程回传的按钮事件,更新页面数据之后
-        // `cx.notify()`。现在这里只有一件事:让那句一次性通知到点消失。
+        let mut changed = self.drain_events(cx);
+        changed |= self.refresh_alerts_if_due();
+
+        // 倒计时("42 秒后再轮询")每秒动一次,不必每拍动。
+        let now = now_secs();
+        if now != self.last_second {
+            self.last_second = now;
+            if self.page == Page::Watches {
+                self.watches_dirty = true;
+            }
+        }
+
+        if self.watches_dirty {
+            self.rebuild_watches_table(cx);
+            changed = true;
+        }
+        if self.alerts_dirty {
+            self.rebuild_alerts_table(cx);
+            changed = true;
+        }
+
         if let Some(at) = self.notice_at
             && at.elapsed() >= NOTICE_LIFETIME
         {
             self.notice.clear();
             self.notice_at = None;
+            changed = true;
+        }
+
+        if changed {
             cx.notify();
         }
     }
 
     pub(crate) fn show_page(&mut self, page: Page) {
         self.page = page;
+        // 翻到提醒记录页就重读一次:上一次读可能是几分钟前的事了。
+        if page == Page::Alerts {
+            self.refresh_alerts();
+        }
+    }
+
+    /// 蹲价表 = 设置里的搜索列表 × actor 广播的运行状态。
+    fn rebuild_watches_table(&mut self, cx: &mut Context<Self>) {
+        self.watches_dirty = false;
+        let content = pages::watches::table_content_for(
+            &self.settings,
+            &self.watch_status,
+            self.text(),
+            now_secs(),
+        );
+        self.watches_table.update(cx, |state, cx| {
+            state.delegate_mut().set_content(content);
+            state.refresh(cx);
+        });
+    }
+
+    /// 提醒表 = `watch.sqlite` 里最近的那 200 行。
+    fn rebuild_alerts_table(&mut self, cx: &mut Context<Self>) {
+        self.alerts_dirty = false;
+        let content = pages::alerts::table_content_for(&self.alert_rows, self.text());
+        self.alerts_table.update(cx, |state, cx| {
+            state.delegate_mut().set_content(content);
+            state.refresh(cx);
+        });
     }
 
     /// 换语言之后,把语言烘进去的那些东西重造一遍。
@@ -360,9 +496,11 @@ impl AppShell {
         self.language = self.settings.ui_language.clone();
         let text = self.text();
 
+        // 蹲价表和提醒表连行带列一起重建(表头和格子里的状态词都跟着语言走),
+        // 走各自的 rebuild;剩下两张还是示例数据,原地换一份就行。
+        self.watches_dirty = true;
+        self.alerts_dirty = true;
         for (table, content) in [
-            (&self.watches_table, pages::watches::table_content(text)),
-            (&self.alerts_table, pages::alerts::table_content(text)),
             (
                 &self.uniques_table,
                 pages::ninja_uniques::table_content(text),

@@ -121,7 +121,9 @@ impl AppShell {
                             .primary()
                             .label(text.uniques_refresh)
                             .with_size(Size::Small)
-                            .on_click(cx.listener(|this, _, _, cx| this.not_wired_yet(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.not_wired_yet("ninja sampling", cx);
+                            })),
                     ),
             )
             .child(

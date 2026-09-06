@@ -4,8 +4,9 @@
 //! **一个** `TableDelegate`,页面各自给它列和行 —— 四份几乎一样的委托
 //! 抄下来,以后改一次表格外观就要改四处,总有一处会忘。
 //!
-//! 这一步的行是写死的示例数据。它不是占位横杠:列宽、对齐、颜色都要拿
-//! 真实长度的字去量,空表量不出来。
+//! 蹲价页和提醒记录页的行是真数据(设置 + actor 状态 + `watch.sqlite`),
+//! ninja 那两页还是写死的示例数据 —— 它不是占位横杠:列宽、对齐、颜色都要
+//! 拿真实长度的字去量,空表量不出来。
 
 pub mod alerts;
 pub mod ninja_mods;
@@ -73,6 +74,15 @@ impl Cell {
 
     pub fn warn(text: impl Into<SharedString>) -> Self {
         Self::new(text, Tone::Warn)
+    }
+
+    /// 格子里的字。测试查它 —— "这一格写的是什么"是唯一值得断言的东西。
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn tone(&self) -> Tone {
+        self.tone
     }
 }
 
@@ -175,8 +185,62 @@ impl TableDelegate for SimpleTable {
 
 #[cfg(test)]
 mod pages_tests {
+    use std::collections::BTreeMap;
+
+    use pnd_domain::{Currency, Price, WatchId};
+    use pnd_settings::{AppSettings, WatchEntry};
+    use pnd_storage::{AlertRow, AlertSource};
+
     use super::*;
     use crate::i18n;
+
+    /// 一条搜索 + 一条它的运行状态,拿来量蹲价表。
+    fn watch_content(text: &'static i18n::Text) -> TableContent {
+        let settings = AppSettings {
+            watches: vec![WatchEntry {
+                id: WatchId("w-1".to_string()),
+                label: "Choir of the Storm".to_string(),
+                league: "Forbidden Rites".to_string(),
+                price_cap: Price::new(20_000, Currency::Divine),
+                ..WatchEntry::default()
+            }],
+            ..AppSettings::default()
+        };
+        let status = BTreeMap::from([(
+            WatchId("w-1".to_string()),
+            pnd_runtime::WatchStatus {
+                state: pnd_runtime::WatchRunState::Polling,
+                next_poll_at: Some(1_000_100),
+                last_poll_at: Some(1_000_000),
+                hits_today: 2,
+                ..pnd_runtime::WatchStatus::default()
+            },
+        )]);
+        watches::table_content_for(&settings, &status, text, 1_000_000)
+    }
+
+    /// 一条提醒历史,拿来量提醒表。
+    fn alert_content(text: &'static i18n::Text) -> TableContent {
+        let rows = vec![AlertRow {
+            alert_id: 1,
+            watch_id: WatchId("w-1".to_string()),
+            listing_id: "abc".to_string(),
+            league: "Forbidden Rites".to_string(),
+            search_id: "H4sIAAAA-_09".to_string(),
+            item_name: "Choir of the Storm".to_string(),
+            price: Some(Price::new(18_000, Currency::Divine)),
+            account: "Exile#1234".to_string(),
+            character: "ExileChar".to_string(),
+            whisper: "@ExileChar hi".to_string(),
+            hideout_token: None,
+            token_fetched_at: None,
+            source: AlertSource::Live,
+            fired_at: 1_000_000,
+            dismissed_at: None,
+            last_action: None,
+        }];
+        alerts::table_content_for(&rows, text)
+    }
 
     /// 每一页的表在两种语言下,列数和行的格子数必须对得上 —— 少一个格子,
     /// 那一列在那一行就是空白,而空白看起来和"这里没有数据"一模一样。
@@ -185,8 +249,8 @@ mod pages_tests {
         for language in i18n::LANGUAGES {
             let text = i18n::text(language);
             for (name, content) in [
-                ("watches", watches::table_content(text)),
-                ("alerts", alerts::table_content(text)),
+                ("watches", watch_content(text)),
+                ("alerts", alert_content(text)),
                 ("uniques", ninja_uniques::table_content(text)),
                 ("mods", ninja_mods::table_content(text)),
             ] {
@@ -203,6 +267,17 @@ mod pages_tests {
                     );
                 }
             }
+        }
+    }
+
+    /// 上面那条只在"有行"时才检查得到东西 —— 两个真数据的行构造器要是
+    /// 哪天返回了空表,它会一声不响地通过。这条守住"确实造出了行"。
+    #[test]
+    fn the_real_row_builders_produce_rows() {
+        for language in i18n::LANGUAGES {
+            let text = i18n::text(language);
+            assert_eq!(watch_content(text).rows.len(), 1);
+            assert_eq!(alert_content(text).rows.len(), 1);
         }
     }
 }

@@ -53,6 +53,17 @@ catalogue! {
     common_hours_short,
     common_milliseconds_short,
     common_percent,
+    common_days_short,
+    /// 表格上的动作按钮作用在选中的那一行,没选中就说这一句。
+    common_select_row,
+    /// 一分钟以内的"多久以前"。
+    common_age_just_now,
+    /// "{} 分钟前"
+    common_age_minutes,
+    /// "{} 小时前"
+    common_age_hours,
+    /// "{} 天前"
+    common_age_days,
 
     // -- 蹲价页 --
     watches_heading,
@@ -76,6 +87,21 @@ catalogue! {
     watches_col_last_poll,
     watches_col_hits_today,
     watches_empty,
+    /// 表格里"下一轮什么时候":"{} 后再轮询"
+    watches_next_in,
+    /// 还没轮询过的那一格。
+    watches_never,
+    /// 选中一行之后那一排按钮的标题。
+    watches_row_actions,
+    watches_remove,
+    watches_added,
+    watches_removed,
+    watches_invalid_search,
+    watches_invalid_cap,
+    watches_poll_requested,
+    /// "1 divine = {} chaos / {} exalted"
+    watches_rates,
+    watches_rates_unknown,
     /// 状态词,和 `pnd-runtime` 的搜索状态一一对应。
     status_disabled,
     status_polling,
@@ -109,6 +135,8 @@ catalogue! {
     alerts_action_none,
     alerts_action_opened,
     alerts_action_dismissed,
+    alerts_action_copied,
+    alerts_action_hideout_unavailable,
 
     // -- 暗金热度页 --
     uniques_heading,
@@ -214,6 +242,26 @@ catalogue! {
     card_hideout_sent,
     card_hideout_failed,
     card_whisper_copied,
+    card_online,
+    card_afk,
+    card_offline,
+
+    // -- 状态行上的一句话 --
+    notice_opened_trade,
+    /// "打不开浏览器:{}"
+    notice_open_failed,
+    notice_no_whisper,
+    notice_dismissed,
+    notice_hideout_phase_two,
+    notice_session_invalid,
+    /// "…请求要等到 {} 才继续"
+    notice_cloudflare,
+    /// "后台运行时没起来:{}"
+    notice_runtime_failed,
+    notice_runtime_gone,
+    /// "提醒卡片没起来:{}"
+    notice_card_failed,
+    notice_card_missing,
 }
 
 /// 支持的语言码。设置里存的就是这两个字符串。
@@ -279,6 +327,12 @@ pub static ENGLISH: Text = Text {
     common_hours_short: "h",
     common_milliseconds_short: "ms",
     common_percent: "%",
+    common_days_short: "d",
+    common_select_row: "Select a row first.",
+    common_age_just_now: "just now",
+    common_age_minutes: "{} min ago",
+    common_age_hours: "{} h ago",
+    common_age_days: "{} d ago",
 
     watches_heading: "Watches",
     watches_subtitle: "Filter on the trade site, paste the search here, and the poller takes it from there.",
@@ -300,6 +354,17 @@ pub static ENGLISH: Text = Text {
     watches_col_last_poll: "Last poll",
     watches_col_hits_today: "Hits today",
     watches_empty: "No watches yet. Paste a search above to start one.",
+    watches_next_in: "next in {}",
+    watches_never: "never",
+    watches_row_actions: "Selected watch",
+    watches_remove: "Remove",
+    watches_added: "Watch added.",
+    watches_removed: "Watch removed.",
+    watches_invalid_search: "That is not a trade search URL or id.",
+    watches_invalid_cap: "The price cap has to be a number above zero.",
+    watches_poll_requested: "Polling that watch now.",
+    watches_rates: "1 divine = {} chaos / {} exalted",
+    watches_rates_unknown: "rates not loaded yet",
     status_disabled: "disabled",
     status_polling: "polling",
     status_backoff: "backoff",
@@ -329,6 +394,8 @@ pub static ENGLISH: Text = Text {
     alerts_action_none: "—",
     alerts_action_opened: "opened",
     alerts_action_dismissed: "dismissed",
+    alerts_action_copied: "whisper copied",
+    alerts_action_hideout_unavailable: "hideout: phase 2",
 
     uniques_heading: "Unique heat",
     uniques_subtitle: "What the popular builds wear, priced against the economy feed.",
@@ -420,7 +487,22 @@ pub static ENGLISH: Text = Text {
     card_verdict_different_currency: "different currency",
     card_hideout_sent: "hideout request sent",
     card_hideout_failed: "hideout request failed",
-    card_whisper_copied: "whisper copied",
+    card_whisper_copied: "Whisper copied to the clipboard.",
+    card_online: "online",
+    card_afk: "afk",
+    card_offline: "offline",
+
+    notice_opened_trade: "Opened the trade page in your browser.",
+    notice_open_failed: "Could not open the browser: {}",
+    notice_no_whisper: "That listing has no whisper text.",
+    notice_dismissed: "Dismissed.",
+    notice_hideout_phase_two: "Travel to hideout is phase 2. Open the trade page and click Travel there.",
+    notice_session_invalid: "The trade site did not recognise your POESESSID, so it has been dropped. Polling carries on anonymously.",
+    notice_cloudflare: "Cloudflare is blocking the trade site. Requests are held until {}.",
+    notice_runtime_failed: "The background runtime did not start: {}",
+    notice_runtime_gone: "The background runtime is not running.",
+    notice_card_failed: "The alert card did not start: {}",
+    notice_card_missing: "No alert card on screen — the alert is on the Alerts page.",
 };
 
 pub static SIMPLIFIED_CHINESE: Text = Text {
@@ -441,6 +523,12 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     common_hours_short: "小时",
     common_milliseconds_short: "毫秒",
     common_percent: "%",
+    common_days_short: "天",
+    common_select_row: "先在表里选中一行。",
+    common_age_just_now: "刚刚",
+    common_age_minutes: "{} 分钟前",
+    common_age_hours: "{} 小时前",
+    common_age_days: "{} 天前",
 
     watches_heading: "蹲价",
     watches_subtitle: "在网页上筛好条件,把搜索粘进来,剩下的交给轮询。",
@@ -462,6 +550,17 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     watches_col_last_poll: "上次轮询",
     watches_col_hits_today: "今日命中",
     watches_empty: "还没有搜索。在上面粘一条进来就开始蹲。",
+    watches_next_in: "{} 后再轮询",
+    watches_never: "还没跑过",
+    watches_row_actions: "选中的搜索",
+    watches_remove: "删除",
+    watches_added: "已新增搜索。",
+    watches_removed: "已删除搜索。",
+    watches_invalid_search: "这不是一条交易站搜索 URL 或 id。",
+    watches_invalid_cap: "价格上限得是个大于 0 的数。",
+    watches_poll_requested: "这就去轮询一次。",
+    watches_rates: "1 divine = {} chaos / {} exalted",
+    watches_rates_unknown: "还没读到汇率",
     status_disabled: "已停用",
     status_polling: "轮询中",
     status_backoff: "退避中",
@@ -491,6 +590,8 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     alerts_action_none: "—",
     alerts_action_opened: "已打开",
     alerts_action_dismissed: "已忽略",
+    alerts_action_copied: "已复制私聊",
+    alerts_action_hideout_unavailable: "去藏身处:第二阶段",
 
     uniques_heading: "暗金热度",
     uniques_subtitle: "热门 BD 在穿什么,拼上经济接口的参考价。",
@@ -582,7 +683,22 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     card_verdict_different_currency: "币种不同",
     card_hideout_sent: "已发去藏身处请求",
     card_hideout_failed: "去藏身处失败",
-    card_whisper_copied: "私聊内容已复制",
+    card_whisper_copied: "私聊内容已复制到剪贴板。",
+    card_online: "在线",
+    card_afk: "挂机",
+    card_offline: "离线",
+
+    notice_opened_trade: "已在浏览器里打开交易页。",
+    notice_open_failed: "打不开浏览器:{}",
+    notice_no_whisper: "这条挂单没有私聊内容。",
+    notice_dismissed: "已忽略。",
+    notice_hideout_phase_two: "去藏身处是第二阶段的功能。先打开交易页,在网页上点 Travel。",
+    notice_session_invalid: "交易站不认这个 POESESSID,程序已经停用它。轮询照常匿名跑。",
+    notice_cloudflare: "Cloudflare 把交易站拦住了。请求要等到 {} 才继续。",
+    notice_runtime_failed: "后台运行时没起来:{}",
+    notice_runtime_gone: "后台运行时没在跑。",
+    notice_card_failed: "提醒卡片没起来:{}",
+    notice_card_missing: "屏幕上没有卡片 —— 这条提醒记在提醒记录页里。",
 };
 
 #[cfg(test)]

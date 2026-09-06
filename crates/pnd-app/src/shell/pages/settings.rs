@@ -318,23 +318,26 @@ impl AppShell {
             ],
         );
 
-        let session = section(
-            text.settings_section_session,
-            vec![
-                field_row()
-                    .child(field_label(text.settings_poesessid))
-                    .child(input_box(320., &form.poesessid, read_only))
-                    .child(
-                        Button::new("settings-test-session")
-                            .label(text.settings_test_session)
-                            .with_size(Size::Small)
-                            .on_click(cx.listener(|this, _, _, cx| this.not_wired_yet(cx))),
-                    ),
-                field_row()
-                    .child(field_label(""))
-                    .child(hint(text.settings_poesessid_hint)),
-            ],
-        );
+        let session =
+            section(
+                text.settings_section_session,
+                vec![
+                    field_row()
+                        .child(field_label(text.settings_poesessid))
+                        .child(input_box(320., &form.poesessid, read_only))
+                        .child(
+                            Button::new("settings-test-session")
+                                .label(text.settings_test_session)
+                                .with_size(Size::Small)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.not_wired_yet("session test", cx)
+                                })),
+                        ),
+                    field_row()
+                        .child(field_label(""))
+                        .child(hint(text.settings_poesessid_hint)),
+                ],
+            );
 
         let watcher = section(
             text.settings_section_watcher,
@@ -488,6 +491,12 @@ impl AppShell {
             Ok(()) => {
                 self.push_log("settings saved".to_owned());
                 self.set_notice(text.settings_saved.to_owned());
+                // 存下来还不够:后台那份是启动时给它的旧设置。整份推过去,
+                // actor 自己 diff 出哪条搜索变了、要不要换网关。
+                self.apply_settings_to_runtime();
+                // 卡片的角落、透明度、声音都是起线程时定死的,只能重起一条。
+                // 每次保存都重起,免得维护"哪些字段能热改"那张表。
+                self.restart_alert_card();
             }
             Err(error) => {
                 self.push_log(format!("settings save failed: {error}"));
@@ -496,6 +505,8 @@ impl AppShell {
         }
         let settings = self.settings.clone();
         self.settings_form.write_back(&settings, window, cx);
+        // 联赛、语言之类改完,蹲价表那几列跟着变。
+        self.watches_dirty = true;
         cx.notify();
     }
 

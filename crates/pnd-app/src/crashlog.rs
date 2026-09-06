@@ -7,9 +7,13 @@
 
 use std::path::PathBuf;
 
-/// `%LOCALAPPDATA%\PoeNinjaData\panic.log`:和两个数据库、设置同一个目录。
+/// `%LOCALAPPDATA%\PoeNinjaData\panic.log`:和两个数据库同一个目录,
+/// 所以 `PND_DATA_DIR` 也把它一起搬走。
 pub fn panic_log_path() -> PathBuf {
-    pnd_storage::default_data_dir().join("panic.log")
+    crate::redirect(
+        &pnd_storage::default_data_dir().join("panic.log"),
+        crate::DATA_DIR_ENV,
+    )
 }
 
 /// 一次 panic 一行:时间、版本、位置、消息。版本在最前面 —— 报告回来的
