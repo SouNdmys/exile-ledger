@@ -1247,8 +1247,16 @@ impl RuntimeActor {
         }
 
         if !hits.is_empty() {
-            let alert_ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
+            let listing_ids: Vec<String> =
+                hits.iter().map(|(_, listing)| listing.id.clone()).collect();
+            let mut alert_ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
             if let Some((headline, extra)) = coalesce(hits) {
+                // 卡片上写的是标题那条,而卡片按钮只带**一个**行号(第一个)。
+                // 把标题那条换到第一位:不然点"去藏身处"会传送到另一件货的
+                // 卖家那儿 —— 一次点击对应哪件东西,不该靠运气。
+                if let Some(index) = listing_ids.iter().position(|id| *id == headline.id) {
+                    alert_ids.swap(0, index);
+                }
                 self.emit(RuntimeEvent::ListingMatched(Box::new(MatchedListing {
                     alert_ids,
                     watch_id: watch_id.clone(),
@@ -1924,6 +1932,17 @@ mod actor_tests {
         assert_eq!(matched.alert_ids.len(), 2);
         assert_eq!(matched.label, "Choir of the Storm");
         assert_eq!(matched.source, AlertSource::Poll);
+
+        // 卡片按钮只带一个行号,而卡片上写的是标题那条:标题的行号必须排在
+        // 第一位,否则"去藏身处"会把你送到另一个卖家那儿。两条提醒是按 fetch
+        // 的顺序插库的("one" 先、"two" 后),所以标题那条("two",更便宜)
+        // 的行号是两个里更大的那个。
+        assert_eq!(
+            matched.alert_ids.first(),
+            matched.alert_ids.iter().max(),
+            "标题那条的行号没排在最前面:{:?}",
+            matched.alert_ids
+        );
 
         assert_eq!(log.lock().unwrap().searches, 1);
         assert_eq!(log.lock().unwrap().fetches.len(), 1);
