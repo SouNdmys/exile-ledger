@@ -17,6 +17,7 @@ pub mod decide;
 pub mod gateway;
 pub mod live_worker;
 pub mod ninja_sampler;
+pub mod observe;
 pub mod poll;
 
 pub use actor::{
@@ -40,6 +41,7 @@ pub use ninja_sampler::{
     plan_partitions, rate_limit_delay, refresh_prices, run_sampler, should_skip, stage_order,
     stage_plan,
 };
+pub use observe::{ObserveEntry, ObserveKind, ObserveScheduler, fetch_listing_cap};
 pub use poll::{PollEntry, PollOutcome, PollScheduler, budget_floor_interval};
 
 /// 现在是 unix 秒。

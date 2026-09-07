@@ -23,7 +23,22 @@
 //! # 观察模式:市场观察(Phase 3)开工前要核实的三条接口事实,一趟跑完
 //! cargo run -p pnd-runtime --bin trade_probe -- \
 //!     --observe --league "Forbidden Rites" --search <搜索URL或id>
+//!
+//! # 观察运行模式:起真的 actor 跑市场观察,把 discover / recheck 两轮都走一遍
+//! cargo run -p pnd-runtime --bin trade_probe -- \
+//!     --observe-run --search <搜索URL或id> --minutes 1 \
+//!     [--discover-seconds 300] [--recheck-seconds 1800]
 //! ```
+//!
+//! `--observe-run` 和 `--watch` 一样,一行判定逻辑都没有:它造一份带一条
+//! `ObservationEntry` 的设置、起 [`RuntimeHandle`]、把事件翻译成人话,最后
+//! 直接读一遍库把攒下来的东西打出来(见过几条、没了几条、按词缀聚合的结果)。
+//! 库开在临时文件里(actor 和探针各开一个连接读同一个文件),跑完就删掉 ——
+//! 探针不该往用户真正的 `watch.sqlite` 里塞东西。
+//!
+//! 一分钟的窗口里等不到默认 30 分钟的回查,所以第一轮 discover 一跑完,
+//! 探针就发一条 `RecheckNow`:这样一趟就能看到"新挂单入库 → 回查 → 判定"
+//! 整条链路。花掉的请求是 1 次 search + 新面孔那几批 fetch + 回查那几批。
 //!
 //! 蹲价模式每条状态行里都带着 live 那一头的档位(`live off` / `live connecting` /
 //! `live up 42s` / `live retry #2 in 18s` / `live disabled: no session`)。
@@ -41,22 +56,25 @@
 //! 一个词的形式出现在输出里。
 
 use std::collections::BTreeMap;
-use std::process::ExitCode;
+use std::path::Path;
+use std::process::{self, ExitCode};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use pnd_domain::{
-    Currency, CurrencyRates, ListingSummary, Price, PriceCap, SearchRef, Verdict, decode_search_id,
-    judge, parse_search_reference, search_page_url, search_request_body, with_seller_filter,
-    with_sort,
+    Currency, CurrencyRates, ListingSummary, ObservationId, Price, PriceCap, SearchRef, Verdict,
+    decode_search_id, judge, parse_search_reference, search_page_url, search_request_body,
+    with_seller_filter, with_sort,
 };
 use pnd_ninja::client::NinjaClient;
 use pnd_runtime::actor::{
-    HideoutOutcome, RuntimeCommand, RuntimeEvent, RuntimeHandle, RuntimePaths, WatchStatus,
+    HideoutOutcome, ObservationStatus, RuntimeCommand, RuntimeEvent, RuntimeHandle, RuntimePaths,
+    WatchStatus,
 };
 use pnd_runtime::live_worker::{LiveOffReason, LiveRunState};
 use pnd_runtime::{describe_token, now_secs};
-use pnd_settings::{AppSettings, WatchEntry};
+use pnd_settings::{AppSettings, ObservationEntry, WatchEntry};
+use pnd_storage::{ObservedListingRow, WatchStore};
 use pnd_trade::client::{
     MAX_FETCH_IDS, SearchResponse, TradeClient, TradeResponse, ggg_error, parse_search_response,
 };
@@ -82,7 +100,9 @@ const USAGE: &str = "usage: trade_probe --search <url|id> [--league \"Forbidden 
 [--rates chaos=25.21,exalted=83.42]\n       \
 trade_probe --watch --minutes 3 [--poll-seconds 60] --search <url|id> [--search <url|id>] \
 [--cap 20] [--currency divine] [--session <POESESSID>] [--hideout <alert_id>]\n       \
-trade_probe --observe --search <url|id> [--league \"Forbidden Rites\"]";
+trade_probe --observe --search <url|id> [--league \"Forbidden Rites\"]\n       \
+trade_probe --observe-run --search <url|id> [--minutes 1] \
+[--discover-seconds 300] [--recheck-seconds 1800]";
 
 /// 蹲价模式里多久抽一次事件。事件通道是无界的,抽得慢只是屏幕上晚一点看到,
 /// 不会丢。
@@ -107,6 +127,9 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> Result<(), String> {
+    if args.observe_run {
+        return run_observe_run(args);
+    }
     if args.observe {
         return run_observe(args);
     }
@@ -526,6 +549,235 @@ fn fake_listing_id(id: &str) -> String {
 }
 
 // ---------------------------------------------------------------------
+// 观察运行模式:开真的 actor 跑一轮 discover + 一轮 recheck
+// ---------------------------------------------------------------------
+
+/// `--observe-run`:把市场观察那条链路整个跑一遍。
+///
+/// 和 `--watch` 一样,这里一行判定逻辑都没有 —— 造设置、起 actor、印事件,
+/// 最后直接读库把攒下来的东西摆出来。判定("这条挂单是卖掉了还是撤了")、
+/// 聚合、词缀模板全是生产代码算的。
+fn run_observe_run(args: &Args) -> Result<(), String> {
+    let raw = &args.searches[0];
+    let search_ref = parse_search_reference(raw, &args.league)
+        .ok_or_else(|| format!("could not read a search reference out of {raw:?}"))?;
+    let query_json = decode_search_id(&search_ref.search_id).map_err(|e| e.to_string())?;
+    let label = label_from_query(&query_json, &search_ref);
+
+    let mut settings = AppSettings {
+        league: search_ref.league.clone(),
+        poesessid: args.session.clone().unwrap_or_default(),
+        ..AppSettings::default()
+    };
+    let mut entry = ObservationEntry::new(label.clone(), &search_ref);
+    entry.discover_interval_secs = args.discover_seconds;
+    entry.recheck_interval_secs = args.recheck_seconds;
+    let obs_id = entry.id.clone();
+    settings.observations.push(entry);
+    // 两个下限由它兜住(300 / 1800 秒),所以印出来的数就是真正会用的数。
+    settings.normalize();
+
+    // 库开在临时文件而不是内存里:actor 和探针各开一个连接读同一个文件,
+    // 跑完探针才能把攒下来的东西读出来给人看。
+    let db_path = std::env::temp_dir().join(format!("pnd-observe-probe-{}.sqlite", process::id()));
+    let _ = std::fs::remove_file(&db_path);
+
+    println!("league        {}", settings.league);
+    println!("search id     {}", search_ref.search_id);
+    println!("search page   {}", search_page_url(&search_ref));
+    println!(
+        "session       {}",
+        if settings.poesessid.is_empty() {
+            "no (anonymous)"
+        } else {
+            "yes (POESESSID sent, never printed)"
+        }
+    );
+    println!("observation   {label}   ({obs_id})");
+    println!(
+        "discover      every {} s   (1 search + fetches for ids we have not seen)",
+        settings.observations[0].discover_interval_secs
+    );
+    println!(
+        "recheck       every {} s   (fetch the listings on file, 10 per request)",
+        settings.observations[0].recheck_interval_secs
+    );
+    println!("database      {}", db_path.display());
+    println!("running for   {} minutes\n", args.minutes);
+
+    let handle = RuntimeHandle::start(settings, RuntimePaths::new(db_path.clone()))
+        .map_err(|error| error.to_string())?;
+
+    let labels: BTreeMap<String, String> =
+        [(obs_id.to_string(), label.clone())].into_iter().collect();
+    let deadline = Instant::now() + Duration::from_secs(args.minutes * 60);
+    // 默认回查是半小时一次,一分钟的窗口里等不到。第一轮 discover 一落地就
+    // 手动排一次 —— 这条命令正是界面上那个"立刻回查"按钮发的东西。
+    let mut recheck_asked = false;
+    while Instant::now() < deadline {
+        match handle.try_next_event() {
+            Some(event) => {
+                if !recheck_asked && matches!(event, RuntimeEvent::ObservationChanged { .. }) {
+                    recheck_asked = true;
+                    println!(
+                        "{} observe   the first discover landed — asking for a recheck now",
+                        stamp()
+                    );
+                    handle
+                        .try_send(RuntimeCommand::RecheckNow {
+                            obs_id: obs_id.clone(),
+                        })
+                        .map_err(|error| error.to_string())?;
+                }
+                print_event(&event, &labels);
+            }
+            None => sleep(DRAIN_INTERVAL),
+        }
+    }
+    // actor 先走干净,再去读它写的那个库。
+    drop(handle);
+    println!("\n{} observe window finished.", stamp());
+
+    let report = observation_report(&db_path, &obs_id);
+    // 库故意留在原地:聚合表要是空的,里面存着的物品原文就是唯一的线索。
+    // 看完自己删掉就行(还有 -wal / -shm 两个附属文件)。
+    println!(
+        "
+database kept at {}",
+        db_path.display()
+    );
+    report
+}
+
+/// 跑完之后读一遍库:这条观察到底攒下了什么。
+fn observation_report(db_path: &Path, obs_id: &ObservationId) -> Result<(), String> {
+    let store = WatchStore::open(db_path).map_err(|error| error.to_string())?;
+    let summary = store
+        .observation_summary(obs_id)
+        .map_err(|error| error.to_string())?;
+    println!(
+        "\n=========== what this observation has on file ===========\n\
+         active {}   gone {}   (sold_likely {} · sold_after_cuts {} · unknown {})",
+        summary.active, summary.gone, summary.sold_likely, summary.sold_after_cuts, summary.unknown
+    );
+
+    let gone = store
+        .recent_gone(obs_id, 10)
+        .map_err(|error| error.to_string())?;
+    println!("\nrecently gone ({}):", gone.len());
+    for row in &gone {
+        println!("  {}", describe_observed(row));
+    }
+    if gone.is_empty() {
+        println!("  (none — nothing vanished between the discover and the recheck)");
+    }
+
+    let active = store
+        .oldest_active(obs_id, 10)
+        .map_err(|error| error.to_string())?;
+    println!("\nlongest listed ({} shown):", active.len());
+    for row in &active {
+        println!("  {}", describe_observed(row));
+    }
+
+    // 词缀是从物品原文(`item` 那一块)里读出来的,而那一块真长什么样,只有
+    // 对着真交易站跑一次才看得见。聚合表空着的时候,下面这几行是唯一能回答
+    // "为什么空"的东西:原文存下来没有、里面有哪些键、从里面读出了几条词缀。
+    if let Some(row) = active.first().or_else(|| gone.first()) {
+        let mods = store
+            .observed_mods(obs_id, &row.listing_id)
+            .map_err(|error| error.to_string())?;
+        let keys = match serde_json::from_str::<serde_json::Value>(&row.item_json) {
+            Ok(serde_json::Value::Object(map)) => map.keys().cloned().collect::<Vec<_>>(),
+            Ok(_) => vec!["(the item block is not an object)".to_string()],
+            Err(_) => vec!["(no item block was stored)".to_string()],
+        };
+        println!(
+            "
+first item block: {} bytes, {} modifier rows read out of it",
+            row.item_json.len(),
+            mods.len()
+        );
+        println!("  keys: {}", keys.join(", "));
+        for entry in mods.iter().take(8) {
+            println!("  {:<10}{}", entry.mod_kind, entry.template);
+        }
+    }
+
+    let aggregate = store
+        .mod_aggregate(obs_id, 1)
+        .map_err(|error| error.to_string())?;
+    println!(
+        "\nby modifier ({} templates, min 1 sample):",
+        aggregate.len()
+    );
+    println!(
+        "  {:<44}{:<12}{:<6}{:<6}{:<6}{:<14}{:<14}alive",
+        "template", "kind", "seen", "gone", "sold", "median gone", "median listed"
+    );
+    for outcome in aggregate.iter().take(20) {
+        println!(
+            "  {:<44}{:<12}{:<6}{:<6}{:<6}{:<14}{:<14}{}",
+            truncate(&outcome.template, 42),
+            outcome.mod_kind,
+            outcome.seen,
+            outcome.gone,
+            outcome.sold_likely,
+            describe_milli(outcome.median_gone_price_milli, &outcome.currency),
+            describe_milli(outcome.median_active_price_milli, &outcome.currency),
+            outcome
+                .median_hours_alive
+                .map_or_else(|| "-".to_string(), |hours| format!("{hours:.1} h"))
+        );
+    }
+    Ok(())
+}
+
+/// 一条观察到的挂单,一行说清:价格轨迹、活了多久、判成了什么。
+fn describe_observed(row: &ObservedListingRow) -> String {
+    let price = |price: &Option<Price>| {
+        price
+            .as_ref()
+            .map_or_else(|| "no price".to_string(), Price::display)
+    };
+    let track = if row.price_changes == 0 {
+        price(&row.last_price)
+    } else {
+        format!(
+            "{} → {} ({} changes)",
+            price(&row.first_price),
+            price(&row.last_price),
+            row.price_changes
+        )
+    };
+    let verdict = match row.gone_class {
+        Some(class) => format!("  gone: {}", class.as_str()),
+        None => String::new(),
+    };
+    format!(
+        "{}  {}  {}  seen for {} min{verdict}",
+        short_id(&row.listing_id),
+        row.item_name,
+        track,
+        row.observed_lifetime_secs() / 60
+    )
+}
+
+fn describe_milli(milli: Option<i64>, currency: &str) -> String {
+    match milli {
+        Some(milli) => Price::new(milli, Currency::parse(currency)).display(),
+        None => "-".to_string(),
+    }
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    text.chars().take(width - 1).chain(['…']).collect()
+}
+
+// ---------------------------------------------------------------------
 // 蹲价模式:开真的 actor,只负责把事件翻译成人话
 // ---------------------------------------------------------------------
 
@@ -679,6 +931,25 @@ fn print_event(event: &RuntimeEvent, labels: &BTreeMap<String, String>) {
                 }
             );
         }
+        RuntimeEvent::ObservationStatus { obs_id, status } => {
+            println!(
+                "{at} observe   {} {}",
+                labels
+                    .get(obs_id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| obs_id.to_string()),
+                describe_observation(status)
+            );
+        }
+        RuntimeEvent::ObservationChanged { obs_id } => {
+            println!(
+                "{at} observe   {} — a cycle finished, the page would re-read the database now",
+                labels
+                    .get(obs_id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| obs_id.to_string())
+            );
+        }
         RuntimeEvent::SessionInvalid => println!("{at} session   the POESESSID was rejected"),
         RuntimeEvent::CloudflareBlocked { until } => {
             println!(
@@ -741,6 +1012,25 @@ fn live_reason(reason: LiveOffReason) -> &'static str {
         LiveOffReason::TooMany => "too many live connections",
         LiveOffReason::SessionInvalid => "session invalid",
     }
+}
+
+/// 一条观察的状态行。两条时间线各说各的,所以两个"还有多久"都要印。
+fn describe_observation(status: &ObservationStatus) -> String {
+    let now = now_secs();
+    let mut parts = vec![
+        format!("{} active", status.active),
+        format!("{} gone", status.gone),
+    ];
+    if let Some(at) = status.next_discover_at {
+        parts.push(format!("discover in {}s", (at - now).max(0)));
+    }
+    if let Some(at) = status.next_recheck_at {
+        parts.push(format!("recheck in {}s", (at - now).max(0)));
+    }
+    if let Some(error) = &status.last_error {
+        parts.push(format!("error: {error}"));
+    }
+    parts.join("  ")
 }
 
 fn describe_status(status: &WatchStatus) -> String {
@@ -1105,6 +1395,12 @@ struct Args {
     watch: bool,
     /// `--observe`:市场观察那三条接口事实的一次性取证,见 [`run_observe`]。
     observe: bool,
+    /// `--observe-run`:起真的 actor 跑市场观察,见 [`run_observe_run`]。
+    observe_run: bool,
+    /// 观察的两个节奏(秒)。默认就是设置里的下限 —— 探针一趟只有几分钟,
+    /// 跑的是"最勤能多勤",而 `normalize` 会兜住不让它更勤。
+    discover_seconds: u64,
+    recheck_seconds: u64,
     minutes: u64,
     poll_seconds: u64,
     /// `--hideout <alert_id>`:蹲价模式下发一条 `TravelToHideout` 命令。
@@ -1129,6 +1425,9 @@ impl Args {
         let mut rates: Option<CurrencyRates> = None;
         let mut watch = false;
         let mut observe = false;
+        let mut observe_run = false;
+        let mut discover_seconds = pnd_settings::MIN_DISCOVER_INTERVAL_SECS;
+        let mut recheck_seconds = pnd_settings::MIN_RECHECK_INTERVAL_SECS;
         let mut minutes: u64 = 3;
         let mut poll_seconds: u64 = 300;
         let mut hideout: Option<i64> = None;
@@ -1141,6 +1440,19 @@ impl Args {
                 "--search" => searches.push(value()?),
                 "--watch" => watch = true,
                 "--observe" => observe = true,
+                "--observe-run" => observe_run = true,
+                "--discover-seconds" => {
+                    let raw = value()?;
+                    discover_seconds = raw.parse::<u64>().map_err(|_| {
+                        format!("--discover-seconds wants a whole number, got {raw:?}")
+                    })?;
+                }
+                "--recheck-seconds" => {
+                    let raw = value()?;
+                    recheck_seconds = raw.parse::<u64>().map_err(|_| {
+                        format!("--recheck-seconds wants a whole number, got {raw:?}")
+                    })?;
+                }
                 "--minutes" => {
                     let raw = value()?;
                     minutes = raw
@@ -1200,6 +1512,9 @@ impl Args {
             rates,
             watch,
             observe,
+            observe_run,
+            discover_seconds,
+            recheck_seconds,
             minutes,
             // 低于 60 秒对交易站不礼貌;`AppSettings::normalize` 也会兜这一下,
             // 这里先兜是为了打印出来的数就是真正会用的数。

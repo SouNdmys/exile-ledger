@@ -152,7 +152,12 @@ fn number_at(chars: &[char], start: usize) -> Option<usize> {
 }
 
 /// 一行显示文本里的那些数,顺序和 [`mod_template`] 里 `#` 的顺序一致。
-fn line_numbers(display: &str) -> Vec<f64> {
+///
+/// 对外开着,是因为交易站那边的词缀只有显示文本(没有 ninja 那份结构化的
+/// `mods`):市场观察把 `Adds 29 to 38 Cold Damage` 记成模板 + 两个数,靠的
+/// 就是这一对函数,不能自己再抄一份取数的规则。
+#[must_use]
+pub fn line_numbers(display: &str) -> Vec<f64> {
     let chars: Vec<char> = flatten_markup(display).chars().collect();
     let mut out = Vec::new();
     let mut index = 0;

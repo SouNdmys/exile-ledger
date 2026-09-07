@@ -10,7 +10,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use pnd_domain::{Currency, Price, SearchRef, WatchId};
+use pnd_domain::{Currency, ObservationId, Price, SearchRef, WatchId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -84,6 +84,72 @@ impl WatchEntry {
             price_cap,
             created_at: chrono::Utc::now().to_rfc3339(),
             ..WatchEntry::default()
+        }
+    }
+}
+
+/// 一条市场观察:盯住一整类货(比如"某一档碑牌"),看它们最后都怎么样了。
+///
+/// 和 [`WatchEntry`] 的区别不只是少了一个价格上限:蹲价问的是"现在有没有
+/// 便宜货",观察问的是"这批货能不能卖掉、多久卖掉、什么价卖掉",所以它
+/// 不判定、不提醒,只是按两个节奏反复看 —— `discover` 拉最新 100 条找新面孔,
+/// `recheck` 回头查在册的那些还在不在。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct ObservationEntry {
+    pub id: ObservationId,
+    pub label: String,
+    pub league: String,
+    pub search_id: String,
+    pub enabled: bool,
+    /// 多久拉一次"最新 100 条"找新面孔(秒)。
+    ///
+    /// 默认 600:一次 discover 就是一次 search,而 6 小时 299 次的搜索额度
+    /// 要和蹲价分着花;10 分钟一次的话,一条观察一天只花 144 次。
+    /// [`AppSettings::normalize`] 兜住 300 秒的下限。
+    pub discover_interval_secs: u64,
+    /// 多久把在册的挂单回头查一遍(秒)。
+    ///
+    /// 默认 7200:回查的粒度就是"存活时间"的精度,两小时对"挂了三天"和
+    /// "两小时就没了"这个区别足够了,而更勤只是白花 fetch 额度。
+    pub recheck_interval_secs: u64,
+    /// RFC3339;空串合法(手写的设置文件可以不填)。
+    pub created_at: String,
+}
+
+/// discover / recheck 的下限。比这更勤对交易站不礼貌,而且换不来更多信息:
+/// 挂单的上架时间本来就只精确到秒级以上,五分钟内的差别看不出什么。
+pub const MIN_DISCOVER_INTERVAL_SECS: u64 = 300;
+/// 回查的下限。半小时一次已经能把"挂了三天"和"两小时就没了"分得很开,
+/// 更勤只是把 fetch 额度烧在同一批挂单上。
+pub const MIN_RECHECK_INTERVAL_SECS: u64 = 1800;
+
+impl Default for ObservationEntry {
+    fn default() -> Self {
+        Self {
+            id: ObservationId(String::new()),
+            label: String::new(),
+            league: String::new(),
+            search_id: String::new(),
+            enabled: true,
+            discover_interval_secs: 600,
+            recheck_interval_secs: 7200,
+            created_at: String::new(),
+        }
+    }
+}
+
+impl ObservationEntry {
+    /// 从"用户刚粘进来的那个搜索"造一条新观察。和 [`WatchEntry::new`] 一样,
+    /// 这是少数几处碰时钟的地方,别处的时间都由调用方传进来。
+    pub fn new(label: impl Into<String>, search_ref: &SearchRef) -> ObservationEntry {
+        ObservationEntry {
+            id: ObservationId(uuid::Uuid::new_v4().to_string()),
+            label: label.into(),
+            league: search_ref.league.clone(),
+            search_id: search_ref.search_id.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            ..ObservationEntry::default()
         }
     }
 }
@@ -214,6 +280,9 @@ pub struct AppSettings {
     /// 明文存本机。程序不登录、不存密码、不把它写进日志。
     pub poesessid: String,
     pub watches: Vec<WatchEntry>,
+    /// 市场观察的列表。schema 版本还是 1:`#[serde(default)]` 让老文件缺这个
+    /// 键时读出一个空列表,而不是整份设置读不出来。
+    pub observations: Vec<ObservationEntry>,
     pub watcher: WatcherTuning,
     pub alert: AlertTuning,
     pub ninja: NinjaTuning,
@@ -228,6 +297,7 @@ impl Default for AppSettings {
             league: "Forbidden Rites".to_string(),
             poesessid: String::new(),
             watches: Vec::new(),
+            observations: Vec::new(),
             watcher: WatcherTuning::default(),
             alert: AlertTuning::default(),
             ninja: NinjaTuning::default(),
@@ -248,6 +318,14 @@ impl AppSettings {
         self.watcher.poll_interval_when_live_seconds =
             self.watcher.poll_interval_when_live_seconds.max(60);
         self.alert.opacity = self.alert.opacity.max(60);
+        // 观察的两个节奏同理:比下限更勤只是白花额度,而它们和蹲价共用
+        // 同一份 6 小时的搜索预算。
+        for entry in &mut self.observations {
+            entry.discover_interval_secs =
+                entry.discover_interval_secs.max(MIN_DISCOVER_INTERVAL_SECS);
+            entry.recheck_interval_secs =
+                entry.recheck_interval_secs.max(MIN_RECHECK_INTERVAL_SECS);
+        }
         if self.ui_language != "zh" && self.ui_language != "en" {
             self.ui_language = "zh".to_string();
         }
@@ -255,6 +333,10 @@ impl AppSettings {
 
     pub fn watch(&self, id: &WatchId) -> Option<&WatchEntry> {
         self.watches.iter().find(|entry| &entry.id == id)
+    }
+
+    pub fn observation(&self, id: &ObservationId) -> Option<&ObservationEntry> {
+        self.observations.iter().find(|entry| &entry.id == id)
     }
 
     /// 所有出站请求的 User-Agent。ninja 的文档要求能识别到人 + 联系方式。
@@ -659,6 +741,96 @@ mod settings_tests {
 
         let other = WatchEntry::new("Choir", &search, Price::new(20_000, Currency::Divine));
         assert_ne!(entry.id, other.id, "每条记录一个自己的 id");
+    }
+
+    /// 新建的观察:有 uuid、有时间戳、默认开着,两个节奏是计划里那两个数。
+    #[test]
+    fn a_new_observation_entry_is_ready_to_run() {
+        let search = SearchRef {
+            league: "Forbidden Rites".to_string(),
+            search_id: "H4sIAAAA-_09".to_string(),
+        };
+        let entry = ObservationEntry::new("Precursor Tablets", &search);
+        assert_eq!(entry.id.as_str().len(), 36, "uuid v4 带连字符是 36 个字符");
+        assert_eq!(entry.label, "Precursor Tablets");
+        assert_eq!(entry.league, "Forbidden Rites");
+        assert_eq!(entry.search_id, "H4sIAAAA-_09");
+        assert!(entry.enabled);
+        assert_eq!(entry.discover_interval_secs, 600);
+        assert_eq!(entry.recheck_interval_secs, 7_200);
+        assert!(entry.created_at.starts_with("20"));
+
+        let other = ObservationEntry::new("Precursor Tablets", &search);
+        assert_ne!(entry.id, other.id, "每条观察一个自己的 id");
+    }
+
+    /// 观察列表要能存能读,而且能按 id 找回来。
+    #[test]
+    fn observations_round_trip_and_can_be_looked_up() {
+        let store = temp_store("observations");
+        let search = SearchRef {
+            league: "Forbidden Rites".to_string(),
+            search_id: "H4sIAAAA-_09".to_string(),
+        };
+        let mut settings = AppSettings::default();
+        settings
+            .observations
+            .push(ObservationEntry::new("Tablets", &search));
+        let id = settings.observations[0].id.clone();
+
+        store.save(&settings).expect("save");
+        let loaded = store.load();
+        assert_eq!(loaded.status, LoadStatus::Loaded);
+        assert_eq!(loaded.settings, settings);
+        assert_eq!(
+            loaded.settings.observation(&id).map(|e| e.label.as_str()),
+            Some("Tablets")
+        );
+        assert_eq!(
+            loaded.settings.observation(&ObservationId("nope".into())),
+            None
+        );
+    }
+
+    /// 盘上那份 schema 1 的文件没有 `observations` 这个键。它必须照常读出来:
+    /// 观察列表补一个空的,版本号还是 1 —— 加一个功能不该逼用户重设一遍设置。
+    #[test]
+    fn an_older_schema_one_file_gains_an_empty_observation_list() {
+        let store = temp_store("older-no-observations");
+        write_file(
+            &store,
+            r#"{"schema_version": 1, "league": "Standard", "watches": []}"#,
+        );
+        let loaded = store.load();
+        assert_eq!(loaded.status, LoadStatus::Loaded);
+        assert_eq!(loaded.settings.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(loaded.settings.league, "Standard");
+        assert!(loaded.settings.observations.is_empty());
+        assert!(!store.is_read_only());
+    }
+
+    /// 手改得再勤也快不过下限:观察和蹲价共用同一份 6 小时的搜索预算。
+    #[test]
+    fn normalize_clamps_the_observation_intervals() {
+        let search = SearchRef {
+            league: "Forbidden Rites".to_string(),
+            search_id: "H4sIAAAA-_09".to_string(),
+        };
+        let mut settings = AppSettings::default();
+        let mut eager = ObservationEntry::new("Tablets", &search);
+        eager.discover_interval_secs = 5;
+        eager.recheck_interval_secs = 0;
+        let mut lazy = ObservationEntry::new("Rings", &search);
+        lazy.discover_interval_secs = 3_600;
+        lazy.recheck_interval_secs = 86_400;
+        settings.observations = vec![eager, lazy];
+        settings.normalize();
+
+        assert_eq!(settings.observations[0].discover_interval_secs, 300);
+        assert_eq!(settings.observations[0].recheck_interval_secs, 1_800);
+        // 填得比下限还慢就听用户的。
+        assert_eq!(settings.observations[1].discover_interval_secs, 3_600);
+        assert_eq!(settings.observations[1].recheck_interval_secs, 86_400);
     }
 
     /// 货币走普通字符串、金额走千分整数 —— 手工看设置文件时要能读懂。

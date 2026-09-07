@@ -16,10 +16,11 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use pnd_domain::{ListingSummary, WatchId};
+use pnd_domain::{ListingSummary, ObservationId, WatchId};
 use pnd_trade::{
     BucketUsage, Budget, FETCH_POLICY, RateLimiter, SEARCH_POLICY, TradeClient, TradeResponse,
-    TransportError, backoff_after_429, parse_fetch_response, parse_search_response,
+    TransportError, backoff_after_429, parse_fetch_response, parse_fetch_response_by_id,
+    parse_search_response,
 };
 use thiserror::Error;
 
@@ -123,11 +124,59 @@ pub enum Priority {
 ///
 /// `alert_id` 是"去藏身处"那条链路用的:那次刷新 token 的 fetch 和随后的
 /// whisper 都不属于任何一轮轮询,回信要认的是提醒记录里的行号。
+/// `obs_id` 同理,认的是市场观察那一条。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestTag {
     pub watch_id: Option<WatchId>,
+    pub obs_id: Option<ObservationId>,
     pub alert_id: Option<i64>,
     pub label: &'static str,
+}
+
+impl RequestTag {
+    /// 一条蹲价搜索的某一步。
+    #[must_use]
+    pub fn watch(watch_id: WatchId, label: &'static str) -> RequestTag {
+        RequestTag {
+            watch_id: Some(watch_id),
+            obs_id: None,
+            alert_id: None,
+            label,
+        }
+    }
+
+    /// 一条市场观察的某一步。
+    #[must_use]
+    pub fn observation(obs_id: ObservationId, label: &'static str) -> RequestTag {
+        RequestTag {
+            watch_id: None,
+            obs_id: Some(obs_id),
+            alert_id: None,
+            label,
+        }
+    }
+
+    /// 一条提醒上的某一步("去藏身处"那两下)。
+    #[must_use]
+    pub fn alert(alert_id: i64, label: &'static str) -> RequestTag {
+        RequestTag {
+            watch_id: None,
+            obs_id: None,
+            alert_id: Some(alert_id),
+            label,
+        }
+    }
+
+    /// 谁也不属于的一次请求(设置页那个"测试会话")。
+    #[must_use]
+    pub fn standalone(label: &'static str) -> RequestTag {
+        RequestTag {
+            watch_id: None,
+            obs_id: None,
+            alert_id: None,
+            label,
+        }
+    }
 }
 
 /// 四种请求。请求体已经拼好了:网关不认识查询 JSON 长什么样。
@@ -148,6 +197,17 @@ pub enum RequestKind {
         body_json: String,
     },
     Fetch {
+        ids: Vec<String>,
+        search_id: String,
+    },
+    /// 和 `Fetch` 发的是同一个请求,**要的答案不同**:回信按请求时的 id 逐个
+    /// 对号,查不到的那一格是 `None`。
+    ///
+    /// 市场观察问的正是"我问的这几条里哪几条没了" —— 而 `Fetch` 的回信是一个
+    /// 摘要数组,`null` 那几格早被丢掉了,丢完就分不清是哪个 id 没的。
+    /// 蹲价不需要这份信息(少一条便宜货无所谓),所以没有让所有 fetch 回信
+    /// 都拖着一份 id 清单。
+    FetchByIds {
         ids: Vec<String>,
         search_id: String,
     },
@@ -234,6 +294,9 @@ pub enum ReplyKind {
     Search(Result<SearchOutcome, GatewayError>),
     SessionCheck(Result<SessionCheckOutcome, GatewayError>),
     Fetch(Result<Vec<ListingSummary>, GatewayError>),
+    /// 按请求时的 id 顺序逐个对号,`None` = 那条挂单没了。见
+    /// [`RequestKind::FetchByIds`]。
+    FetchByIds(Result<Vec<(String, Option<ListingSummary>)>, GatewayError>),
     /// whisper 只回一个状态码:200 = 发出去了,503 多半是 token 过期。
     Whisper(Result<u16, GatewayError>),
 }
@@ -368,7 +431,7 @@ fn policy_for(kind: &RequestKind) -> &'static str {
     match kind {
         // 会话检查发的就是一次 search,它当然要从 search 的预算里出。
         RequestKind::Search { .. } | RequestKind::SessionCheck { .. } => SEARCH_POLICY,
-        RequestKind::Fetch { .. } => FETCH_POLICY,
+        RequestKind::Fetch { .. } | RequestKind::FetchByIds { .. } => FETCH_POLICY,
         RequestKind::Whisper { .. } => WHISPER_POLICY_PLACEHOLDER,
     }
 }
@@ -584,7 +647,7 @@ impl TradeGateway {
             | RequestKind::SessionCheck { league, body_json } => {
                 self.transport.search(league, body_json, session.as_deref())
             }
-            RequestKind::Fetch { ids, search_id } => {
+            RequestKind::Fetch { ids, search_id } | RequestKind::FetchByIds { ids, search_id } => {
                 self.transport.fetch(ids, search_id, session.as_deref())
             }
             // 上面那道闸已经保证了这里一定有会话。
@@ -749,6 +812,10 @@ fn success_reply(kind: &RequestKind, response: &TradeResponse) -> ReplyKind {
             parse_fetch_response(&response.body)
                 .map_err(|error| GatewayError::Parse(error.to_string())),
         ),
+        RequestKind::FetchByIds { ids, .. } => ReplyKind::FetchByIds(
+            parse_fetch_response_by_id(ids, &response.body)
+                .map_err(|error| GatewayError::Parse(error.to_string())),
+        ),
         RequestKind::Whisper { .. } => ReplyKind::Whisper(Ok(response.status)),
     }
 }
@@ -758,6 +825,7 @@ fn error_reply(kind: &RequestKind, error: GatewayError) -> ReplyKind {
         RequestKind::Search { .. } => ReplyKind::Search(Err(error)),
         RequestKind::SessionCheck { .. } => ReplyKind::SessionCheck(Err(error)),
         RequestKind::Fetch { .. } => ReplyKind::Fetch(Err(error)),
+        RequestKind::FetchByIds { .. } => ReplyKind::FetchByIds(Err(error)),
         RequestKind::Whisper { .. } => ReplyKind::Whisper(Err(error)),
     }
 }
@@ -775,11 +843,7 @@ mod gateway_tests {
                 kind,
                 priority,
                 reply: tx,
-                tag: RequestTag {
-                    watch_id: None,
-                    alert_id: None,
-                    label: "test",
-                },
+                tag: RequestTag::standalone("test"),
             },
             sequence,
             not_before,
@@ -956,11 +1020,7 @@ mod gateway_tests {
             },
             priority: Priority::User,
             reply: reply_tx,
-            tag: RequestTag {
-                watch_id: None,
-                alert_id: Some(7),
-                label: "test",
-            },
+            tag: RequestTag::alert(7, "test"),
         });
 
         let reply = reply_rx
@@ -1072,11 +1132,7 @@ mod gateway_tests {
             kind: search(),
             priority: Priority::PollSearch,
             reply: reply_tx,
-            tag: RequestTag {
-                watch_id: None,
-                alert_id: None,
-                label: "test",
-            },
+            tag: RequestTag::standalone("test"),
         });
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

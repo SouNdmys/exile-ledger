@@ -2,10 +2,15 @@
 //! 不依赖任何 I/O,是其余 crate 共同建立的最底层。
 
 pub mod listing;
+pub mod observe;
 pub mod price;
 pub mod search_ref;
 
-pub use listing::{ListingSummary, WatchId};
+pub use listing::{ListingSummary, ObservationId, WatchId};
+pub use observe::{
+    GoneClass, MIN_OBSERVED_LIFETIME_SECS, STALE_AFTER_SECS, classify_gone, is_stale,
+    observed_lifetime_secs,
+};
 pub use price::{Currency, CurrencyRates, Price, PriceCap, Verdict, judge, to_divine_milli};
 pub use search_ref::{
     SearchIdError, SearchRef, decode_search_id, default_label_for, encode_league_path,

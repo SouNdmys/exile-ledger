@@ -18,19 +18,19 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use pnd_domain::{
-    CurrencyRates, ListingSummary, PriceCap, SearchRef, WatchId, decode_search_id, judge,
-    search_page_url, search_request_body,
+    CurrencyRates, ListingSummary, ObservationId, PriceCap, SearchRef, WatchId, classify_gone,
+    decode_search_id, judge, search_page_url, search_request_body, with_sort,
 };
 use pnd_ninja::client::NinjaClient;
-use pnd_settings::{AppSettings, WatchEntry};
+use pnd_settings::{AppSettings, ObservationEntry, WatchEntry};
 use pnd_storage::{
-    AlertRow, AlertSource, LiveState, NewAlert, StorageError, WatchState, WatchStore,
-    default_watch_db_path,
+    AlertRow, AlertSource, LiveState, NewAlert, ObservationRun, StorageError, WatchState,
+    WatchStore, default_watch_db_path,
 };
 use pnd_trade::live::{LiveConfig, MAX_LIVE_CONNECTIONS_PER_ACCOUNT};
 use pnd_trade::{
-    BucketUsage, Budget, MAX_FETCH_IDS, SEARCH_LONG_WINDOW_REQUESTS, SEARCH_LONG_WINDOW_SECS,
-    TradeClient, ggg_error, jwt_expiry,
+    BucketUsage, Budget, FETCH_LONG_WINDOW_REQUESTS, FETCH_LONG_WINDOW_SECS, MAX_FETCH_IDS,
+    SEARCH_LONG_WINDOW_REQUESTS, SEARCH_LONG_WINDOW_SECS, TradeClient, ggg_error, jwt_expiry,
 };
 use thiserror::Error;
 
@@ -43,6 +43,7 @@ use crate::live_worker::{
     LiveConnector, LiveEvent, LiveOffReason, LiveRunState, LiveWorkerConfig, LiveWorkerHandle,
     TungsteniteConnector, spawn_live_worker,
 };
+use crate::observe::{ObserveKind, ObserveScheduler, fetch_listing_cap};
 use crate::poll::{PollOutcome, PollScheduler, budget_floor_interval};
 use crate::{describe_token, now_secs};
 
@@ -65,6 +66,10 @@ const HIDEOUT_FETCH_LABEL: &str = "hideout-fetch";
 const HIDEOUT_WHISPER_LABEL: &str = "hideout-whisper";
 /// 设置页那个"测试会话"发出去的一次搜索。
 const SESSION_CHECK_LABEL: &str = "session-check";
+/// 市场观察的三步:拉最新 100 条、抓新面孔的详情、回查在册的还在不在。
+const OBSERVE_SEARCH_LABEL: &str = "observe-discover";
+const OBSERVE_DISCOVER_FETCH_LABEL: &str = "observe-discover-fetch";
+const OBSERVE_RECHECK_LABEL: &str = "observe-recheck";
 
 /// token 里没有 `exp` 时的兜底:拿到超过这么久就当它过期了。
 /// 2026-09-07 抓包证实 hideout_token 只活 300 秒,这里再减掉和
@@ -122,6 +127,15 @@ pub enum RuntimeCommand {
     /// 设置页上的"测试会话":拿现在这个 POESESSID 发一次搜索,看服务端
     /// 认不认它。花掉一次 search 额度,所以也只在用户点的时候发。
     TestSession,
+    /// 市场观察页上的"立刻找一次新的":排一次 discover(1 次 search + 新面孔的
+    /// fetch)。和 `PollNow` 一样,只在用户点的时候发。
+    DiscoverNow {
+        obs_id: ObservationId,
+    },
+    /// "立刻回查一次":把在册的挂单按 10 个一批查一遍,看谁没了。
+    RecheckNow {
+        obs_id: ObservationId,
+    },
     Shutdown,
 }
 
@@ -201,6 +215,26 @@ pub struct WatchStatus {
     pub last_error: Option<String>,
 }
 
+/// 给界面看的一条市场观察的运行状态。
+///
+/// 只有"这条观察现在怎么样",没有任何统计结果:聚合表、挂单流那些是几百行
+/// 的东西,每次广播都塞一份既大又陈旧。界面收到 [`RuntimeEvent::ObservationChanged`]
+/// 之后自己去库里读,读到的一定是最新的。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ObservationStatus {
+    /// 还挂着的挂单条数。
+    pub active: u32,
+    /// 已经不见了的条数(含判成 `Unknown` 的)。
+    pub gone: u32,
+    pub last_discover_at: Option<i64>,
+    pub last_recheck_at: Option<i64>,
+    /// 下一次 discover / recheck 的 unix 秒;不在排班(停用了、搜索 id 坏了)
+    /// 时是 `None`。
+    pub next_discover_at: Option<i64>,
+    pub next_recheck_at: Option<i64>,
+    pub last_error: Option<String>,
+}
+
 /// 运行时向外广播的一切。
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeEvent {
@@ -228,6 +262,18 @@ pub enum RuntimeEvent {
     SessionChecked {
         valid: bool,
         detail: String,
+    },
+    /// 一条市场观察的运行状态变了(排班动了、一轮跑完了、出错了)。
+    ObservationStatus {
+        obs_id: ObservationId,
+        status: ObservationStatus,
+    },
+    /// 一条市场观察的**库里的数据**变了 —— 每轮 discover / recheck 跑完发一次。
+    ///
+    /// 事件里不带数据:观察页要的那几张表(聚合、挂单流)动辄几百行,
+    /// 而且用户还在上面筛选。界面收到这一句就自己去库里重读一遍。
+    ObservationChanged {
+        obs_id: ObservationId,
     },
     /// POESESSID 失效了,程序已经停用它。
     SessionInvalid,
@@ -479,6 +525,26 @@ struct WatchRuntime {
     status: WatchStatus,
 }
 
+/// 一条市场观察在运行时里的全部状态。
+struct ObservationRuntime {
+    entry: ObservationEntry,
+    /// 搜索 id 解出来的查询,换成**按上架时间倒序**的请求体
+    /// (`with_sort(q, "indexed", "desc")`)—— 观察要的是"最新 100 条",
+    /// 不是蹲价那个"最便宜的 100 条"。解不开就是 `None`,那条观察不排班。
+    query_body: Option<String>,
+    /// 上一次 discover 回来的服务端搜索 id,fetch 要拿它当 `?query=`。
+    search_id: String,
+    /// discover 的那次 search 正在路上。
+    discover_in_flight: bool,
+    /// 这一轮 discover / recheck 还有几批 fetch 没回来。
+    ///
+    /// 数它是为了知道"这一轮什么时候算跑完":跑完才落 `last_discover_at`、
+    /// 才广播一次 `ObservationChanged`,而不是每回来一批就喊一声。
+    discover_pending: usize,
+    recheck_pending: usize,
+    status: ObservationStatus,
+}
+
 /// 一次"去藏身处"点击走到哪一步了。
 ///
 /// 一个 alert 同时只会有一条:第二次点击在这条还没走完时会被挡掉,
@@ -507,6 +573,9 @@ struct RuntimeActor {
     inbox: Sender<Inbox>,
     scheduler: PollScheduler,
     watches: BTreeMap<WatchId, WatchRuntime>,
+    /// 市场观察的时间表和状态。和蹲价并排,共用同一条网关、同一份预算。
+    observe_scheduler: ObserveScheduler,
+    observations: BTreeMap<ObservationId, ObservationRuntime>,
     /// 怎么去开一条 live 连接。生产是 tungstenite,测试是写好剧本的假货。
     connector: Arc<dyn LiveConnector>,
     /// 正在跑的 live worker,一条搜索最多一条。
@@ -567,6 +636,8 @@ impl RuntimeActor {
             inbox,
             scheduler: PollScheduler::new(),
             watches: BTreeMap::new(),
+            observe_scheduler: ObserveScheduler::new(),
+            observations: BTreeMap::new(),
             connector,
             live_workers: BTreeMap::new(),
             session_ok: true,
@@ -593,6 +664,9 @@ impl RuntimeActor {
             let now = now_secs();
             for watch_id in self.scheduler.due(now) {
                 self.start_poll(&watch_id, now);
+            }
+            for (obs_id, kind) in self.observe_scheduler.due(now) {
+                self.start_observe(&obs_id, kind, now);
             }
 
             match inbox.recv_timeout(self.wait(now)) {
@@ -624,9 +698,16 @@ impl RuntimeActor {
         }
     }
 
-    /// 睡到下一次该轮询的时刻,封顶一秒。
+    /// 睡到下一件该做的事的时刻,封顶一秒。蹲价和观察两张时间表取早的那个。
     fn wait(&self, now: i64) -> Duration {
-        match self.scheduler.next_deadline() {
+        let deadline = match (
+            self.scheduler.next_deadline(),
+            self.observe_scheduler.next_deadline(),
+        ) {
+            (Some(poll), Some(observe)) => Some(poll.min(observe)),
+            (poll, observe) => poll.or(observe),
+        };
+        match deadline {
             Some(at) => {
                 Duration::from_secs((at - now).clamp(0, MAX_LOOP_WAIT.as_secs() as i64) as u64)
                     .max(Duration::from_millis(50))
@@ -657,6 +738,14 @@ impl RuntimeActor {
                 self.travel_to_hideout(alert_id, now);
             }
             RuntimeCommand::TestSession => self.test_session(),
+            RuntimeCommand::DiscoverNow { obs_id } => {
+                self.observe_scheduler
+                    .run_now(&obs_id, ObserveKind::Discover, now);
+            }
+            RuntimeCommand::RecheckNow { obs_id } => {
+                self.observe_scheduler
+                    .run_now(&obs_id, ObserveKind::Recheck, now);
+            }
             RuntimeCommand::Shutdown => self.shutdown = true,
         }
     }
@@ -704,13 +793,24 @@ impl RuntimeActor {
             .iter()
             .filter(|entry| entry.enabled)
             .count();
+        let enabled_observations = settings
+            .observations
+            .iter()
+            .filter(|entry| entry.enabled)
+            .count();
         // 搜索额度 6 小时就那么多次,几条搜索分着花。设置里填得再勤,
         // 也不能勤过这个地板 —— 超了不是报错,是被服务端 429 冷却。
-        self.scheduler.set_budget_floor(budget_floor_interval(
-            enabled_count,
+        //
+        // **观察也要数进来**:一次 discover 就是一次 search,和蹲价花的是
+        // 同一份额度。两边各算各的地板的话,三条搜索 + 三条观察就会一起
+        // 按"三个用户"的节奏跑,加起来正好超一倍。
+        let search_floor = budget_floor_interval(
+            enabled_count + enabled_observations,
             budget.effective_limit(SEARCH_LONG_WINDOW_REQUESTS),
             SEARCH_LONG_WINDOW_SECS,
-        ));
+        );
+        self.scheduler.set_budget_floor(search_floor);
+        self.observe_scheduler.set_discover_floor(search_floor);
         let mut stagger = 0usize;
 
         for entry in &settings.watches {
@@ -791,6 +891,8 @@ impl RuntimeActor {
             self.scheduler.remove(&watch_id);
             self.watches.remove(&watch_id);
         }
+
+        self.apply_observations(&settings, enabled_observations, now);
 
         if league_changed && self.rates_cancel.is_some() {
             self.settings.league = settings.league.clone();
@@ -986,11 +1088,7 @@ impl RuntimeActor {
                 },
                 priority: Priority::LiveFetch,
                 reply: self.replies.clone(),
-                tag: RequestTag {
-                    watch_id: Some(watch_id.clone()),
-                    alert_id: None,
-                    label: LIVE_FETCH_LABEL,
-                },
+                tag: RequestTag::watch(watch_id.clone(), LIVE_FETCH_LABEL),
             });
         }
         // 顺手把"最后一次收到推送"的时刻记上:界面问"WS 还活着吗"看的是它。
@@ -1148,11 +1246,7 @@ impl RuntimeActor {
             kind: RequestKind::Search { league, body_json },
             priority: Priority::PollSearch,
             reply: self.replies.clone(),
-            tag: RequestTag {
-                watch_id: Some(watch_id.clone()),
-                alert_id: None,
-                label: SEARCH_LABEL,
-            },
+            tag: RequestTag::watch(watch_id.clone(), SEARCH_LABEL),
         });
         self.emit_status(watch_id);
     }
@@ -1171,6 +1265,12 @@ impl RuntimeActor {
         // "去藏身处"那两步不属于任何一轮轮询,先认它。
         if let Some(alert_id) = tag.alert_id {
             self.on_hideout_reply(alert_id, kind, now);
+            return;
+        }
+        // 市场观察也走自己那条路:它和蹲价共用网关,但两边的时间表、
+        // 状态、库表都是分开的。
+        if let Some(obs_id) = tag.obs_id.clone() {
+            self.on_observe_reply(&obs_id, tag.label, kind, now);
             return;
         }
         let Some(watch_id) = tag.watch_id.clone() else {
@@ -1196,8 +1296,9 @@ impl RuntimeActor {
                 self.on_poll_failed(&watch_id, &error, now);
             }
             // 走到这里的 whisper 一定带着 alert_id,会话检查更是上面就
-            // 认掉了,两种都轮不到这里。
-            ReplyKind::Whisper(_) | ReplyKind::SessionCheck(_) => {}
+            // 认掉了;按 id 对号的那种 fetch 只有市场观察在用,也带着自己的
+            // obs_id —— 三种都轮不到这里。
+            ReplyKind::Whisper(_) | ReplyKind::SessionCheck(_) | ReplyKind::FetchByIds(_) => {}
         }
     }
 
@@ -1229,11 +1330,7 @@ impl RuntimeActor {
             },
             priority: Priority::PollFetch,
             reply: self.replies.clone(),
-            tag: RequestTag {
-                watch_id: Some(watch_id.clone()),
-                alert_id: None,
-                label: FETCH_LABEL,
-            },
+            tag: RequestTag::watch(watch_id.clone(), FETCH_LABEL),
         });
     }
 
@@ -1396,6 +1493,533 @@ impl RuntimeActor {
         (self.settings.watcher.fetch_batch as usize).clamp(1, MAX_FETCH_IDS)
     }
 
+    // ---- 市场观察 ----------------------------------------------------
+
+    /// 按新设置把观察列表摆平。逐条 diff,规矩和上面那段搜索的一样:
+    /// 停用的下班、粘错 id 的留在列表里带着原因、设置里没有的从时间表上拿掉。
+    fn apply_observations(&mut self, settings: &AppSettings, enabled: usize, now: i64) {
+        let mut keep: BTreeSet<ObservationId> = BTreeSet::new();
+        let mut stagger = 0usize;
+
+        for entry in &settings.observations {
+            keep.insert(entry.id.clone());
+            if !entry.enabled {
+                self.observe_scheduler.remove(&entry.id);
+                self.upsert_observation(entry.clone(), None, None);
+                continue;
+            }
+
+            let known = self.observations.get(&entry.id);
+            let query_stale = match known {
+                None => true,
+                Some(runtime) => {
+                    runtime.query_body.is_none()
+                        || runtime.entry.search_id != entry.search_id
+                        || runtime.entry.league != entry.league
+                }
+            };
+            let query_body = if query_stale {
+                match decode_search_id(&entry.search_id) {
+                    Ok(query_json) => {
+                        self.persist_observation(entry, &query_json, now);
+                        // 观察要的是"最新挂上来的 100 条",所以把排序换成上架
+                        // 时间倒序 —— 蹲价那个"最便宜的 100 条"永远看不到贵货,
+                        // 而观察要的正是完整的一批。
+                        Some(with_sort(&query_json, "indexed", "desc"))
+                    }
+                    Err(error) => {
+                        self.observe_scheduler.remove(&entry.id);
+                        let message = format!("{}: {error}", entry.label);
+                        self.emit(RuntimeEvent::Log(message.clone()));
+                        self.upsert_observation(entry.clone(), None, Some(message));
+                        continue;
+                    }
+                }
+            } else {
+                known.and_then(|runtime| runtime.query_body.clone())
+            };
+
+            self.observe_scheduler.upsert(
+                entry.id.clone(),
+                entry.discover_interval_secs,
+                entry.recheck_interval_secs,
+                now,
+                stagger,
+                enabled,
+            );
+            stagger += 1;
+            self.upsert_observation(entry.clone(), query_body, None);
+        }
+
+        // 设置里没有的观察:停掉排班、从内存里拿掉,**库里的行留着**。
+        // 和删搜索一个道理 —— 真要把攒下来的数据清干净,是界面上那个"删除"
+        // 按钮调 `WatchStore::delete_observation` 的事,不该由一次设置保存代劳。
+        let gone: Vec<ObservationId> = self
+            .observations
+            .keys()
+            .filter(|id| !keep.contains(*id))
+            .cloned()
+            .collect();
+        for obs_id in gone {
+            self.observe_scheduler.remove(&obs_id);
+            self.observations.remove(&obs_id);
+        }
+    }
+
+    /// 把一条观察写进内存表并广播。已经在跑的那条只更新用户改得动的部分。
+    fn upsert_observation(
+        &mut self,
+        entry: ObservationEntry,
+        query_body: Option<String>,
+        last_error: Option<String>,
+    ) {
+        let obs_id = entry.id.clone();
+        let summary = self
+            .note(
+                self.store.observation_summary(&obs_id),
+                "observation_summary",
+            )
+            .unwrap_or_default();
+        let stored = self
+            .note(self.store.observation_state(&obs_id), "observation_state")
+            .flatten();
+        let (next_discover_at, next_recheck_at) = self.observe_schedule_of(&obs_id);
+
+        match self.observations.get_mut(&obs_id) {
+            Some(runtime) => {
+                runtime.entry = entry;
+                if query_body.is_some() {
+                    runtime.query_body = query_body;
+                }
+                runtime.status.active = summary.active;
+                runtime.status.gone = summary.gone;
+                runtime.status.next_discover_at = next_discover_at;
+                runtime.status.next_recheck_at = next_recheck_at;
+                if last_error.is_some() {
+                    runtime.status.last_error = last_error;
+                }
+            }
+            None => {
+                let status = ObservationStatus {
+                    active: summary.active,
+                    gone: summary.gone,
+                    last_discover_at: stored.as_ref().and_then(|run| run.last_discover_at),
+                    last_recheck_at: stored.as_ref().and_then(|run| run.last_recheck_at),
+                    next_discover_at,
+                    next_recheck_at,
+                    last_error,
+                };
+                self.observations.insert(
+                    obs_id.clone(),
+                    ObservationRuntime {
+                        entry,
+                        query_body,
+                        search_id: String::new(),
+                        discover_in_flight: false,
+                        discover_pending: 0,
+                        recheck_pending: 0,
+                        status,
+                    },
+                );
+            }
+        }
+        self.emit_observation_status(&obs_id);
+    }
+
+    /// 把这条观察的"跑出来的状态"写回库。已有的行只补查询和联赛,
+    /// 别把两个时间戳洗掉 —— 重启之后界面还要显示它们。
+    fn persist_observation(&self, entry: &ObservationEntry, query_json: &str, now: i64) {
+        let previous = self
+            .note(self.store.observation_state(&entry.id), "observation_state")
+            .flatten();
+        let run = ObservationRun {
+            obs_id: entry.id.clone(),
+            league: entry.league.clone(),
+            search_id: entry.search_id.clone(),
+            query_json: Some(query_json.to_string()),
+            last_discover_at: previous.as_ref().and_then(|run| run.last_discover_at),
+            last_recheck_at: previous.as_ref().and_then(|run| run.last_recheck_at),
+            updated_at: now,
+        };
+        self.note(
+            self.store.upsert_observation_state(&run),
+            "upsert_observation_state",
+        );
+    }
+
+    fn start_observe(&mut self, obs_id: &ObservationId, kind: ObserveKind, now: i64) {
+        match kind {
+            ObserveKind::Discover => self.start_discover(obs_id, now),
+            ObserveKind::Recheck => self.start_recheck(obs_id, now),
+        }
+    }
+
+    /// discover 的第一步:一次 search,按上架时间倒序拿最新的一批 id。
+    fn start_discover(&mut self, obs_id: &ObservationId, now: i64) {
+        let Some(runtime) = self.observations.get_mut(obs_id) else {
+            return;
+        };
+        if !runtime.entry.enabled || runtime.discover_in_flight || runtime.discover_pending > 0 {
+            return;
+        }
+        let Some(body_json) = runtime.query_body.clone() else {
+            return;
+        };
+        let league = runtime.entry.league.clone();
+        runtime.discover_in_flight = true;
+        // 上一轮的错误到此为止:这一轮的结论由这一轮说了算。
+        runtime.status.last_error = None;
+
+        // 请求一发出去就把下一轮排上,理由同轮询:否则 `next_at` 停在过去,
+        // 主循环会一直觉得"该跑了"而空转。
+        self.observe_scheduler
+            .defer(obs_id, ObserveKind::Discover, now);
+        self.refresh_observe_schedule(obs_id);
+
+        self.gateway.submit(GatewayRequest {
+            kind: RequestKind::Search { league, body_json },
+            // 观察永远排在队列最后:它是攒数据的活,晚十秒钟什么也不影响,
+            // 而蹲价晚十秒可能就错过一件好货。
+            priority: Priority::Background,
+            reply: self.replies.clone(),
+            tag: RequestTag::observation(obs_id.clone(), OBSERVE_SEARCH_LABEL),
+        });
+        self.emit_observation_status(obs_id);
+    }
+
+    /// recheck:把在册的挂单按 10 个一批查一遍,看谁没了。
+    fn start_recheck(&mut self, obs_id: &ObservationId, now: i64) {
+        let Some(runtime) = self.observations.get_mut(obs_id) else {
+            return;
+        };
+        if !runtime.entry.enabled || runtime.recheck_pending > 0 {
+            return;
+        }
+        let label = runtime.entry.label.clone();
+        let interval = runtime.entry.recheck_interval_secs;
+        // fetch 要一个 `?query=` 参数。上一次 discover 回的那个最准;
+        // 还没 discover 过就用用户粘进来的那个(两者通常一样)。
+        let search_id = if runtime.search_id.is_empty() {
+            runtime.entry.search_id.clone()
+        } else {
+            runtime.search_id.clone()
+        };
+        runtime.status.last_error = None;
+
+        self.observe_scheduler
+            .defer(obs_id, ObserveKind::Recheck, now);
+        self.refresh_observe_schedule(obs_id);
+
+        // 库给的顺序就是"最久没见到的排前面",所以砍掉尾巴留下的正是最可能
+        // 已经没了的那几条。
+        let mut ids = self
+            .note(self.store.active_listing_ids(obs_id), "active_listing_ids")
+            .unwrap_or_default();
+        let cap = self.observe_fetch_cap(interval);
+        if ids.len() > cap {
+            self.emit(RuntimeEvent::Log(format!(
+                "observation {label}: {} listings to recheck but this round can only afford \
+                 {cap} — the longest-unseen ones go first, the rest wait for the next round",
+                ids.len()
+            )));
+            ids.truncate(cap);
+        }
+        self.submit_observe_fetches(obs_id, ObserveKind::Recheck, &ids, &search_id, now);
+    }
+
+    /// discover 的 search 回来了:在册的那些只推 `last_seen`,没见过的才去抓详情。
+    fn on_discover_search(&mut self, obs_id: &ObservationId, outcome: SearchOutcome, now: i64) {
+        let (label, interval) = {
+            let Some(runtime) = self.observations.get_mut(obs_id) else {
+                return;
+            };
+            runtime.discover_in_flight = false;
+            runtime.search_id = outcome.id.clone();
+            (
+                runtime.entry.label.clone(),
+                runtime.entry.discover_interval_secs,
+            )
+        };
+
+        // 搜索只给 id、不给价格 —— 所以在册的那些**不花一次 fetch**:
+        // 它出现在"最新 100 条"里就是"还挂着",推一下 last_seen 就够了,
+        // 改没改价等下一轮回查真抓到它时再说。
+        let known: BTreeSet<String> = self
+            .note(self.store.active_listing_ids(obs_id), "active_listing_ids")
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let (mut fresh, still_listed): (Vec<String>, Vec<String>) = outcome
+            .result
+            .into_iter()
+            .partition(|id| !known.contains(id));
+        self.note(
+            self.store.touch_listings(obs_id, &still_listed, now),
+            "touch_listings",
+        );
+
+        // 搜索是按上架时间倒序回来的,所以砍掉尾巴留下的是最新的那些。
+        let cap = self.observe_fetch_cap(interval);
+        if fresh.len() > cap {
+            self.emit(RuntimeEvent::Log(format!(
+                "observation {label}: {} new listings but this discover can only afford {cap} — \
+                 taking the newest, the rest will be picked up next round",
+                fresh.len()
+            )));
+            fresh.truncate(cap);
+        }
+        let search_id = outcome.id;
+        self.submit_observe_fetches(obs_id, ObserveKind::Discover, &fresh, &search_id, now);
+    }
+
+    /// 把一串 id 按 10 个一批交给网关。一条都没有就当这一轮当场跑完了。
+    fn submit_observe_fetches(
+        &mut self,
+        obs_id: &ObservationId,
+        kind: ObserveKind,
+        ids: &[String],
+        search_id: &str,
+        now: i64,
+    ) {
+        if ids.is_empty() {
+            self.finish_observe(obs_id, kind, now);
+            return;
+        }
+        let batch = self.fetch_batch();
+        let batches = ids.chunks(batch).count();
+        if let Some(runtime) = self.observations.get_mut(obs_id) {
+            match kind {
+                ObserveKind::Discover => runtime.discover_pending = batches,
+                ObserveKind::Recheck => runtime.recheck_pending = batches,
+            }
+        }
+        let label = match kind {
+            ObserveKind::Discover => OBSERVE_DISCOVER_FETCH_LABEL,
+            ObserveKind::Recheck => OBSERVE_RECHECK_LABEL,
+        };
+        for chunk in ids.chunks(batch) {
+            self.gateway.submit(GatewayRequest {
+                // 按 id 对号的那一种:观察问的是"我问的这几条里哪几条没了",
+                // 而普通 fetch 的回信早把 `null` 那几格丢掉了。
+                kind: RequestKind::FetchByIds {
+                    ids: chunk.to_vec(),
+                    search_id: search_id.to_string(),
+                },
+                priority: Priority::Background,
+                reply: self.replies.clone(),
+                tag: RequestTag::observation(obs_id.clone(), label),
+            });
+        }
+        self.emit_observation_status(obs_id);
+    }
+
+    /// 一批 fetch 回来了。
+    fn on_observe_fetch(
+        &mut self,
+        obs_id: &ObservationId,
+        kind: ObserveKind,
+        pairs: Vec<(String, Option<ListingSummary>)>,
+        now: i64,
+    ) {
+        for (listing_id, listing) in pairs {
+            match listing {
+                Some(listing) => {
+                    self.note(self.store.record_seen(obs_id, &listing, now), "record_seen");
+                }
+                // 回查时那一格是 `None` = 这条挂单没了,该判定了。
+                None if kind == ObserveKind::Recheck => {
+                    self.on_listing_gone(obs_id, &listing_id, now);
+                }
+                // discover 问的都是**没见过**的 id:它在这几秒里没了,
+                // 我们连它长什么样都不知道,没什么可记的。
+                None => {}
+            }
+        }
+        self.finish_observe_batch(obs_id, kind, now);
+    }
+
+    /// 回查查不到它了 —— 判一下是怎么没的,把结论写在行上。
+    ///
+    /// 判定本身是 `pnd_domain::classify_gone` 那个纯函数,这里只负责把它要的
+    /// 三样东西(第一次见到、最后一次见到、价格轨迹)从库里捞出来。
+    fn on_listing_gone(&mut self, obs_id: &ObservationId, listing_id: &str, now: i64) {
+        let Some(row) = self
+            .note(
+                self.store.observed_listing(obs_id, listing_id),
+                "observed_listing",
+            )
+            .flatten()
+        else {
+            return;
+        };
+        let history = self
+            .note(
+                self.store.price_history(obs_id, listing_id),
+                "price_history",
+            )
+            .unwrap_or_default();
+        // 无价的那些点跳过:它没法和一个数比大小,而"降过价没有"问的就是大小。
+        let points: Vec<(i64, i64)> = history
+            .iter()
+            .filter_map(|point| {
+                point
+                    .price
+                    .as_ref()
+                    .map(|price| (point.at, price.amount_milli))
+            })
+            .collect();
+        let class = classify_gone(row.first_seen_at, row.last_seen_at, now, &points);
+        self.note(
+            self.store.mark_gone(obs_id, listing_id, now, class),
+            "mark_gone",
+        );
+    }
+
+    /// 少了一批在途的 fetch;一批都不剩就是这一轮跑完了。
+    fn finish_observe_batch(&mut self, obs_id: &ObservationId, kind: ObserveKind, now: i64) {
+        let done = {
+            let Some(runtime) = self.observations.get_mut(obs_id) else {
+                return;
+            };
+            let pending = match kind {
+                ObserveKind::Discover => &mut runtime.discover_pending,
+                ObserveKind::Recheck => &mut runtime.recheck_pending,
+            };
+            *pending = pending.saturating_sub(1);
+            *pending == 0
+        };
+        if done {
+            self.finish_observe(obs_id, kind, now);
+        }
+    }
+
+    /// 一轮跑完了:落时间戳、重算这条观察的账、告诉界面去库里重读。
+    ///
+    /// 中间有一批 fetch 砸了也照样算跑完:那一批的挂单下一轮还会被问到,
+    /// 而这一轮确实发生过 —— 时间戳照实记,出了什么事另有 `last_error` 说。
+    fn finish_observe(&mut self, obs_id: &ObservationId, kind: ObserveKind, now: i64) {
+        match kind {
+            ObserveKind::Discover => {
+                self.note(self.store.touch_discover(obs_id, now), "touch_discover");
+            }
+            ObserveKind::Recheck => {
+                self.note(self.store.touch_recheck(obs_id, now), "touch_recheck");
+            }
+        }
+        let summary = self
+            .note(
+                self.store.observation_summary(obs_id),
+                "observation_summary",
+            )
+            .unwrap_or_default();
+        let (next_discover_at, next_recheck_at) = self.observe_schedule_of(obs_id);
+        if let Some(runtime) = self.observations.get_mut(obs_id) {
+            runtime.status.active = summary.active;
+            runtime.status.gone = summary.gone;
+            runtime.status.next_discover_at = next_discover_at;
+            runtime.status.next_recheck_at = next_recheck_at;
+            match kind {
+                ObserveKind::Discover => runtime.status.last_discover_at = Some(now),
+                ObserveKind::Recheck => runtime.status.last_recheck_at = Some(now),
+            }
+        }
+        self.emit(RuntimeEvent::ObservationChanged {
+            obs_id: obs_id.clone(),
+        });
+        self.emit_observation_status(obs_id);
+    }
+
+    /// discover 的那次 search 砸了。这一轮到此为止,下一轮照常来 —— 观察不退避
+    /// (它本来就是十分钟一次的慢节奏,而 429 / Cloudflare 那两种真该停手的
+    /// 情况,网关在自己那一层已经拦住了)。
+    fn on_discover_failed(&mut self, obs_id: &ObservationId, error: &GatewayError) {
+        if let Some(runtime) = self.observations.get_mut(obs_id) {
+            runtime.discover_in_flight = false;
+            runtime.status.last_error = Some(error.to_string());
+        }
+        self.emit_observation_status(obs_id);
+    }
+
+    fn on_observe_fetch_failed(
+        &mut self,
+        obs_id: &ObservationId,
+        kind: ObserveKind,
+        error: &GatewayError,
+        now: i64,
+    ) {
+        if let Some(runtime) = self.observations.get_mut(obs_id) {
+            runtime.status.last_error = Some(error.to_string());
+        }
+        self.finish_observe_batch(obs_id, kind, now);
+    }
+
+    fn on_observe_reply(&mut self, obs_id: &ObservationId, label: &str, kind: ReplyKind, now: i64) {
+        if !self.observations.contains_key(obs_id) {
+            // 这条观察在请求飞在路上的时候被删了,回信直接丢掉。
+            return;
+        }
+        let step = if label == OBSERVE_RECHECK_LABEL {
+            ObserveKind::Recheck
+        } else {
+            ObserveKind::Discover
+        };
+        match kind {
+            ReplyKind::Search(Ok(outcome)) => self.on_discover_search(obs_id, outcome, now),
+            ReplyKind::Search(Err(error)) => self.on_discover_failed(obs_id, &error),
+            ReplyKind::FetchByIds(Ok(pairs)) => self.on_observe_fetch(obs_id, step, pairs, now),
+            ReplyKind::FetchByIds(Err(error)) => {
+                self.on_observe_fetch_failed(obs_id, step, &error, now);
+            }
+            // 观察这条路上只发 search 和 FetchByIds,别的回信不会挂着 obs_id。
+            ReplyKind::Fetch(_) | ReplyKind::Whisper(_) | ReplyKind::SessionCheck(_) => {}
+        }
+    }
+
+    /// 时间表上这条观察的(下一次 discover, 下一次 recheck)。
+    fn observe_schedule_of(&self, obs_id: &ObservationId) -> (Option<i64>, Option<i64>) {
+        match self.observe_scheduler.entry(obs_id) {
+            Some(entry) => (Some(entry.next_discover_at), Some(entry.next_recheck_at)),
+            None => (None, None),
+        }
+    }
+
+    fn refresh_observe_schedule(&mut self, obs_id: &ObservationId) {
+        let (next_discover_at, next_recheck_at) = self.observe_schedule_of(obs_id);
+        if let Some(runtime) = self.observations.get_mut(obs_id) {
+            runtime.status.next_discover_at = next_discover_at;
+            runtime.status.next_recheck_at = next_recheck_at;
+        }
+    }
+
+    fn enabled_observation_count(&self) -> usize {
+        self.settings
+            .observations
+            .iter()
+            .filter(|entry| entry.enabled)
+            .count()
+    }
+
+    /// 这一轮最多拿多少条挂单去 fetch。抓取额度是所有观察分着花的,
+    /// 算法在 [`fetch_listing_cap`]。
+    fn observe_fetch_cap(&self, interval_secs: u64) -> usize {
+        fetch_listing_cap(
+            self.enabled_observation_count().max(1),
+            interval_secs,
+            self.budget.effective_limit(FETCH_LONG_WINDOW_REQUESTS),
+            FETCH_LONG_WINDOW_SECS,
+            self.fetch_batch(),
+        )
+    }
+
+    fn emit_observation_status(&self, obs_id: &ObservationId) {
+        if let Some(runtime) = self.observations.get(obs_id) {
+            self.emit(RuntimeEvent::ObservationStatus {
+                obs_id: obs_id.clone(),
+                status: runtime.status.clone(),
+            });
+        }
+    }
+
     // ---- 去藏身处 ----------------------------------------------------
 
     /// 用户在卡片上点了"去藏身处"。
@@ -1461,11 +2085,7 @@ impl RuntimeActor {
             },
             priority: Priority::User,
             reply: self.replies.clone(),
-            tag: RequestTag {
-                watch_id: None,
-                alert_id: Some(alert_id),
-                label: HIDEOUT_FETCH_LABEL,
-            },
+            tag: RequestTag::alert(alert_id, HIDEOUT_FETCH_LABEL),
         };
         self.gateway.submit(request);
         self.report_hideout(alert_id, HideoutOutcome::Refreshed);
@@ -1500,11 +2120,7 @@ impl RuntimeActor {
             // 队列里的头一位:用户正看着卡片等这一下。
             priority: Priority::User,
             reply: self.replies.clone(),
-            tag: RequestTag {
-                watch_id: None,
-                alert_id: Some(alert_id),
-                label: HIDEOUT_WHISPER_LABEL,
-            },
+            tag: RequestTag::alert(alert_id, HIDEOUT_WHISPER_LABEL),
         };
         self.gateway.submit(request);
     }
@@ -1548,8 +2164,9 @@ impl RuntimeActor {
                 let outcome = hideout_failure(HideoutStep::Whisper, &listing_id, &error);
                 self.finish_hideout(alert_id, outcome);
             }
-            // 这条链路上不会有 search,也不会有会话检查。
-            ReplyKind::Search(_) | ReplyKind::SessionCheck(_) => {}
+            // 这条链路上不会有 search、不会有会话检查,也不会有按 id 对号的
+            // fetch(那是市场观察专用的)。
+            ReplyKind::Search(_) | ReplyKind::SessionCheck(_) | ReplyKind::FetchByIds(_) => {}
         }
     }
 
@@ -1662,11 +2279,7 @@ impl RuntimeActor {
             // 用户正看着按钮等结果,排在队列最前面。
             priority: Priority::User,
             reply: self.replies.clone(),
-            tag: RequestTag {
-                watch_id: None,
-                alert_id: None,
-                label: SESSION_CHECK_LABEL,
-            },
+            tag: RequestTag::standalone(SESSION_CHECK_LABEL),
         });
     }
 
@@ -2195,6 +2808,16 @@ mod actor_tests {
         /// search 响应的 `X-Rate-Limit-Rules` 写什么。`None` = 不给限速头。
         /// 会话检查看的就是这一行。
         rate_rules: Option<String>,
+        /// search 回哪些 id。`None` = 默认那两个("one" / "two")。
+        search_ids: Option<Vec<String>>,
+        /// 每次 search 的请求体。观察那条路靠它证明排序真的换成了
+        /// `{"indexed":"desc"}`。
+        search_bodies: Vec<String>,
+        /// 这些 id 在 fetch 的答复里是 `null` —— 它们已经没了。
+        /// (2026-09-07 实测的形状:数组长度不变,查不到的那一格是 null。)
+        gone_ids: BTreeSet<String>,
+        /// 每件货身上的显示词缀。市场观察按它们聚合。
+        item_mods: Vec<String>,
     }
 
     /// 假交易站:不打网络,search 回两个写死的 id,fetch 按你问的 id 现编。
@@ -2235,11 +2858,18 @@ mod actor_tests {
         token: Option<&str>,
         online: bool,
         price_divine: Option<i64>,
+        gone: &BTreeSet<String>,
+        mods: &[String],
     ) -> String {
+        let mod_lines: Vec<String> = mods.iter().map(|line| format!("\"{line}\"")).collect();
         let items: Vec<String> = ids
             .iter()
             .enumerate()
             .map(|(index, id)| {
+                // 查不到的 id 那一格就是个 null,数组长度不变。
+                if gone.contains(id) {
+                    return "null".to_string();
+                }
                 let hideout = token
                     .map(|token| format!(r#""hideout_token":"{token}","#))
                     .unwrap_or_default();
@@ -2253,8 +2883,10 @@ mod actor_tests {
                         "whisper":"@{id} hi",{hideout}
                         "price":{{"type":"~price","amount":{},"currency":"divine"}},
                         "account":{{"name":"Seller{id}","lastCharacterName":"Char{id}"{presence}}}}},
-                     "item":{{"name":"Choir of the Storm","typeLine":"Lapis Amulet"}}}}"#,
-                    price_divine.unwrap_or((18 - index as i64).max(1))
+                     "item":{{"name":"Choir of the Storm","typeLine":"Lapis Amulet",
+                       "explicitMods":[{}]}}}}"#,
+                    price_divine.unwrap_or((18 - index as i64).max(1)),
+                    mod_lines.join(",")
                 )
             })
             .collect();
@@ -2265,15 +2897,23 @@ mod actor_tests {
         fn search(
             &self,
             _league: &str,
-            _body_json: &str,
+            body_json: &str,
             _session: Option<&str>,
         ) -> Result<TradeResponse, pnd_trade::TransportError> {
-            let rules = {
+            let (rules, ids) = {
                 let mut log = self.log.lock().unwrap();
                 log.searches += 1;
-                log.rate_rules.clone()
+                log.search_bodies.push(body_json.to_string());
+                (log.rate_rules.clone(), log.search_ids.clone())
             };
-            let body = r#"{"id":"SEARCHID","total":2,"result":["one","two"]}"#;
+            let ids = ids.unwrap_or_else(|| vec!["one".to_string(), "two".to_string()]);
+            let quoted: Vec<String> = ids.iter().map(|id| format!("\"{id}\"")).collect();
+            let body = format!(
+                r#"{{"id":"SEARCHID","total":{},"result":[{}]}}"#,
+                ids.len(),
+                quoted.join(",")
+            );
+            let body = body.as_str();
             let Some(rules) = rules else {
                 return ok(body);
             };
@@ -2298,7 +2938,7 @@ mod actor_tests {
             _search_id: &str,
             _session: Option<&str>,
         ) -> Result<TradeResponse, pnd_trade::TransportError> {
-            let (token, offline, nothing, price) = {
+            let (token, offline, nothing, price, gone, mods) = {
                 let mut log = self.log.lock().unwrap();
                 log.fetches.push(ids.to_vec());
                 (
@@ -2306,12 +2946,21 @@ mod actor_tests {
                     log.seller_offline,
                     log.fetch_returns_nothing,
                     log.price_divine,
+                    log.gone_ids.clone(),
+                    log.item_mods.clone(),
                 )
             };
             if nothing {
                 return ok(r#"{"result":[]}"#);
             }
-            ok(&listings_json(ids, token.as_deref(), !offline, price))
+            ok(&listings_json(
+                ids,
+                token.as_deref(),
+                !offline,
+                price,
+                &gone,
+                &mods,
+            ))
         }
 
         fn whisper(
@@ -3894,5 +4543,311 @@ mod actor_tests {
             "w2 to be pushed out by the cap",
         );
         assert_eq!(connector.connects(), 1, "只开了一条");
+    }
+
+    // ---- 市场观察 ----------------------------------------------------
+
+    /// 一份只有一条市场观察、一条蹲价搜索都没有的设置。
+    fn observe_settings(label: &str) -> (AppSettings, ObservationId) {
+        let search = SearchRef {
+            league: "Forbidden Rites".to_string(),
+            search_id: FIXTURE_ID.to_string(),
+        };
+        let entry = ObservationEntry::new(label, &search);
+        let obs_id = entry.id.clone();
+        let settings = AppSettings {
+            league: "Forbidden Rites".to_string(),
+            observations: vec![entry],
+            ..AppSettings::default()
+        };
+        (settings, obs_id)
+    }
+
+    /// 观察的测试要在 actor 走掉之后自己读一遍库,所以库开在临时文件上 ——
+    /// 内存库跟着 actor 那个连接一起消失,外面读不到。
+    fn temp_db(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("pnd-observe-{name}-{}.sqlite", std::process::id()));
+        remove_db(&path);
+        path
+    }
+
+    fn remove_db(path: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut with_suffix = path.to_path_buf().into_os_string();
+            with_suffix.push(suffix);
+            let _ = std::fs::remove_file(with_suffix);
+        }
+    }
+
+    /// 等到假交易站收够了这么多次 fetch(或者超时)。
+    fn wait_for_fetches(
+        handle: &RuntimeHandle,
+        seen: &mut Vec<RuntimeEvent>,
+        log: &Arc<Mutex<TradeLog>>,
+        wanted: usize,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while log.lock().unwrap().fetches.len() < wanted && Instant::now() < deadline {
+            match handle.try_next_event() {
+                Some(event) => seen.push(event),
+                None => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        // 回信路上还有几个事件,一并抽干,免得下一个断言看的是半截状态。
+        thread::sleep(Duration::from_millis(200));
+        while let Some(event) = handle.try_next_event() {
+            seen.push(event);
+        }
+        assert_eq!(
+            log.lock().unwrap().fetches.len(),
+            wanted,
+            "等不到第 {wanted} 次 fetch:{seen:#?}"
+        );
+    }
+
+    /// 第一轮 discover:排序换成上架时间倒序,新面孔连同物品原文和词缀一起入库。
+    #[test]
+    fn an_observation_stores_new_listings_with_their_item_json_and_mods() {
+        let (transport, log) = FakeTrade::new();
+        log.lock().unwrap().item_mods = vec!["+115 to maximum Life".to_string()];
+        let (settings, obs_id) = observe_settings("Choir of the Storm");
+        let db = temp_db("stores");
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::new(db.clone()), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        wait_for(
+            &handle,
+            &mut seen,
+            |event| matches!(event, RuntimeEvent::ObservationChanged { .. }),
+            "the first discover to land",
+        );
+        drop(handle);
+
+        // 观察要的是"最新挂上来的 100 条",不是"最便宜的 100 条"。
+        let body = log.lock().unwrap().search_bodies[0].clone();
+        assert!(
+            body.contains(r#""sort":{"indexed":"desc"}"#),
+            "discover 的排序不对:{body}"
+        );
+
+        let store = WatchStore::open(&db).expect("open");
+        assert_eq!(store.active_listing_ids(&obs_id).unwrap(), ["one", "two"]);
+        let row = store
+            .observed_listing(&obs_id, "one")
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.first_price, Some(Price::new(18_000, Currency::Divine)));
+        assert_eq!(row.last_price, row.first_price);
+        assert_eq!(row.price_changes, 0);
+        // 整块物品原文留着 —— 以后想统计别的(ilvl、底子)不用重抓一遍。
+        let item: serde_json::Value = serde_json::from_str(&row.item_json).expect("item json");
+        assert_eq!(item["name"], "Choir of the Storm");
+        assert_eq!(item["explicitMods"][0], "+115 to maximum Life");
+
+        let mods = store.observed_mods(&obs_id, "one").unwrap();
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].mod_kind, "explicit");
+        assert_eq!(mods[0].template, "+# to maximum Life");
+        assert_eq!(mods[0].value1, Some(115.0));
+
+        // 聚合表当场就能出:一条词缀、两件货、一件都没卖掉。
+        let aggregate = store.mod_aggregate(&obs_id, 1).unwrap();
+        assert_eq!(aggregate.len(), 1);
+        assert_eq!(aggregate[0].seen, 2);
+        assert_eq!(aggregate[0].gone, 0);
+        remove_db(&db);
+    }
+
+    /// 第二轮 discover 只抓没见过的 id。
+    ///
+    /// 搜索回来的 100 个 id 里绝大多数上一轮就见过了,再抓一遍就是把 fetch
+    /// 额度烧在"我已经知道的事"上;它们出现在搜索结果里本身就说明还挂着,
+    /// 推一下 `last_seen` 就够了。
+    #[test]
+    fn a_second_discover_only_fetches_ids_it_has_not_seen() {
+        let (transport, log) = FakeTrade::new();
+        let (settings, obs_id) = observe_settings("Choir of the Storm");
+        let db = temp_db("unknown-only");
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::new(db.clone()), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        wait_for_fetches(&handle, &mut seen, &log, 1);
+        assert_eq!(log.lock().unwrap().fetches[0], ["one", "two"]);
+
+        // 同样两条 id 再 discover 一次。
+        handle
+            .try_send(RuntimeCommand::DiscoverNow {
+                obs_id: obs_id.clone(),
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while log.lock().unwrap().searches < 2 && Instant::now() < deadline {
+            match handle.try_next_event() {
+                Some(event) => seen.push(event),
+                None => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        assert_eq!(log.lock().unwrap().searches, 2, "第二轮 discover 没跑起来");
+        thread::sleep(Duration::from_millis(300));
+        while let Some(event) = handle.try_next_event() {
+            seen.push(event);
+        }
+        drop(handle);
+
+        assert_eq!(
+            log.lock().unwrap().fetches.len(),
+            1,
+            "见过的 id 不该再抓一次:{seen:#?}"
+        );
+        let store = WatchStore::open(&db).expect("open");
+        assert_eq!(store.active_listing_ids(&obs_id).unwrap().len(), 2);
+        remove_db(&db);
+    }
+
+    /// 回查时那一格是 `null` = 这条挂单没了,判定要跟着写上。
+    ///
+    /// 这里判出来的是 `Unknown`,而且那是**对的**:这件货我们只见过一次
+    /// (第一次 discover),看得见的存活时间是 0 秒,连"它到底挂了多久"都
+    /// 回答不了。三档判定各自的边界在 `pnd_domain::classify_gone` 的测试里钉着,
+    /// 这一条钉的是"actor 真的把 null 认成了没了、真的调了判定"。
+    #[test]
+    fn a_null_on_a_recheck_marks_the_listing_gone() {
+        let (transport, log) = FakeTrade::new();
+        let (settings, obs_id) = observe_settings("Choir of the Storm");
+        let db = temp_db("gone");
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::new(db.clone()), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        wait_for_fetches(&handle, &mut seen, &log, 1);
+
+        // "two" 被买走了:下一次问它,服务端那一格是 null。
+        log.lock().unwrap().gone_ids.insert("two".to_string());
+        handle
+            .try_send(RuntimeCommand::RecheckNow {
+                obs_id: obs_id.clone(),
+            })
+            .unwrap();
+        wait_for_fetches(&handle, &mut seen, &log, 2);
+        drop(handle);
+
+        assert_eq!(
+            log.lock().unwrap().fetches[1],
+            ["one", "two"],
+            "回查问的是在册的那两条"
+        );
+        let store = WatchStore::open(&db).expect("open");
+        assert_eq!(store.active_listing_ids(&obs_id).unwrap(), ["one"]);
+        let gone = store
+            .observed_listing(&obs_id, "two")
+            .unwrap()
+            .expect("row");
+        assert_eq!(gone.status, pnd_storage::ObservedStatus::Gone);
+        assert!(gone.gone_at.is_some());
+        assert_eq!(gone.gone_class, Some(pnd_domain::GoneClass::Unknown));
+
+        let summary = store.observation_summary(&obs_id).unwrap();
+        assert_eq!((summary.active, summary.gone, summary.unknown), (1, 1, 1));
+        // 状态事件里也要看得见这一笔。
+        let last = seen
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                RuntimeEvent::ObservationStatus { status, .. } => Some(status.clone()),
+                _ => None,
+            })
+            .expect("an ObservationStatus");
+        assert_eq!((last.active, last.gone), (1, 1));
+        assert!(last.last_recheck_at.is_some());
+        remove_db(&db);
+    }
+
+    /// 同一条挂单换了价:轨迹上多一个点,改价次数 +1,第一个价不动。
+    #[test]
+    fn a_price_change_on_a_recheck_appends_to_the_history() {
+        let (transport, log) = FakeTrade::new();
+        let (settings, obs_id) = observe_settings("Choir of the Storm");
+        let db = temp_db("reprice");
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::new(db.clone()), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        wait_for_fetches(&handle, &mut seen, &log, 1);
+
+        // 卖家降价到 5 divine。
+        log.lock().unwrap().price_divine = Some(5);
+        handle
+            .try_send(RuntimeCommand::RecheckNow {
+                obs_id: obs_id.clone(),
+            })
+            .unwrap();
+        wait_for_fetches(&handle, &mut seen, &log, 2);
+        drop(handle);
+
+        let store = WatchStore::open(&db).expect("open");
+        let row = store
+            .observed_listing(&obs_id, "one")
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.first_price, Some(Price::new(18_000, Currency::Divine)));
+        assert_eq!(row.last_price, Some(Price::new(5_000, Currency::Divine)));
+        assert_eq!(row.price_changes, 1);
+        let history = store.price_history(&obs_id, "one").unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|point| point.price.as_ref().map(|price| price.amount_milli))
+                .collect::<Vec<_>>(),
+            vec![Some(18_000), Some(5_000)]
+        );
+        remove_db(&db);
+    }
+
+    /// 观察也花搜索额度,所以预算地板必须把观察条数一起数进去。
+    ///
+    /// 一条搜索 + 两条观察 = 三个花搜索额度的东西,地板是 217 秒。要是只数
+    /// 搜索,这条搜索会按"我一个人用整份额度"的 73 秒去跑,三边加起来正好
+    /// 超掉 6 小时那一格。
+    #[test]
+    fn the_budget_floor_counts_observations_as_well_as_watches() {
+        let (transport, _log) = FakeTrade::new();
+        let mut settings = settings();
+        settings.watcher.poll_interval_seconds = 60;
+        let (first, _) = observe_settings("Tablets");
+        let (second, _) = observe_settings("Rings");
+        settings.observations = first
+            .observations
+            .into_iter()
+            .chain(second.observations)
+            .collect();
+
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::in_memory(), transport).unwrap();
+        let mut seen = Vec::new();
+        let event = wait_for(
+            &handle,
+            &mut seen,
+            |event| {
+                matches!(event, RuntimeEvent::WatchStatus { status, .. }
+                    if status.poll_every_secs > 0)
+            },
+            "a watch status with an interval",
+        );
+        let RuntimeEvent::WatchStatus { status, .. } = event else {
+            unreachable!()
+        };
+        assert_eq!(
+            status.poll_every_secs,
+            budget_floor_interval(3, 299, 21_600),
+            "一条搜索 + 两条观察分同一份搜索额度"
+        );
+        assert_eq!(status.poll_every_secs, 217);
     }
 }

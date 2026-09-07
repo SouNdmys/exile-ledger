@@ -1,12 +1,14 @@
-//! SQLite 持久化:蹲价状态与提醒历史(`watch.sqlite`)、
+//! SQLite 持久化:蹲价状态与提醒历史、市场观察(`watch.sqlite`)、
 //! ninja 采样缓存与词缀统计(`ninja.sqlite`)。
 
 use std::path::PathBuf;
 
 pub mod ninja;
+pub mod observe;
 pub mod watch;
 
 pub use ninja::*;
+pub use observe::*;
 pub use watch::*;
 
 /// 和 `settings.json` 同一个目录:`%LOCALAPPDATA%\PoeNinjaData`。

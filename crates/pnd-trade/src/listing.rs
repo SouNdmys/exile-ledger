@@ -88,6 +88,10 @@ fn summarize(entry: &Value) -> Option<ListingSummary> {
         whisper_token: optional_text(listing, "whisper_token"),
         hideout_token: optional_text(listing, "hideout_token"),
         icon: text(item, "icon"),
+        // 原样一份 `item`,给市场观察按词缀聚合用。`to_string` 而不是原始
+        // 字节切片:我们手上只有解析好的 `Value`,再序列化一次得到的是同样
+        // 的内容(键序按 serde_json 的保留顺序),而这里要的是内容不是字节。
+        item_json: item.map(Value::to_string).unwrap_or_default(),
     })
 }
 
@@ -322,6 +326,27 @@ mod listing_tests {
         assert_eq!(pairs[0].0, "aaa111");
         assert!(pairs[0].1.is_none(), "第一个 id 没回来 = 它没了");
         assert_eq!(pairs[1].1.as_ref().unwrap().type_line, "Sapphire Ring");
+    }
+
+    /// `item` 那一整块要原样留一份。
+    ///
+    /// 市场观察按词缀聚合,而词缀数组(explicit/implicit/crafted/…)不在摘要
+    /// 里 —— 摘要只管卡片要显示什么。原文留着,统计想换个算法就不用回头改
+    /// 解析。摘要里那几个字段还得照常有,原文只是**多**一份,不是替代。
+    #[test]
+    fn the_raw_item_block_is_kept_alongside_the_summary() {
+        let first = &parsed()[0];
+        let item: Value = serde_json::from_str(&first.item_json).expect("item_json is JSON");
+        assert_eq!(item["name"], "Choir of the Storm");
+        assert_eq!(item["rarity"], "Unique");
+        assert_eq!(item["ilvl"], 68);
+        assert_eq!(item["explicitMods"][0], "+35 to Intelligence");
+        // 摘出来的字段没有被原文顶掉。
+        assert_eq!(first.item_name, "Choir of the Storm");
+
+        // 没有 `item` 那一块的条目留空串,而不是塞一个 "null" 进去。
+        let body = br#"{"result":[{"id":"aaa","listing":{"indexed":"x"}}]}"#;
+        assert_eq!(parse_fetch_response(body).unwrap()[0].item_json, "");
     }
 
     #[test]

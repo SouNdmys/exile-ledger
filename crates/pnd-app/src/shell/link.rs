@@ -229,6 +229,17 @@ impl AppShell {
                 // 命中会往 alerts 表里写行,但写的是 actor 线程,等它落盘再读。
                 self.refresh_alerts_soon();
             }
+            // 市场观察页还没做(Phase 3 step 3):先只记一笔日志,把事件
+            // 从通道里抽干净。做页面的那一步会把这两条接到表格上。
+            RuntimeEvent::ObservationStatus { obs_id, status } => {
+                self.push_log(format!(
+                    "observation {obs_id}: {} active / {} gone",
+                    status.active, status.gone
+                ));
+            }
+            RuntimeEvent::ObservationChanged { obs_id } => {
+                self.push_log(format!("observation {obs_id}: data changed"));
+            }
             RuntimeEvent::SessionInvalid => {
                 self.push_log("runtime: POESESSID rejected, now anonymous".to_owned());
                 self.set_sticky_notice(text.notice_session_invalid.to_owned());
@@ -943,6 +954,7 @@ mod link_tests {
             whisper_token: None,
             hideout_token: None,
             icon: String::new(),
+            item_json: String::new(),
         }
     }
 

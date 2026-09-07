@@ -30,6 +30,14 @@ pub const FETCH_POLICY: &str = "trade-fetch-request-limit";
 pub const SEARCH_LONG_WINDOW_REQUESTS: u32 = 600;
 pub const SEARCH_LONG_WINDOW_SECS: u32 = 21_600;
 
+/// fetch 策略最长的那个桶:6 小时 1000 次(2026-09-07 实测的 `1000:21600:1800`)。
+///
+/// 市场观察靠它算"每轮回查最多能查多少条挂单":300 条 active 两小时回查一次
+/// 是 6 小时 90 次,离一半的额度(499)还远;但观察条数一多就会撞上,
+/// 所以那条上限按这个桶来算,而不是拍脑袋定一个数。
+pub const FETCH_LONG_WINDOW_REQUESTS: u32 = 1_000;
+pub const FETCH_LONG_WINDOW_SECS: u32 = 21_600;
+
 /// 一条 `次数:窗口秒:冷却秒` 三元组。
 ///
 /// 同样的写法在两个头里含义不同:在上限头里三个数是"允许次数 / 窗口 /

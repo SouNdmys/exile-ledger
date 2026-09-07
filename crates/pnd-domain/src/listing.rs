@@ -24,6 +24,24 @@ impl std::fmt::Display for WatchId {
     }
 }
 
+/// 一条市场观察的 id。和 [`WatchId`] 分开包一层,是因为两者说的根本不是一件事:
+/// 蹲价是"这个价出现了叫我",观察是"这批货最后都怎么样了"。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ObservationId(pub String);
+
+impl ObservationId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ObservationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// 一条挂单里我们关心的部分。
 ///
 /// `price` 是 `Option`:交易站允许挂"仅供展示"的无价单,那种直接判 `Unpriced`,不提醒。
@@ -44,6 +62,14 @@ pub struct ListingSummary {
     pub whisper_token: Option<String>,
     pub hideout_token: Option<String>,
     pub icon: String,
+    /// fetch 回来的 `item` 那一整块的原文,一个字都没动。
+    ///
+    /// 上面那几个字段是"卡片要显示什么"摘出来的,而市场观察问的是另一个问题:
+    /// **这件货身上有哪些词缀**。词缀数组(explicit/implicit/crafted/rune/…)
+    /// 形状五花八门,今天摘一遍、明天想统计别的又得改一遍摘法;所以原文原样
+    /// 留一份,统计什么时候想改都行。摘要留空(`""`)是合法的 —— 没有 `item`
+    /// 那一块(或者这条摘要是测试现编的)就是空串。
+    pub item_json: String,
 }
 
 impl ListingSummary {
@@ -77,6 +103,7 @@ mod listing_tests {
             whisper_token: None,
             hideout_token: None,
             icon: "https://web.poecdn.com/image/item.png".to_string(),
+            item_json: String::new(),
         }
     }
 

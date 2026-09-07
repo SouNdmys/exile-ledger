@@ -203,7 +203,10 @@ pub struct AlertRow {
 }
 
 pub struct WatchStore {
-    conn: Connection,
+    /// 同一个连接给两套表用:蹲价那几张(本文件)和市场观察那几张
+    /// (`observe.rs`)。一个文件、一个连接、一份 busy timeout —— 分成两个
+    /// 连接只会让两边在同一个 `watch.sqlite` 上互相等锁。
+    pub(crate) conn: Connection,
 }
 
 impl WatchStore {
@@ -233,6 +236,7 @@ impl WatchStore {
         // 5 秒足够让探针和主程序共用同一个文件而互不打断。
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(BASELINE_SCHEMA)?;
+        conn.execute_batch(crate::observe::OBSERVE_SCHEMA)?;
         Ok(Self { conn })
     }
 
@@ -550,7 +554,7 @@ fn verdict_code(verdict: Verdict) -> &'static str {
 }
 
 /// 价格拆成两列。无价单走 `UNPRICED_MILLI` + 空货币,见本文件顶部的说明。
-fn encode_price(price: Option<&Price>) -> (i64, String) {
+pub(crate) fn encode_price(price: Option<&Price>) -> (i64, String) {
     match price {
         Some(price) => (price.amount_milli, price.currency.code().to_string()),
         None => (UNPRICED_MILLI, String::new()),
@@ -559,7 +563,7 @@ fn encode_price(price: Option<&Price>) -> (i64, String) {
 
 /// 反过来拼回一个价格。判据是货币列为空,不是金额为负 ——
 /// 空货币是写入时的约定,金额只是跟着走。
-fn decode_price(amount_milli: i64, currency: &str) -> Option<Price> {
+pub(crate) fn decode_price(amount_milli: i64, currency: &str) -> Option<Price> {
     if currency.is_empty() {
         return None;
     }
@@ -572,7 +576,7 @@ fn to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-fn to_u32(value: i64) -> u32 {
+pub(crate) fn to_u32(value: i64) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
@@ -645,6 +649,7 @@ mod watch_tests {
             whisper_token: None,
             hideout_token: None,
             icon: "https://web.poecdn.com/image/item.png".to_string(),
+            item_json: String::new(),
         }
     }
 

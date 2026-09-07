@@ -111,6 +111,7 @@ mod decide_tests {
             whisper_token: None,
             hideout_token: None,
             icon: String::new(),
+            item_json: String::new(),
         }
     }
 
