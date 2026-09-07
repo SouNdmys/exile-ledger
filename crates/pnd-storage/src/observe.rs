@@ -1005,8 +1005,10 @@ pub fn observed_mods_from_item_json(item_json: &str) -> Vec<ObservedMod> {
         let Some(lines) = item.get(key).and_then(serde_json::Value::as_array) else {
             continue;
         };
-        for (ordinal, line) in lines.iter().enumerate() {
-            let Some(line) = line.as_str() else { continue };
+        for (ordinal, entry) in lines.iter().enumerate() {
+            let Some(line) = mod_display_line(entry) else {
+                continue;
+            };
             let numbers = line_numbers(line);
             out.push(ObservedMod {
                 mod_kind: mod_kind.to_string(),
@@ -1018,6 +1020,21 @@ pub fn observed_mods_from_item_json(item_json: &str) -> Vec<ObservedMod> {
         }
     }
     out
+}
+
+/// 词缀数组里的一格 → 那行显示文本。
+///
+/// **poe2 的交易站给的是对象**,显示文本在 `description` 里,旁边还跟着
+/// `hash`(stat id)和 `mods`(词缀等级和这一档的取值范围)。2026-09-07
+/// 匿名跑一趟 `--observe-run` 才看见:此前照 PoE1 的写法只认字符串,
+/// 于是每一条词缀都被跳过,聚合表一直是空的。
+///
+/// 字符串那种形状还照收:PoE1 的接口就是那样,哪天 poe2 也改回去,
+/// 或者别处塞进来一份手写的原文,都不用再改这里。
+fn mod_display_line(entry: &serde_json::Value) -> Option<&str> {
+    entry
+        .as_str()
+        .or_else(|| entry.get("description").and_then(serde_json::Value::as_str))
 }
 
 fn observation_run_from_row(row: &Row<'_>) -> rusqlite::Result<ObservationRun> {
@@ -1737,6 +1754,63 @@ mod observe_tests {
             store
                 .due_listings(i64::MAX - 1, 10)
                 .expect("due")
+                .is_empty()
+        );
+    }
+
+    /// **2026-09-07 匿名实测的形状**(`trade_probe --observe-run`,
+    /// Choir of the Storm 八件货,原文照抄、只删了卖家和挂单 id)。
+    ///
+    /// 词缀数组里装的**不是字符串,是对象**:显示文本在 `description` 那一格,
+    /// 旁边还跟着 `hash`(stat id)和 `mods`(词缀等级、这一档的取值范围)。
+    /// 计划里记的"字符串数组"是照 PoE1 的接口写的,poe2 不长那样 —— 于是
+    /// 那一趟真跑八件货、每件四五条词缀全被丢掉,聚合表是空的。
+    ///
+    /// `magnitudes` 里的 min/max 是**这一档能卷到的范围**,不是这件货卷了多少;
+    /// 真正卷出来的数在 `description` 里(`+64%`),所以数值照旧从显示文本读。
+    #[test]
+    fn mods_come_back_as_objects_with_a_description() {
+        let mods = observed_mods_from_item_json(
+            r#"{"name":"Choir of the Storm","typeLine":"Lapis Amulet","rarity":"Unique","ilvl":81,
+                 "implicitMods":[{"description":"+15 to [Dexterity|Dexterity]",
+                    "domain":"implicit","hash":"stat.implicit.stat_3261801346",
+                    "mods":[{"level":10,"magnitudes":[{"max":"15","min":"10"}]}]}],
+                 "explicitMods":[
+                   {"description":"+64% to [Resistances|Lightning Resistance]",
+                    "domain":"explicit","hash":"stat.explicit.stat_1671376347",
+                    "mods":[{"level":69,"magnitudes":[{"max":"100","min":"50"}]}]},
+                   {"description":"[Trigger] Lightning Bolt Skill on [Critical|Critical Hit]",
+                    "domain":"explicit","hash":"stat.explicit.stat_704919631",
+                    "mods":[{"level":69,"magnitudes":[{"max":"1","min":"1"}]}]}],
+                 "enchantMods":[{"description":"Allocates [criticals39|Preemptive Strike]",
+                    "domain":"enchant","hash":"stat.enchant.stat_2954116742|21380",
+                    "mods":[{"magnitudes":[{"max":1,"min":1}]}]}]}"#,
+        );
+        assert_eq!(
+            mods.iter()
+                .map(|entry| (
+                    entry.mod_kind.as_str(),
+                    entry.ordinal,
+                    entry.template.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("implicit", 0, "+# to Dexterity"),
+                ("explicit", 0, "+#% to Lightning Resistance"),
+                (
+                    "explicit",
+                    1,
+                    "Trigger Lightning Bolt Skill on Critical Hit"
+                ),
+                ("enchant", 0, "Allocates Preemptive Strike"),
+            ]
+        );
+        assert_eq!(mods[0].value1, Some(15.0), "卷出来的数在 description 里");
+        assert_eq!(mods[1].value1, Some(64.0));
+        // 没有 `description` 的对象跳过,不该顶一条空模板进去 ——
+        // 聚合那边 `template <> ''` 会把它滤掉,留着只是白占一行。
+        assert!(
+            observed_mods_from_item_json(r#"{"explicitMods":[{"hash":"stat.explicit.x"}]}"#)
                 .is_empty()
         );
     }

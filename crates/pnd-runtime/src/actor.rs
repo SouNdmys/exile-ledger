@@ -3126,6 +3126,10 @@ mod actor_tests {
     ///
     /// `online = false` 时干脆不给 `account.online` 这个键 —— 交易站离线时
     /// 就是这么回的(不是回 `null`),摘要那一层认的也是"这个键在不在"。
+    ///
+    /// 词缀按**交易站真正回的形状**编:一格是个对象,显示文本在 `description`
+    /// 里。早先这里编的是字符串数组(照 PoE1 写的),于是这个假交易站一路绿灯,
+    /// 而真跑一趟一条词缀都记不进去 —— 假的和真的不一样,测试就白测了。
     fn listings_json(
         ids: &[String],
         token: Option<&str>,
@@ -3134,7 +3138,14 @@ mod actor_tests {
         gone: &BTreeSet<String>,
         mods: &[String],
     ) -> String {
-        let mod_lines: Vec<String> = mods.iter().map(|line| format!("\"{line}\"")).collect();
+        let mod_lines: Vec<String> = mods
+            .iter()
+            .map(|line| {
+                format!(
+                    r#"{{"description":"{line}","domain":"explicit","hash":"stat.explicit.x"}}"#
+                )
+            })
+            .collect();
         let items: Vec<String> = ids
             .iter()
             .enumerate()
@@ -4918,7 +4929,10 @@ mod actor_tests {
         // 整块物品原文留着 —— 以后想统计别的(ilvl、底子)不用重抓一遍。
         let item: serde_json::Value = serde_json::from_str(&row.item_json).expect("item json");
         assert_eq!(item["name"], "Choir of the Storm");
-        assert_eq!(item["explicitMods"][0], "+115 to maximum Life");
+        assert_eq!(
+            item["explicitMods"][0]["description"],
+            "+115 to maximum Life"
+        );
 
         let mods = store.observed_mods(&obs_id, "one").unwrap();
         assert_eq!(mods.len(), 1);
