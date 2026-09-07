@@ -95,7 +95,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use pnd_ninja::aggregate::unique_usage_from_facet;
+use pnd_ninja::aggregate::{SlotModStat, unique_usage_from_facet};
 use pnd_ninja::client::NinjaClient;
 use pnd_ninja::economy::UNIQUE_TYPES;
 use pnd_ninja::search::{SearchResponse, dictionary_key_for_facet};
@@ -749,8 +749,18 @@ fn run_aggregate(args: &Args) -> Result<(), Box<dyn Error>> {
         println!();
         println!("-- {slot} ({} rows) --", rows.len());
         println!(
-            "  {:>2}  {:<10} {:<10} {:<34} {:>6} {:>7} {:>7}  {:>9} {:>9} {:>9}",
-            "#", "rarity", "kind", "stat id", "chars", "sample", "share", "p25", "p50", "p75"
+            "  {:>2}  {:<10} {:<10} {:<46} {:<34} {:>6} {:>7} {:>7}  {:>9} {:>9} {:>9}",
+            "#",
+            "rarity",
+            "kind",
+            "in-game text",
+            "stat id",
+            "chars",
+            "sample",
+            "share",
+            "p25",
+            "p50",
+            "p75"
         );
         for (rank, row) in rows.iter().take(TOP_MOD_ROWS).enumerate() {
             let share = if row.sample_size == 0 {
@@ -759,10 +769,11 @@ fn run_aggregate(args: &Args) -> Result<(), Box<dyn Error>> {
                 f64::from(row.characters) * 100.0 / f64::from(row.sample_size)
             };
             println!(
-                "  {:>2}. {:<10} {:<10} {:<34} {:>6} {:>7} {:>6.1}%  {:>9} {:>9} {:>9}",
+                "  {:>2}. {:<10} {:<10} {:<46} {:<34} {:>6} {:>7} {:>6.1}%  {:>9} {:>9} {:>9}",
                 rank + 1,
                 row.rarity,
                 row.mod_kind,
+                in_game_text(row),
                 row.stat_id,
                 row.characters,
                 row.sample_size,
@@ -800,6 +811,20 @@ fn run_prices(args: &Args) -> Result<(), Box<dyn Error>> {
         None => println!("(no price rows stored)"),
     }
     Ok(())
+}
+
+/// 游戏里那句话,配不上就写 `(no text)` —— 空一格看着像列错位了。
+///
+/// "要不要补第几个数"这条规则问的是 [`SlotModStat::needs_value_marker`],
+/// 和界面同一个答案;探针只给自己看,所以标记写成 `[#2]` 而不走 i18n。
+fn in_game_text(row: &SlotModStat) -> String {
+    if row.display.is_empty() {
+        return "(no text)".to_owned();
+    }
+    if !row.needs_value_marker() {
+        return row.display.clone();
+    }
+    format!("{} [#{}]", row.display, row.value_index)
 }
 
 fn percentile(value: Option<f64>) -> String {

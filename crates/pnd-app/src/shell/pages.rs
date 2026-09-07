@@ -305,6 +305,8 @@ mod pages_tests {
             rarity: "Rare".to_string(),
             mod_kind: "explicit".to_string(),
             stat_id: "base_maximum_life".to_string(),
+            display: "+# to maximum Life".to_string(),
+            value_index: 1,
             mod_family: "IncreasedLife".to_string(),
             characters: 13,
             occurrences: 13,

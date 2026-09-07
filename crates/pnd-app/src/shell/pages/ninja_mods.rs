@@ -133,17 +133,22 @@ fn kind_label<'a>(kind: &'a str, text: &'static Text) -> &'a str {
 }
 
 /// 词缀表的列。行由 [`table_content_for`] 填。
+///
+/// 第一列是**游戏里那句话**(`+# to maximum Life`),内部的 stat id 让到第二列
+/// 去:后者只在两行同名时才需要看一眼(最小/最大火伤共用一句话),平时是噪音。
+/// 族名压到最后一列 —— 它回答的是"这两条算不算一家",不是"这条是什么"。
 pub fn table_content(text: &'static Text) -> TableContent {
     TableContent {
         columns: vec![
-            column("stat", text.mods_col_stat, 220.),
-            column("family", text.mods_col_family, 150.),
+            column("stat", text.mods_col_stat, 330.),
+            column("stat_id", text.mods_col_stat_id, 200.),
             number_column("share", text.mods_col_characters_percent, 85.),
             number_column("characters", text.mods_col_characters, 90.),
             number_column("occurrences", text.mods_col_occurrences, 95.),
             number_column("p25", text.mods_col_p25, 65.),
             number_column("p50", text.mods_col_p50, 65.),
             number_column("p75", text.mods_col_p75, 65.),
+            column("family", text.mods_col_family, 130.),
         ],
         rows: Vec::new(),
         empty: text.mods_empty.into(),
@@ -265,21 +270,43 @@ pub fn mod_rows(rows: &[&SlotModStat], text: &'static Text) -> Vec<Vec<Cell>> {
     rows.iter()
         .map(|stat| {
             vec![
-                Cell::plain(stat.stat_id.clone()),
-                if stat.mod_family.is_empty() {
-                    Cell::muted(text.common_none)
-                } else {
-                    Cell::muted(stat.mod_family.clone())
-                },
+                Cell::plain(modifier_text(stat, text)),
+                Cell::muted(stat.stat_id.clone()),
                 Cell::data(percent_text(mod_share_percent(stat), text)),
                 Cell::data(stat.characters.to_string()),
                 Cell::data(stat.occurrences.to_string()),
                 percentile_cell(stat.p25, text),
                 percentile_cell(stat.p50, text),
                 percentile_cell(stat.p75, text),
+                if stat.mod_family.is_empty() {
+                    Cell::muted(text.common_none)
+                } else {
+                    Cell::muted(stat.mod_family.clone())
+                },
             ]
         })
         .collect()
+}
+
+/// 第一列那句话。
+///
+/// 配不上游戏文本的行(布尔词缀、合并显示的那些)退回 stat id:空着一格
+/// 会让人以为这一行坏了。
+///
+/// 一句话里有两个数时(`Adds # to # Fire Damage`)后面补一句"第几个数" ——
+/// 最小和最大火伤共用同一句话,不补的话屏幕上就是两行一模一样的字。数几个
+/// `#` 就知道这句话有几个数,不用再问库要一个计数。
+fn modifier_text(stat: &SlotModStat, text: &'static Text) -> String {
+    if stat.display.is_empty() {
+        return stat.stat_id.clone();
+    }
+    if !stat.needs_value_marker() {
+        return stat.display.clone();
+    }
+    i18n::fill(
+        text.mods_value_ordinal,
+        &[&stat.display, &stat.value_index.to_string()],
+    )
 }
 
 /// 分位数那一格。布尔词缀("不会被冰冻")没有数值,那三格就是"—"。
@@ -409,6 +436,8 @@ mod ninja_mods_tests {
             rarity: rarity.to_owned(),
             mod_kind: kind.to_owned(),
             stat_id: stat_id.to_owned(),
+            display: "+# to maximum Life".to_owned(),
+            value_index: 1,
             mod_family: "IncreasedLife".to_owned(),
             characters,
             occurrences: characters + 2,
@@ -516,9 +545,8 @@ mod ninja_mods_tests {
         assert_eq!(built.len(), 2);
         let life = built
             .iter()
-            .find(|row| row[0].text() == "base_maximum_life")
+            .find(|row| row[1].text() == "base_maximum_life")
             .expect("life row");
-        assert_eq!(life[1].text(), "IncreasedLife");
         // 13 / 47 = 27.7%
         assert_eq!(life[2].text(), "27.7%");
         assert_eq!(life[3].text(), "13");
@@ -526,6 +554,63 @@ mod ninja_mods_tests {
         assert_eq!(life[5].text(), "108");
         assert_eq!(life[6].text(), "176", "整数就写整数");
         assert_eq!(life[7].text(), "211.5");
+        assert_eq!(life[8].text(), "IncreasedLife", "族名挪到最后一列");
+    }
+
+    /// 第一列写游戏里那句话,`base_maximum_life` 这种内部名退到后面一列。
+    ///
+    /// 这一页的全部意义就在这儿:`local_minimum_added_fire_damage` 没人认得,
+    /// `Adds # to # Fire Damage` 是打开游戏就看得见的那行字。
+    #[test]
+    fn the_first_column_speaks_the_games_language() {
+        let mods = mods();
+        let rows = filtered(&mods, "Ring", "Rare", "explicit", false);
+        let built = mod_rows(&rows, &i18n::ENGLISH);
+        assert_eq!(built[0][0].text(), "+# to maximum Life");
+        assert_eq!(built[0][1].text(), "base_maximum_life");
+    }
+
+    /// 一句话里有两个数时,行还得说清自己数的是哪一个 —— 不然最小和最大
+    /// 火伤在屏幕上是两行一模一样的字。
+    #[test]
+    fn a_row_says_which_number_of_the_line_it_counts() {
+        let mut low = stat(
+            "Weapon",
+            "Rare",
+            "explicit",
+            "local_minimum_added_fire_damage",
+            10,
+            20,
+        );
+        low.display = "Adds # to # Fire Damage".to_owned();
+        low.value_index = 1;
+        let mut high = low.clone();
+        high.stat_id = "local_maximum_added_fire_damage".to_owned();
+        high.value_index = 2;
+
+        let built = mod_rows(&[&low, &high], &i18n::ENGLISH);
+        assert_eq!(built[0][0].text(), "Adds # to # Fire Damage (number #1)");
+        assert_eq!(built[1][0].text(), "Adds # to # Fire Damage (number #2)");
+        let zh = mod_rows(&[&high], &i18n::SIMPLIFIED_CHINESE);
+        assert_eq!(zh[0][0].text(), "Adds # to # Fire Damage(第 2 个数)");
+
+        // 只有一个数的那句话不挂标记 —— 挂了只是噪音。
+        let single = stat("Ring", "Rare", "explicit", "base_maximum_life", 10, 20);
+        assert_eq!(
+            mod_rows(&[&single], &i18n::ENGLISH)[0][0].text(),
+            "+# to maximum Life"
+        );
+    }
+
+    /// 配不上文本的行退回 stat id,而不是留一格空白。
+    #[test]
+    fn a_stat_without_a_template_falls_back_to_its_id() {
+        let mut unknown = stat("Boots", "Unique", "explicit", "cannot_be_frozen", 9, 26);
+        unknown.display = String::new();
+        unknown.value_index = 0;
+        let built = mod_rows(&[&unknown], &i18n::ENGLISH);
+        assert_eq!(built[0][0].text(), "cannot_be_frozen");
+        assert_eq!(built[0][1].text(), "cannot_be_frozen");
     }
 
     /// 没有数值的词缀(布尔的那种)三格写"—",不写 0。
@@ -537,10 +622,10 @@ mod ninja_mods_tests {
         boolean.p75 = None;
         boolean.mod_family = String::new();
         let built = mod_rows(&[&boolean], &i18n::ENGLISH);
-        assert_eq!(built[0][1].text(), "—", "族名为空时也不留白");
         assert_eq!(built[0][5].text(), "—");
         assert_eq!(built[0][6].text(), "—");
         assert_eq!(built[0][7].text(), "—");
+        assert_eq!(built[0][8].text(), "—", "族名为空时也不留白");
     }
 
     /// 分母取最大值:同一个部位下每一行的分母都是同一个数,求和会放大几十倍。

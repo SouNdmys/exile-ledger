@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::character::{CharacterDetail, ItemData, ModEntry, mod_family};
+use crate::character::{CharacterDetail, ItemData, ModEntry, mod_family, pair_mod_displays};
 use crate::plan::is_rarity_bucket;
 
 /// 一行统计。字段顺序和 `ninja_item_mods` 那张表一一对应。
@@ -36,6 +36,16 @@ pub struct SlotModStat {
     /// `explicit` / `implicit` / `crafted` / `desecrated` / `rune`。
     pub mod_kind: String,
     pub stat_id: String,
+    /// 这条 stat 在游戏里印出来是哪句话,数字换成了 `#`
+    /// (`+# to maximum Mana`)。**认不出来时是空串**,界面退回显示 stat id。
+    ///
+    /// 一条 stat 偶尔会配到不同的写法,这里存的是这一桶里出现最多的那句
+    /// (理由同 [`dominant_family`])。
+    pub display: String,
+    /// 这一行数的是那句话里的第几个数(1 起)。`Adds # to # Fire Damage`
+    /// 有两个数,minimum 是 1、maximum 是 2 —— 没有它,那两行在界面上
+    /// 是一模一样的字。认不出来时是 0。
+    pub value_index: u8,
     pub mod_family: String,
     pub characters: u32,
     pub occurrences: u32,
@@ -44,6 +54,20 @@ pub struct SlotModStat {
     pub p25: Option<f64>,
     pub p50: Option<f64>,
     pub p75: Option<f64>,
+}
+
+impl SlotModStat {
+    /// 这一行要不要在游戏文本后面补一句"数的是第几个数"。
+    ///
+    /// 判据是那句话里有几个 `#`:两个以上就说明最小/最大共用同一句,不补的话
+    /// 屏幕上是两行一模一样的字。只有一个数的行补了只是噪音。
+    ///
+    /// 规则放在这儿而不是各画各的:界面用括号、探针用方括号,但"什么时候该补"
+    /// 只能有一个答案。
+    #[must_use]
+    pub fn needs_value_marker(&self) -> bool {
+        self.value_index > 0 && self.display.matches('#').count() > 1
+    }
 }
 
 /// 热门暗金榜的一行。
@@ -65,6 +89,9 @@ struct Bucket {
     occurrences: u32,
     values: Vec<f64>,
     families: BTreeMap<String, u32>,
+    /// 显示文本和"第几个数"一起投票。捆成一个键是有意的:分开投的话,
+    /// 可能挑出 A 行的话配 B 行的序号,拼出一句谁也没说过的描述。
+    displays: BTreeMap<(String, u8), u32>,
     /// 只记"上一个碰过这个桶的角色是谁"就够去重了:角色是一个接一个处理的,
     /// 比存一整个 HashSet 省得多。
     last_character: Option<usize>,
@@ -146,11 +173,13 @@ fn aggregate_one_class(details: &[&CharacterDetail], class: &str) -> Vec<SlotMod
                 sample.characters += 1;
             }
 
-            for (kind, mods) in mod_groups(item) {
-                for entry_mod in mods {
+            for (kind, mods, lines) in mod_groups(item) {
+                // 显示文本在这一步就配好:出了这个循环,行和它来自哪件装备
+                // 的联系就断了,而配对只有在同一件装备里才能做。
+                let paired = pair_mod_displays(mods, lines);
+                for (entry_mod, stats) in mods.iter().zip(paired) {
                     let family = mod_family(&entry_mod.id);
-                    let numeric = entry_mod.numeric_stats();
-                    if numeric.is_empty() {
+                    if stats.is_empty() {
                         // 布尔词缀、纯文本词缀:数值统计不了,但"有多少人带着它"
                         // 照样有用,所以还是给它一行,只是没有分位数。
                         let key = (
@@ -161,9 +190,15 @@ fn aggregate_one_class(details: &[&CharacterDetail], class: &str) -> Vec<SlotMod
                         );
                         record(&mut buckets, key, family, None, index);
                     } else {
-                        for (stat_id, value) in numeric {
-                            let key = (slot.clone(), rarity.clone(), kind.to_owned(), stat_id);
-                            record(&mut buckets, key, family, Some(value), index);
+                        for stat in stats {
+                            let key = (slot.clone(), rarity.clone(), kind.to_owned(), stat.stat_id);
+                            let bucket = record(&mut buckets, key, family, Some(stat.value), index);
+                            if !stat.display.is_empty() {
+                                *bucket
+                                    .displays
+                                    .entry((stat.display, stat.value_index))
+                                    .or_default() += 1;
+                            }
                         }
                     }
                 }
@@ -178,12 +213,15 @@ fn aggregate_one_class(details: &[&CharacterDetail], class: &str) -> Vec<SlotMod
             let sample_size = samples
                 .get(&(slot.clone(), rarity.clone()))
                 .map_or(0, |sample| sample.characters);
+            let (display, value_index) = dominant_display(&bucket.displays);
             SlotModStat {
                 class: class.to_owned(),
                 slot,
                 rarity,
                 mod_kind,
                 stat_id,
+                display,
+                value_index,
                 mod_family: dominant_family(&bucket.families),
                 characters: bucket.characters,
                 occurrences: bucket.occurrences,
@@ -197,13 +235,16 @@ fn aggregate_one_class(details: &[&CharacterDetail], class: &str) -> Vec<SlotMod
 }
 
 /// 五组词缀,顺序无所谓——输出最后会重排。
-fn mod_groups(item: &ItemData) -> [(&'static str, &[ModEntry]); 5] {
+///
+/// 每组带着**自己那一份显示文本**:`mods.explicit` 配 `explicitMods`。
+/// 配错组就等于把工艺词缀的话挂到天生词缀上。
+fn mod_groups(item: &ItemData) -> [(&'static str, &[ModEntry], &[String]); 5] {
     [
-        ("implicit", &item.mods.implicit),
-        ("explicit", &item.mods.explicit),
-        ("crafted", &item.mods.crafted),
-        ("desecrated", &item.mods.desecrated),
-        ("rune", &item.mods.rune),
+        ("implicit", &item.mods.implicit, &item.implicit_mods),
+        ("explicit", &item.mods.explicit, &item.explicit_mods),
+        ("crafted", &item.mods.crafted, &item.crafted_mods),
+        ("desecrated", &item.mods.desecrated, &item.desecrated_mods),
+        ("rune", &item.mods.rune, &item.rune_mods),
     ]
 }
 
@@ -219,13 +260,14 @@ fn fallback_stat_id(entry: &ModEntry) -> String {
         .unwrap_or_else(|| entry.id.clone())
 }
 
-fn record(
-    buckets: &mut BTreeMap<StatKey, Bucket>,
+/// 记一笔,并把桶还回去 —— 调用方还要往里投一票显示文本。
+fn record<'a>(
+    buckets: &'a mut BTreeMap<StatKey, Bucket>,
     key: StatKey,
     family: &str,
     value: Option<f64>,
     character: usize,
-) {
+) -> &'a mut Bucket {
     let bucket = buckets.entry(key).or_default();
     if bucket.last_character != Some(character) {
         bucket.last_character = Some(character);
@@ -236,6 +278,7 @@ fn record(
         bucket.values.push(value);
     }
     *bucket.families.entry(family.to_owned()).or_default() += 1;
+    bucket
 }
 
 /// 键里没有族名,可行里要显示一个,只能选个代表:出现次数最多的那族,
@@ -245,6 +288,20 @@ fn dominant_family(families: &BTreeMap<String, u32>) -> String {
         .iter()
         .max_by(|left, right| left.1.cmp(right.1).then_with(|| right.0.cmp(left.0)))
         .map(|(name, _)| name.clone())
+        .unwrap_or_default()
+}
+
+/// 同一条 stat 在不同装备上偶尔印出不一样的话(`+16%` 和 `16%`,或者某一件
+/// 上配错了一行),但一行只能挂一句:挑出现次数最多的那对,打平了按字典序小的。
+/// 规则和 [`dominant_family`] 一样,理由也一样 —— 同样的输入永远给同样的结果,
+/// 库里的行才不会来回抖。
+///
+/// 一票都没有(全都配不上)就交白卷,让界面退回 stat id。
+fn dominant_display(displays: &BTreeMap<(String, u8), u32>) -> (String, u8) {
+    displays
+        .iter()
+        .max_by(|left, right| left.1.cmp(right.1).then_with(|| right.0.cmp(left.0)))
+        .map(|((display, value_index), _)| (display.clone(), *value_index))
         .unwrap_or_default()
 }
 
@@ -307,16 +364,22 @@ mod aggregate_tests {
                   "mods": {"explicit": [
                     {"id": "IncreasedLife8", "stats": {"base_maximum_life": 115}},
                     {"id": "LightningResist5", "stats": {"base_lightning_damage_resistance_%": 28}}
-                  ]}}},
+                  ]},
+                  "explicitMods": ["+28% to [Resistances|Lightning Resistance]",
+                                   "+115 to maximum Life"]}},
                 {"itemSlot": 9, "itemData": {"inventoryId": "Ring", "rarity": "Rare",
                   "mods": {"explicit": [{"id": "IncreasedLife6", "stats": {"base_maximum_life": 95}}],
-                           "crafted": [{"id": "FireResist6", "stats": {"base_fire_damage_resistance_%": 34}}]}}},
+                           "crafted": [{"id": "FireResist6", "stats": {"base_fire_damage_resistance_%": 34}}]},
+                  "explicitMods": ["+95 to maximum Life"],
+                  "craftedMods": ["+34% to [Resistances|Fire Resistance]"]}},
                 {"itemSlot": 3, "itemData": {"inventoryId": "BodyArmour", "rarity": "Unique",
-                  "mods": {"explicit": [{"id": "UniqueCannotBeFrozen1", "stats": {"cannot_be_frozen": true}}]}}}
+                  "mods": {"explicit": [{"id": "UniqueCannotBeFrozen1", "stats": {"cannot_be_frozen": true}}]},
+                  "explicitMods": ["Cannot be Frozen"]}}
               ],
               "jewels": [
                 {"itemSlot": 0, "itemData": {"inventoryId": "Jewel", "rarity": "Rare",
-                  "mods": {"explicit": [{"id": "JewelIncreasedLife3", "stats": {"base_maximum_life": 22}}]}}}
+                  "mods": {"explicit": [{"id": "JewelIncreasedLife3", "stats": {"base_maximum_life": 22}}]},
+                  "explicitMods": ["+22 to maximum Life"]}}
               ]
             }"#,
         )
@@ -330,13 +393,16 @@ mod aggregate_tests {
               "name": "KingPinUwU",
               "items": [
                 {"itemSlot": 8, "itemData": {"inventoryId": "Ring", "rarity": "Rare",
-                  "mods": {"explicit": [{"id": "IncreasedLife8", "stats": {"base_maximum_life": 135}}]}}},
+                  "mods": {"explicit": [{"id": "IncreasedLife8", "stats": {"base_maximum_life": 135}}]},
+                  "explicitMods": ["+135 to maximum Life"]}},
                 {"itemSlot": 3, "itemData": {"inventoryId": "BodyArmour", "rarity": "Unique",
-                  "mods": {"explicit": [{"id": "UniqueCannotBeFrozen1", "stats": {"cannot_be_frozen": true}}]}}}
+                  "mods": {"explicit": [{"id": "UniqueCannotBeFrozen1", "stats": {"cannot_be_frozen": true}}]},
+                  "explicitMods": ["Cannot be Frozen"]}}
               ],
               "flasks": [
                 {"itemSlot": 4, "itemData": {"rarity": "Magic",
-                  "mods": {"implicit": [{"id": "FlaskChargesUsed2", "stats": {"local_charges_used_+%": [-30, -20]}}]}}}
+                  "mods": {"implicit": [{"id": "FlaskChargesUsed2", "stats": {"local_charges_used_+%": [-30, -20]}}]},
+                  "implicitMods": ["30% reduced Charges used"]}}
               ]
             }"#,
         )
@@ -576,6 +642,140 @@ mod aggregate_tests {
                 ("Ring", "Rare", "explicit", 1),
             ]
         );
+    }
+
+    /// 一把武器,`Adds {min} to {max} Fire Damage`。两个 stat 共用一行文本,
+    /// 所以每一行还得说清自己数的是那行里的第几个数。
+    fn weapon_bearer(min: u32, max: u32) -> CharacterDetail {
+        serde_json::from_str(&format!(
+            r#"{{
+              "items": [
+                {{"itemSlot": 5, "itemData": {{"inventoryId": "Weapon", "rarity": "Rare",
+                  "mods": {{"explicit": [{{"id": "LocalAddedFireDamage6",
+                    "stats": {{"local_minimum_added_fire_damage": {min},
+                              "local_maximum_added_fire_damage": {max}}}}}]}},
+                  "explicitMods": ["Adds {min} to {max} [Fire|Fire] Damage"]}}}}
+              ]
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    /// 一只戒指,全抗那一行的写法由调用方给 —— 用来验"少数服从多数"。
+    fn ring_bearer(value: u32, line: &str) -> CharacterDetail {
+        serde_json::from_str(&format!(
+            r#"{{
+              "items": [
+                {{"itemSlot": 8, "itemData": {{"inventoryId": "Ring", "rarity": "Rare",
+                  "mods": {{"explicit": [{{"id": "AllResistances5",
+                    "stats": {{"base_resist_all_elements_%": {value}}}}}]}},
+                  "explicitMods": ["{line}"]}}}}
+              ]
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    /// 每一行都要带上游戏里那句话。`base_maximum_life` 谁也认不出来,
+    /// `+# to maximum Life` 一眼就懂。
+    ///
+    /// alpha 那只戒指的 `explicitMods` 是**反着写**的(抗性在前、生命在后),
+    /// 照下标配对的话生命这一行会挂上抗性的文本。
+    #[test]
+    fn every_row_carries_the_in_game_text_of_its_stat() {
+        let rows = aggregate_mods(&[alpha(), beta()]);
+
+        let life = row(&rows, "Ring", "explicit", "base_maximum_life");
+        assert_eq!(life.display, "+# to maximum Life");
+        assert_eq!(life.value_index, 1);
+
+        let resist = row(
+            &rows,
+            "Ring",
+            "explicit",
+            "base_lightning_damage_resistance_%",
+        );
+        assert_eq!(resist.display, "+#% to Lightning Resistance");
+
+        let crafted = row(&rows, "Ring", "crafted", "base_fire_damage_resistance_%");
+        assert_eq!(crafted.display, "+#% to Fire Resistance");
+    }
+
+    /// 配不上的行留空,界面照旧退回 stat id —— 空着好过挂一句别的词缀的话。
+    #[test]
+    fn a_stat_without_a_matching_line_leaves_the_text_empty() {
+        let rows = aggregate_mods(&[alpha(), beta()]);
+
+        // 布尔词缀根本没有数,无从配起。
+        let frozen = row(&rows, "BodyArmour", "explicit", "cannot_be_frozen");
+        assert_eq!(frozen.display, "");
+        assert_eq!(frozen.value_index, 0);
+
+        // 范围词缀取的是中点(-25),而那一行里写的是 30。
+        let flask = row(&rows, "slot4", "implicit", "local_charges_used_+%");
+        assert_eq!(flask.display, "");
+    }
+
+    /// 一行里有两个数时,两个 stat 各自记住"我数的是第几个" ——
+    /// 没有它,最小和最大冷伤在界面上是两行一模一样的字。
+    #[test]
+    fn a_two_number_line_says_which_number_each_row_counts() {
+        let rows = aggregate_mods(&[weapon_bearer(27, 68), weapon_bearer(31, 74)]);
+
+        let low = row(
+            &rows,
+            "Weapon",
+            "explicit",
+            "local_minimum_added_fire_damage",
+        );
+        assert_eq!(low.display, "Adds # to # Fire Damage");
+        assert_eq!(low.value_index, 1);
+        assert_eq!(low.p50, Some(27.0), "两把武器的最小火伤是 27 和 31");
+
+        let high = row(
+            &rows,
+            "Weapon",
+            "explicit",
+            "local_maximum_added_fire_damage",
+        );
+        assert_eq!(high.display, "Adds # to # Fire Damage");
+        assert_eq!(high.value_index, 2);
+    }
+
+    /// "第几个数"那个标记只在一句话里真有两个数时才该出现。
+    #[test]
+    fn only_a_line_with_two_numbers_needs_a_value_marker() {
+        let rows = aggregate_mods(&[weapon_bearer(27, 68), alpha()]);
+        assert!(
+            row(
+                &rows,
+                "Weapon",
+                "explicit",
+                "local_maximum_added_fire_damage"
+            )
+            .needs_value_marker()
+        );
+        assert!(
+            !row(&rows, "Ring", "explicit", "base_maximum_life").needs_value_marker(),
+            "+# to maximum Life 只有一个数,补个序号只是噪音"
+        );
+        // 连文本都没配上的行更没有什么可标的。
+        assert!(!row(&rows, "BodyArmour", "explicit", "cannot_be_frozen").needs_value_marker());
+    }
+
+    /// 同一条 stat 在不同装备上偶尔会印出不一样的话(`+16%` / `16%`,或者
+    /// 一次配错)。一行只能挂一句,所以挑**出现次数最多**的那句;打平了按
+    /// 字典序,同样的输入永远给同样的结果。
+    #[test]
+    fn the_row_keeps_the_wording_most_of_its_items_agreed_on() {
+        let rows = aggregate_mods(&[
+            ring_bearer(16, "+16% to all Elemental Resistances"),
+            ring_bearer(14, "+14% to all Elemental Resistances"),
+            ring_bearer(12, "12% to all Elemental Resistances"),
+        ]);
+        let resist = row(&rows, "Ring", "explicit", "base_resist_all_elements_%");
+        assert_eq!(resist.characters, 3);
+        assert_eq!(resist.display, "+#% to all Elemental Resistances");
     }
 
     #[test]

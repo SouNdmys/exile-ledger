@@ -86,6 +86,8 @@ CREATE TABLE IF NOT EXISTS ninja_item_mods (
     rarity TEXT NOT NULL,
     mod_kind TEXT NOT NULL,
     stat_id TEXT NOT NULL,
+    display TEXT NOT NULL DEFAULT '',
+    value_index INTEGER NOT NULL DEFAULT 0,
     mod_family TEXT NOT NULL,
     characters INTEGER NOT NULL,
     occurrences INTEGER NOT NULL,
@@ -137,30 +139,37 @@ fn add_primary_currency_column(conn: &Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// 2026-09-07 加的一维:词缀统计现在**按职业分**,`class` 是主键的一列。
+/// 词缀统计表少了哪一列都整张删掉重建。
 ///
-/// 这一次不能像 `primary_currency` 那样 `ALTER TABLE ADD COLUMN` 了事:SQLite
-/// 改不动一张已经存在的表的主键,而新列不进主键的话,十几个职业的行会在插库时
-/// 全撞进同一个键 —— 表面上有数据,实际只剩最后一个职业的那份。所以老表整张
-/// 删掉,让 `CREATE TABLE IF NOT EXISTS` 按新形状重建。
+/// 两次加列都走这条路,而不是 `ALTER TABLE ADD COLUMN`:
+///
+/// - 2026-09-07 加的 `class` 进了主键,而 SQLite 改不动一张已有表的主键。
+///   新列不进主键的话,十几个职业的行会在插库时全撞进同一个键 ——
+///   表面上有数据,实际只剩最后一个职业那份。
+/// - 同日加的 `display` / `value_index`(游戏里那句话 + 这一行数的是第几个数)
+///   本可以 `ADD COLUMN`,但补出来的老行会是一片空白,词缀页就得挂着一整屏
+///   没有文本的行等到下一次聚合。整张删掉,那一屏根本不会出现。
 ///
 /// 删得起:这张表是从 `ninja_characters` 里的详情原文算出来的派生数据,采样线程
 /// 进角色那一步、每 50 个角色、收尾时各重建一次,一个网络请求都不用发。
 ///
 /// 必须**在建表语句之前**跑:删完还得有人把它建回来。
-fn drop_item_mods_without_class(conn: &Connection) -> Result<(), StorageError> {
+fn drop_stale_item_mods(conn: &Connection) -> Result<(), StorageError> {
+    /// 少一个就重建。以后再加列往这儿添一个名字即可。
+    const REQUIRED: [&str; 3] = ["class", "display", "value_index"];
+
     let mut columns = conn.prepare("PRAGMA table_info(ninja_item_mods)")?;
     let names = columns.query_map([], |row| row.get::<_, String>(1))?;
     // 表还不存在时 `table_info` 一行都不给 —— 那就没有什么可删的。
-    let mut exists = false;
+    let mut present: Vec<String> = Vec::new();
     for name in names {
-        exists = true;
-        if name? == "class" {
-            return Ok(());
-        }
+        present.push(name?);
     }
     drop(columns);
-    if exists {
+    let complete = REQUIRED
+        .iter()
+        .all(|wanted| present.iter().any(|name| name == wanted));
+    if !present.is_empty() && !complete {
         conn.execute_batch("DROP TABLE ninja_item_mods")?;
     }
     Ok(())
@@ -343,7 +352,7 @@ impl NinjaStore {
         // 采样线程和界面线程各开一个连接读同一个文件,5 秒足够错开一次写事务。
         conn.busy_timeout(Duration::from_secs(5))?;
         // 顺序有讲究:老词缀表得在建表语句**之前**删掉,不然没人把它建回来。
-        drop_item_mods_without_class(&conn)?;
+        drop_stale_item_mods(&conn)?;
         conn.execute_batch(NINJA_SCHEMA)?;
         add_primary_currency_column(&conn)?;
         Ok(Self { conn })
@@ -684,9 +693,10 @@ impl NinjaStore {
         {
             let mut insert = tx.prepare(
                 "INSERT OR REPLACE INTO ninja_item_mods
-                     (league_url, version, class, slot, rarity, mod_kind, stat_id, mod_family,
+                     (league_url, version, class, slot, rarity, mod_kind, stat_id,
+                      display, value_index, mod_family,
                       characters, occurrences, sample_size, p25, p50, p75)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             )?;
             for stat in stats {
                 insert.execute(params![
@@ -697,6 +707,8 @@ impl NinjaStore {
                     stat.rarity,
                     stat.mod_kind,
                     stat.stat_id,
+                    stat.display,
+                    i64::from(stat.value_index),
                     stat.mod_family,
                     i64::from(stat.characters),
                     i64::from(stat.occurrences),
@@ -784,7 +796,7 @@ impl NinjaStore {
         min_share_percent: f64,
     ) -> Result<Vec<SlotModStat>, StorageError> {
         let mut statement = self.conn.prepare(
-            "SELECT class, slot, rarity, mod_kind, stat_id, mod_family,
+            "SELECT class, slot, rarity, mod_kind, stat_id, display, value_index, mod_family,
                     characters, occurrences, sample_size, p25, p50, p75
              FROM ninja_item_mods
              WHERE league_url = ?1 AND version = ?2
@@ -1052,22 +1064,25 @@ fn character_row_from_row(row: &Row<'_>) -> rusqlite::Result<CharacterRow> {
 }
 
 fn slot_mod_from_row(row: &Row<'_>) -> rusqlite::Result<SlotModStat> {
-    let characters: i64 = row.get(6)?;
-    let occurrences: i64 = row.get(7)?;
-    let sample_size: i64 = row.get(8)?;
+    let value_index: i64 = row.get(6)?;
+    let characters: i64 = row.get(8)?;
+    let occurrences: i64 = row.get(9)?;
+    let sample_size: i64 = row.get(10)?;
     Ok(SlotModStat {
         class: row.get(0)?,
         slot: row.get(1)?,
         rarity: row.get(2)?,
         mod_kind: row.get(3)?,
         stat_id: row.get(4)?,
-        mod_family: row.get(5)?,
+        display: row.get(5)?,
+        value_index: u8::try_from(value_index).unwrap_or(0),
+        mod_family: row.get(7)?,
         characters: to_u32(characters),
         occurrences: to_u32(occurrences),
         sample_size: to_u32(sample_size),
-        p25: row.get(9)?,
-        p50: row.get(10)?,
-        p75: row.get(11)?,
+        p25: row.get(11)?,
+        p50: row.get(12)?,
+        p75: row.get(13)?,
     })
 }
 
@@ -1140,6 +1155,8 @@ mod ninja_tests {
             rarity: rarity.to_owned(),
             mod_kind: "explicit".to_owned(),
             stat_id: stat_id.to_owned(),
+            display: "+# to maximum Life".to_owned(),
+            value_index: 1,
             mod_family: "IncreasedLife".to_owned(),
             characters,
             occurrences: characters + 1,
@@ -2052,6 +2069,125 @@ mod ninja_tests {
         );
     }
 
+    /// 游戏里那句话要跟着行一起存,不然界面每次都得回头翻角色原文重算一遍。
+    #[test]
+    fn a_mod_row_round_trips_its_in_game_text() {
+        let store = store();
+        let low = SlotModStat {
+            stat_id: "local_minimum_added_fire_damage".to_owned(),
+            display: "Adds # to # Fire Damage".to_owned(),
+            value_index: 1,
+            ..stat("Weapon", "Rare", "x", 10, 20)
+        };
+        let high = SlotModStat {
+            stat_id: "local_maximum_added_fire_damage".to_owned(),
+            value_index: 2,
+            ..low.clone()
+        };
+        // 配不上的行照样要存得下:空串 + 0。
+        let blank = SlotModStat {
+            stat_id: "cannot_be_frozen".to_owned(),
+            display: String::new(),
+            value_index: 0,
+            ..low.clone()
+        };
+        store
+            .replace_item_mods(LEAGUE, VERSION, &[low, high, blank])
+            .expect("replace");
+
+        let rows = store
+            .slot_mods(LEAGUE, VERSION, None, None, 0.0)
+            .expect("read");
+        let of = |stat_id: &str| {
+            rows.iter()
+                .find(|row| row.stat_id == stat_id)
+                .unwrap_or_else(|| panic!("no row for {stat_id}"))
+                .clone()
+        };
+        assert_eq!(
+            (
+                of("local_minimum_added_fire_damage").display,
+                of("local_minimum_added_fire_damage").value_index
+            ),
+            ("Adds # to # Fire Damage".to_owned(), 1)
+        );
+        assert_eq!(of("local_maximum_added_fire_damage").value_index, 2);
+        assert_eq!(
+            (
+                of("cannot_be_frozen").display,
+                of("cannot_be_frozen").value_index
+            ),
+            (String::new(), 0)
+        );
+    }
+
+    /// 已经升过一次(有 `class`)但还没有显示文本的库也得能再升一次。
+    ///
+    /// 老行没有那两列,读它会直接报错;而这张表是从角色原文算出来的派生数据,
+    /// 整张删掉、下一个检查点重建即可,一个网络请求都不用发。
+    #[test]
+    fn a_cache_without_the_display_columns_gets_rebuilt() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.execute_batch(
+            "CREATE TABLE ninja_item_mods (
+                 league_url TEXT NOT NULL,
+                 version TEXT NOT NULL,
+                 class TEXT NOT NULL DEFAULT '',
+                 slot TEXT NOT NULL,
+                 rarity TEXT NOT NULL,
+                 mod_kind TEXT NOT NULL,
+                 stat_id TEXT NOT NULL,
+                 mod_family TEXT NOT NULL,
+                 characters INTEGER NOT NULL,
+                 occurrences INTEGER NOT NULL,
+                 sample_size INTEGER NOT NULL,
+                 p25 REAL,
+                 p50 REAL,
+                 p75 REAL,
+                 PRIMARY KEY (league_url, version, class, slot, rarity, mod_kind, stat_id)
+             ) STRICT;
+             INSERT INTO ninja_item_mods VALUES
+                 ('forbiddenrites', '1508-20260906-55820', '', 'Ring', 'Rare', 'explicit',
+                  'base_maximum_life', 'IncreasedLife', 900, 901, 1000, 95.0, 115.0, 135.0);",
+        )
+        .expect("class-era schema");
+
+        let store = NinjaStore::initialize(conn).expect("upgrade");
+        assert!(
+            store
+                .slot_mods(LEAGUE, VERSION, None, None, 0.0)
+                .expect("read")
+                .is_empty(),
+            "老行没有显示文本这两列,留着只会是一半新一半旧"
+        );
+
+        // 重建出来的表装得下新字段。
+        store
+            .replace_item_mods(
+                LEAGUE,
+                VERSION,
+                &[stat("Ring", "Rare", "base_maximum_life", 9, 20)],
+            )
+            .expect("replace");
+        assert_eq!(
+            store
+                .slot_mods(LEAGUE, VERSION, None, None, 0.0)
+                .expect("read")[0]
+                .display,
+            "+# to maximum Life"
+        );
+
+        // 升级那一步每次开库都走一遍,第二遍必须是空操作。
+        drop_stale_item_mods(&store.conn).expect("second run");
+        assert_eq!(
+            store
+                .slot_mods(LEAGUE, VERSION, None, None, 0.0)
+                .expect("read")
+                .len(),
+            1
+        );
+    }
+
     /// 2026-09-07 之前建的库必须能原地升级。
     ///
     /// 这一列进了主键,而 SQLite 改不动已有表的主键:不整张删掉重建,
@@ -2112,7 +2248,7 @@ mod ninja_tests {
 
         // 升级那一步每次开库都走一遍,第二遍必须是空操作 —— 不然每次开程序
         // 都把统计清一次。
-        drop_item_mods_without_class(&store.conn).expect("second run");
+        drop_stale_item_mods(&store.conn).expect("second run");
         assert_eq!(
             store
                 .slot_mods_of_kind(LEAGUE, VERSION, None, None, None, Some("Deadeye"), 0.0)

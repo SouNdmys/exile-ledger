@@ -1,0 +1,84 @@
+{
+  "itemSlot": 7,
+  "itemData": {
+    "inventoryId": "Weapon",
+    "name": "Phoenix Edge",
+    "typeLine": "Soaring Spear",
+    "baseType": "Soaring Spear",
+    "rarity": "Rare",
+    "frameType": 2,
+    "ilvl": 74,
+    "corrupted": false,
+    "desecrated": false,
+    "mods": {
+      "implicit": [
+        {
+          "id": "SpearImplicitDisplaySpearThrow1",
+          "stats": {
+            "local_display_grants_spear_throw_skill": 1
+          }
+        }
+      ],
+      "explicit": [
+        {
+          "id": "LifeGainedFromEnemyDeath5",
+          "stats": {
+            "base_life_gained_on_enemy_death": 30
+          }
+        },
+        {
+          "id": "LocalIncreasedAttackSpeed7",
+          "stats": {
+            "local_attack_speed_+%": 25
+          }
+        },
+        {
+          "id": "LocalAddedLightningDamage4",
+          "stats": {
+            "local_minimum_added_lightning_damage": 1,
+            "local_maximum_added_lightning_damage": 46
+          }
+        },
+        {
+          "id": "LocalCriticalMultiplier6",
+          "stats": {
+            "local_critical_strike_multiplier_+": 24
+          }
+        },
+        {
+          "id": "LocalAddedColdDamage6",
+          "stats": {
+            "local_minimum_added_cold_damage": 29,
+            "local_maximum_added_cold_damage": 38
+          }
+        }
+      ],
+      "crafted": [
+        {
+          "id": "AlloyAccuracyAttackSpeedHybrid1",
+          "stats": {
+            "accuracy_rating": 400,
+            "local_attack_speed_+%": 6
+          }
+        }
+      ]
+    },
+    "implicitMods": [],
+    "explicitMods": [
+      "Adds 29 to 38 [Cold|Cold] Damage",
+      "Adds 1 to 46 [Lightning|Lightning] Damage",
+      "+24% to [CriticalDamageBonus|Critical Damage Bonus]",
+      "25% increased [Attack] Speed",
+      "Gain 30 Life per enemy killed"
+    ],
+    "craftedMods": [
+      "+400 to [Accuracy|Accuracy] Rating",
+      "6% increased [Attack] Speed"
+    ],
+    "desecratedMods": [],
+    "runeMods": [
+      "5% increased [Attack] Speed"
+    ],
+    "enchantMods": []
+  }
+}

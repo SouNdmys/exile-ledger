@@ -513,6 +513,8 @@ mod ninja_tests {
             rarity: "Rare".to_owned(),
             mod_kind: "explicit".to_owned(),
             stat_id: "base_maximum_life".to_owned(),
+            display: "+# to maximum Life".to_owned(),
+            value_index: 1,
             mod_family: "IncreasedLife".to_owned(),
             characters,
             occurrences: characters,

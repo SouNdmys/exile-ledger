@@ -226,6 +226,13 @@ catalogue! {
     mods_rarity_label,
     mods_kind_label,
     mods_col_stat,
+    /// 内部 stat id 那一列。它认不出来是什么,但同名的两行(最小/最大火伤)
+    /// 只能靠它分辨,所以留着,只是让到后面去。
+    mods_col_stat_id,
+    /// 一句话里有两个数时,给它补一句"这一行数的是第几个"。
+    /// 第一个 `{}` 是那句话本身,第二个是 1 起的序号。
+    /// 括号写在模板里 —— 中文用全角,和职业下拉那条一样。
+    mods_value_ordinal,
     mods_col_family,
     mods_col_characters_percent,
     mods_col_characters,
@@ -604,7 +611,9 @@ pub static ENGLISH: Text = Text {
     mods_slot_label: "Slot",
     mods_rarity_label: "Rarity",
     mods_kind_label: "Kind",
-    mods_col_stat: "Stat",
+    mods_col_stat: "Modifier",
+    mods_col_stat_id: "Stat id",
+    mods_value_ordinal: "{} (number #{})",
     mods_col_family: "Family",
     mods_col_characters_percent: "Share",
     mods_col_characters: "Characters",
@@ -890,6 +899,8 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     mods_rarity_label: "稀有度",
     mods_kind_label: "词缀类型",
     mods_col_stat: "词缀",
+    mods_col_stat_id: "内部 id",
+    mods_value_ordinal: "{}(第 {} 个数)",
     mods_col_family: "归并到",
     mods_col_characters_percent: "携带比例",
     mods_col_characters: "人数",
