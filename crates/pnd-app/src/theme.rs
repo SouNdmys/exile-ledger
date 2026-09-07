@@ -31,6 +31,21 @@ pub const SELECTED: u32 = 0x232B3A;
 /// 按下底。
 pub const PRESSED: u32 = 0x283040;
 
+/// 表格里"选中那一行"的覆盖层颜色。
+///
+/// 为什么不直接用 `SELECTED`:上游的表格不是把选中画成行的底色,而是在
+/// 整行**上面**盖一块绝对定位的方块(`table/state.rs` 的 `render_table_row`,
+/// 那块 `div().absolute().bg(table_active)` 是行的最后一个子元素)。这个画法
+/// 只有在方块半透明时才成立 —— 上游自己在 `ThemeConfig::apply_colors` 里
+/// 把 `table_active` 的不透明度掐到 0.2 来保证这一点。我们是直接往
+/// `ThemeColor` 上写值、绕过了那一步,于是一块不透明的方块正好把整行字盖住。
+///
+/// 这个更亮的灰蓝按 [`SELECTED_ALPHA`] 压在 [`PANEL`] 上,合成出来正好是
+/// `SELECTED`:看上去还是原来那个选中底,但字透得出来。
+pub const SELECTED_WASH: u32 = 0x536B96;
+/// 选中覆盖层的不透明度。和上游给自己定的上限一致。
+pub const SELECTED_ALPHA: f32 = 0.2;
+
 /// 最轻的分隔线(表格行线)。
 pub const HAIRLINE_SOFT: u32 = 0x222834;
 /// 常规边框。
@@ -107,6 +122,51 @@ pub fn warn_amber() -> Rgba {
 /// 安静的灰:列标题、脚注、单位。
 pub fn muted() -> Rgba {
     c(TEXT_META)
+}
+
+/// 一块半透明的颜色压在底色上之后,眼睛真正看到的那个颜色。
+///
+/// 有它才能回答"这行字压在选中层下面还读得清吗" —— 覆盖层的颜色本身
+/// 不是任何一格的背景,合成出来的才是。
+#[must_use]
+pub fn blend(top: u32, alpha: f32, bottom: u32) -> u32 {
+    let alpha = alpha.clamp(0.0, 1.0);
+    let mix = |shift: u32| {
+        let top = f32::from(((top >> shift) & 0xFF) as u8);
+        let bottom = f32::from(((bottom >> shift) & 0xFF) as u8);
+        (top * alpha + bottom * (1.0 - alpha))
+            .round()
+            .clamp(0.0, 255.0) as u32
+    };
+    (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
+
+/// 选中那一行的格子,底下实际是什么颜色。
+#[must_use]
+pub fn selected_row_bg() -> u32 {
+    blend(SELECTED_WASH, SELECTED_ALPHA, PANEL)
+}
+
+/// 两个颜色的对比度,和 WCAG 一个口径(4.5:1 是正文的线)。
+///
+/// 深色盘只有一套,没人替它把关就没人把关了:每加一个语气色都得先过这一关。
+#[must_use]
+pub fn contrast_ratio(one: u32, other: u32) -> f32 {
+    let (a, b) = (relative_luminance(one), relative_luminance(other));
+    let (light, dark) = if a > b { (a, b) } else { (b, a) };
+    (light + 0.05) / (dark + 0.05)
+}
+
+fn relative_luminance(hex: u32) -> f32 {
+    let channel = |shift: u32| {
+        let value = f32::from(((hex >> shift) & 0xFF) as u8) / 255.0;
+        if value <= 0.03928 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +296,9 @@ fn apply_app_colors(colors: &mut ThemeColor) {
 
     // 表格(斑马行 = ZEBRA)
     colors.table = h(PANEL);
-    colors.table_active = h(SELECTED);
+    // 半透明:上游把"选中"画成盖在格子**上面**的一块方块,不透明的话
+    // 整行字都在它下面。理由写在 `SELECTED_WASH` 那儿。
+    colors.table_active = h(SELECTED_WASH).alpha(SELECTED_ALPHA);
     colors.table_active_border = h(ACCENT);
     colors.table_even = h(ZEBRA);
     colors.table_head = h(RAIL);
@@ -296,8 +358,9 @@ fn apply_app_colors(colors: &mut ThemeColor) {
 #[cfg(test)]
 mod theme_tests {
     use super::{
-        ACCENT, CANVAS, DANGER, FRESH, PANEL, TEXT_META, TEXT_PRIMARY, WARN, accent,
-        apply_app_colors, c, hit_green, muted, warn_amber,
+        ACCENT, CANVAS, DANGER, FRESH, PANEL, SELECTED, SELECTED_ALPHA, SELECTED_WASH, TEXT_META,
+        TEXT_PRIMARY, WARN, accent, apply_app_colors, blend, c, contrast_ratio, hit_green, muted,
+        selected_row_bg, warn_amber,
     };
 
     /// 正文对面板必须读得清。深色盘只有一套,没人替它把关就没人把关了。
@@ -306,15 +369,45 @@ mod theme_tests {
     #[test]
     fn body_text_reads_against_the_panel() {
         assert!(
-            contrast(TEXT_PRIMARY, PANEL) >= 4.5,
+            contrast_ratio(TEXT_PRIMARY, PANEL) >= 4.5,
             "正文 {:.2}:1",
-            contrast(TEXT_PRIMARY, PANEL)
+            contrast_ratio(TEXT_PRIMARY, PANEL)
         );
         assert!(
-            contrast(TEXT_META, PANEL) >= 3.0,
+            contrast_ratio(TEXT_META, PANEL) >= 3.0,
             "元信息 {:.2}:1",
-            contrast(TEXT_META, PANEL)
+            contrast_ratio(TEXT_META, PANEL)
         );
+    }
+
+    /// 选中那一行的覆盖层必须是半透明的。
+    ///
+    /// 不透明的话,上游那块盖在格子上面的方块会把整行字吃掉 —— 屏幕上就是
+    /// 一条选中了、却一个字都没有的行。上游给自己定的上限是 0.2,我们照抄。
+    #[test]
+    fn the_selected_row_overlay_stays_translucent() {
+        let mut colors = gpui_component::theme::ThemeColor::default();
+        apply_app_colors(&mut colors);
+        assert!(
+            colors.table_active.a <= 0.2,
+            "选中层的不透明度是 {},字会被盖住",
+            colors.table_active.a
+        );
+    }
+
+    /// 半透明之后眼睛看到的仍然是原来那个选中底 —— 修的是画法,不是配色。
+    #[test]
+    fn the_translucent_overlay_still_looks_like_the_selected_colour() {
+        assert_eq!(blend(SELECTED_WASH, SELECTED_ALPHA, PANEL), SELECTED);
+        assert_eq!(selected_row_bg(), SELECTED);
+    }
+
+    /// `blend` 的两个端点:全透明 = 底色,全不透明 = 覆盖色。
+    #[test]
+    fn blending_at_the_extremes_is_a_plain_pick() {
+        assert_eq!(blend(SELECTED_WASH, 0.0, PANEL), PANEL);
+        assert_eq!(blend(SELECTED_WASH, 1.0, PANEL), SELECTED_WASH);
+        assert!((contrast_ratio(PANEL, PANEL) - 1.0).abs() < 0.001);
     }
 
     /// 三个语义色必须互不相同,否则"命中"和"退避"在屏幕上是一个东西。
@@ -340,26 +433,5 @@ mod theme_tests {
         assert_eq!(colors.background, super::h(CANVAS));
         assert_eq!(colors.primary, super::h(ACCENT));
         assert_eq!(colors.success, super::h(FRESH));
-    }
-
-    fn channel(value: f32) -> f32 {
-        if value <= 0.03928 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        }
-    }
-
-    fn luminance(hex: u32) -> f32 {
-        let red = channel(((hex >> 16) & 0xFF) as f32 / 255.0);
-        let green = channel(((hex >> 8) & 0xFF) as f32 / 255.0);
-        let blue = channel((hex & 0xFF) as f32 / 255.0);
-        0.2126 * red + 0.7152 * green + 0.0722 * blue
-    }
-
-    fn contrast(one: u32, other: u32) -> f32 {
-        let (a, b) = (luminance(one), luminance(other));
-        let (light, dark) = if a > b { (a, b) } else { (b, a) };
-        (light + 0.05) / (dark + 0.05)
     }
 }

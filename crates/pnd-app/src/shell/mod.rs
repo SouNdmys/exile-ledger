@@ -14,15 +14,17 @@ pub mod ninja;
 pub mod pages;
 
 use std::collections::{BTreeMap, VecDeque};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
-    ParentElement, Render, SharedString, Styled, Window, div, px,
+    App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, InteractiveElement as _,
+    IntoElement, ParentElement, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::select::{SearchableVec, SelectEvent, SelectItem, SelectState};
-use gpui_component::table::TableState;
+use gpui_component::table::{TableEvent, TableState};
 use gpui_component::{IndexPath, Selectable as _, Sizable as _, Size, StyledExt as _};
 
 use pnd_domain::{CurrencyRates, WatchId};
@@ -32,12 +34,13 @@ use pnd_storage::{AlertRow, NinjaStore, WatchStore};
 use pnd_trade::BucketUsage;
 
 use crate::i18n;
+use crate::logbook::{self, LOG_CAPACITY};
 use crate::theme::*;
 use ninja::NinjaData;
 use pages::SimpleTable;
 
-/// 状态行只显示最后一条,但留一小段历史,方便将来做"日志"抽屉。
-const LOG_CAPACITY: usize = 120;
+/// 日志抽屉的高度。够看十来行,又不至于把它下面的页面挤没。
+const H_LOG_PANE: f32 = 200.0;
 /// 左导航宽度。中文四个字 + 内边距,英文最长的 "Modifier heat" 也放得下。
 const W_NAV: f32 = 136.0;
 /// 一句话通知("已保存")挂多久。够看清,又不会一直杵在那儿。
@@ -207,6 +210,13 @@ pub struct AppShell {
     /// 盘上那份设置是更新版本写的:读得了,存不得。
     pub(crate) read_only: bool,
     pub(crate) log: VecDeque<String>,
+    /// 日志抽屉开着没有。状态行左边那个"日志"按钮拨它。
+    pub(crate) log_open: bool,
+    /// 每一行还要往这个文件里追一份 —— 程序关掉之后内存里那份就没了。
+    pub(crate) log_path: PathBuf,
+    /// 抽屉里那块滚动区。新的一行进来就把它滚到底,否则最要紧的那条永远
+    /// 在屏幕外。
+    log_scroll: ScrollHandle,
     /// 状态行上那句话("已保存"、"保存失败:…")。空串 = 显示最后一条日志。
     pub(crate) notice: String,
     notice_at: Option<Instant>,
@@ -257,6 +267,11 @@ pub struct AppShell {
     pub(crate) ninja: NinjaData,
     /// 新增搜索表单下面那行红字。空串 = 没有错。
     pub(crate) watch_error: String,
+    /// 表格里刚被选中的那一行,等着填进蹲价表单。
+    ///
+    /// 单独一个标志的理由和 `ninja_filters_dirty` 一样:写输入框要
+    /// `&mut Window`,而发出"选中了第几行"那条事件的订阅回调手上没有窗口。
+    pub(crate) watches_form_load: Option<usize>,
 
     /// 表格内容要重建了。行是每次整份换掉的,没有这四个标志就得每拍重建。
     pub(crate) watches_dirty: bool,
@@ -307,11 +322,13 @@ impl AppShell {
         let language = settings.ui_language.clone();
         let text = i18n::text(&language);
 
-        let mut log = VecDeque::new();
+        // 开窗之前的这几行先攒着:`push_log` 要脱敏、要落盘,而那两件事都得
+        // 等外壳自己造出来(日志文件的位置存在它身上)。造完立刻补记。
+        let mut boot_log: Vec<String> = Vec::new();
         let mut notice = String::new();
         let read_only = match &loaded.status {
             pnd_settings::LoadStatus::FutureSchemaReadOnly { detected } => {
-                log.push_back(format!("settings: schema {detected} is newer than ours"));
+                boot_log.push(format!("settings: schema {detected} is newer than ours"));
                 notice = text.settings_read_only.to_owned();
                 true
             }
@@ -321,13 +338,13 @@ impl AppShell {
             } => {
                 // 设置读不动是必须当场看见的事:不说的话页面看起来就像
                 // 一次全新安装,用户的搜索列表"没了"。
-                log.push_back(format!("settings: {reason}"));
+                boot_log.push(format!("settings: {reason}"));
                 notice = format!("settings moved aside: {}", backup_path.display());
                 false
             }
             pnd_settings::LoadStatus::Loaded | pnd_settings::LoadStatus::Defaults => false,
         };
-        log.push_back(format!("settings: {}", settings_store.path().display()));
+        boot_log.push(format!("settings: {}", settings_store.path().display()));
 
         // 后台三件套。每一件失败都只是少一半功能,不该拦着窗口开出来:
         // actor 没起来还能看历史、改设置;卡片没起来提醒仍然进记录页。
@@ -369,9 +386,7 @@ impl AppShell {
                 None
             }
         };
-        for line in startup {
-            log.push_back(line);
-        }
+        boot_log.extend(startup);
 
         // 120ms 心跳。频率照兄弟项目:比一帧慢得多,又快到让"点了按钮"和
         // "屏幕上有反应"之间看不出间隔。视图没了(窗口关掉)`update` 会报错,
@@ -395,6 +410,15 @@ impl AppShell {
         let watches_form = pages::watches::WatchesForm::new(&settings, text, window, cx);
 
         let watches_table = new_table(pages::watches::table_content(text), window, cx);
+        // 选中一行 = "我要改这一条"。真正把值填进表单要 `&mut Window`,
+        // 这里只记下是第几行,下一帧 `sync_watch_form` 去填。
+        cx.subscribe(&watches_table, |this: &mut AppShell, _, event, cx| {
+            if let TableEvent::SelectRow(row) = event {
+                this.watches_form_load = Some(*row);
+                cx.notify();
+            }
+        })
+        .detach();
         let alerts_table = new_table(pages::alerts::table_content(text), window, cx);
         let uniques_table = new_table(pages::ninja_uniques::table_content(text), window, cx);
         let mods_table = new_table(pages::ninja_mods::table_content(text), window, cx);
@@ -450,7 +474,10 @@ impl AppShell {
             settings_store,
             settings,
             read_only,
-            log,
+            log: VecDeque::new(),
+            log_open: false,
+            log_path: crate::app_log_path(),
+            log_scroll: ScrollHandle::new(),
             notice,
             notice_at: None,
             runtime,
@@ -474,6 +501,7 @@ impl AppShell {
             alert_rows: Vec::new(),
             ninja,
             watch_error: String::new(),
+            watches_form_load: None,
             // 四张表现在还是空的(列已经有了):第一拍就会填上真数据。
             watches_dirty: true,
             alerts_dirty: true,
@@ -496,6 +524,9 @@ impl AppShell {
             mods_rarity_select,
             mods_kind_select,
         };
+        for line in boot_log {
+            shell.push_log(line);
+        }
         shell.refresh_alerts();
         shell.reload_ninja();
         shell
@@ -506,12 +537,35 @@ impl AppShell {
         i18n::text(&self.language)
     }
 
-    /// 往日志里追一行,满了就丢最老的。
+    /// 往日志里追一行:**先脱敏**,再进抽屉,再落盘。
+    ///
+    /// 脱敏只在这一处做。日志有四五个来源(后台 actor、登录窗、卡片线程、
+    /// 界面自己),每处各记各的迟早会漏一处,而漏出去的那一行会同时出现在
+    /// 状态行上和盘上的 `app.log` 里。
     pub(crate) fn push_log(&mut self, line: String) {
+        let line = logbook::redact_for_log(&line);
+        logbook::append_line(&self.log_path, &line);
         if self.log.len() >= LOG_CAPACITY {
             self.log.pop_front();
         }
         self.log.push_back(line);
+        // 抽屉开着的时候新行要自己滚进视野:最要紧的永远是最后一条。
+        if self.log_open {
+            self.log_scroll.scroll_to_bottom();
+        }
+    }
+
+    /// 抽屉里那几行整份复制走。出问题要贴给别人看的时候,一行行选是不现实的。
+    fn copy_log(&mut self, cx: &mut Context<Self>) {
+        let text = self.text();
+        let body = self
+            .log
+            .iter()
+            .cloned()
+            .collect::<Vec<String>>()
+            .join("\r\n");
+        cx.write_to_clipboard(ClipboardItem::new_string(body));
+        self.set_notice(text.log_copied.to_owned());
     }
 
     /// 状态行上那句会自己消失的话。
@@ -741,8 +795,9 @@ impl AppShell {
             }))
     }
 
-    /// 底部状态行:有通知就说通知,否则说最后一条日志。
-    fn status_bar(&self) -> gpui::Div {
+    /// 底部状态行:有通知就说通知,否则说最后一条日志,左边挂一个日志开关。
+    fn status_bar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let text = self.text();
         let (line, tone) = if self.notice.is_empty() {
             (self.log.back().cloned().unwrap_or_default(), muted())
         } else if self.read_only {
@@ -751,17 +806,118 @@ impl AppShell {
             (self.notice.clone(), c(ACCENT_TEXT))
         };
         div()
-            .h(px(24.))
+            .h(px(26.))
             .flex_none()
-            .flex()
+            .h_flex()
             .items_center()
-            .px(px(10.))
+            .gap(px(8.))
+            .px(px(6.))
             .bg(c(RAIL))
             .border_t_1()
             .border_color(c(HAIRLINE))
-            .text_size(fs(FS_11))
-            .text_color(tone)
-            .child(SharedString::from(line))
+            .child(
+                Button::new("log-toggle")
+                    .ghost()
+                    .xsmall()
+                    .selected(self.log_open)
+                    .label(text.log_toggle)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.log_open = !this.log_open;
+                        if this.log_open {
+                            this.log_scroll.scroll_to_bottom();
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(fs(FS_11))
+                    .text_color(tone)
+                    .child(SharedString::from(line)),
+            )
+    }
+
+    /// 日志抽屉:最近三百行,新的在下面。
+    ///
+    /// 状态行只放得下一条,而"刚才那一串到底发生了什么"要连着看才成句。
+    /// 复制按钮把整份丢进剪贴板 —— 出问题时要贴出去的就是这一整段。
+    fn log_pane(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let text = self.text();
+        let lines: Vec<SharedString> = self
+            .log
+            .iter()
+            .map(|line| SharedString::from(line.clone()))
+            .collect();
+        panel()
+            .flex_none()
+            .h(px(H_LOG_PANE))
+            .child(
+                div()
+                    .flex_none()
+                    .h_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(8.))
+                    .py(px(4.))
+                    .border_b_1()
+                    .border_color(c(HAIRLINE))
+                    .child(
+                        div()
+                            .text_size(fs(FS_11_5))
+                            .text_color(c(TEXT_SECONDARY))
+                            .child(text.log_toggle),
+                    )
+                    .child(
+                        // 盘上那份在哪儿,得说出来:关掉程序之后要翻的是它。
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .font_family(FONT_MONO)
+                            .text_size(fs(FS_10_5))
+                            .text_color(muted())
+                            .child(SharedString::from(i18n::fill(
+                                text.log_file_path,
+                                &[&self.log_path.display().to_string()],
+                            ))),
+                    )
+                    .child(
+                        Button::new("log-copy")
+                            .ghost()
+                            .xsmall()
+                            .label(text.log_copy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.copy_log(cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("log-lines")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.log_scroll)
+                    .flex()
+                    .flex_col()
+                    .px(px(8.))
+                    .py(px(4.))
+                    .font_family(FONT_MONO)
+                    .text_size(fs(FS_10_5))
+                    .text_color(c(TEXT_DATA))
+                    .children(
+                        lines
+                            .is_empty()
+                            .then(|| div().text_color(muted()).child(text.log_empty)),
+                    )
+                    .children(lines.into_iter().map(|line| div().child(line))),
+            )
     }
 }
 
@@ -770,6 +926,7 @@ impl Render for AppShell {
         self.sync_language(window, cx);
         self.sync_ninja_filters(window, cx);
         self.sync_poesessid_field(window, cx);
+        self.sync_watch_form(window, cx);
         let text = self.text();
 
         let body = match self.page {
@@ -828,7 +985,8 @@ impl Render for AppShell {
                     .child(self.nav_rail(cx))
                     .child(body.flex_1().min_w(px(0.)).min_h(px(0.))),
             )
-            .child(self.status_bar())
+            .children(self.log_open.then(|| self.log_pane(cx)))
+            .child(self.status_bar(cx))
     }
 }
 
@@ -928,11 +1086,15 @@ pub(crate) fn hint(body: impl Into<SharedString>) -> gpui::Div {
 }
 
 /// 一张表格。四页共用同一套外观参数,免得每页各调一份。
+///
+/// `stripe(false)`:上游的斑马开关顺手会在数据行下面补一批空的假行把表铺满,
+/// 那串没有内容的条纹看起来像"还有几条正在加载"。条纹改由 `SimpleTable`
+/// 自己的 `render_tr` 画,只画真行。
 pub(crate) fn table(
     state: &Entity<TableState<SimpleTable>>,
 ) -> gpui_component::table::Table<SimpleTable> {
     gpui_component::table::Table::new(state)
-        .stripe(true)
+        .stripe(false)
         .bordered(false)
         .with_size(Size::XSmall)
 }

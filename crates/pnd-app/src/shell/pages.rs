@@ -15,7 +15,10 @@ pub mod ninja_uniques;
 pub mod settings;
 pub mod watches;
 
-use gpui::{App, Context, IntoElement, ParentElement, SharedString, Styled, Window, div, px};
+use gpui::{
+    App, Context, Div, InteractiveElement as _, IntoElement, ParentElement, SharedString, Stateful,
+    Styled, Window, div, px,
+};
 use gpui_component::StyledExt as _;
 use gpui_component::table::{Column, TableDelegate, TableState};
 
@@ -36,6 +39,50 @@ pub enum Tone {
     Good,
     /// 琥珀:退避、过期、预算吃紧。
     Warn,
+}
+
+impl Tone {
+    /// 这个语气用哪个颜色槽位。
+    ///
+    /// 单独一个纯函数(返回槽位号,不返回画笔)是为了测得动:格子的字压在
+    /// 面板、斑马行、以及这两种被选中之后的底色上都得读得清,而那是一道
+    /// 算术题,不是一件要开窗才看得见的事。
+    #[must_use]
+    pub const fn color(self) -> u32 {
+        match self {
+            Self::Plain => TEXT_PRIMARY,
+            Self::Muted => TEXT_META,
+            Self::Data => TEXT_DATA,
+            Self::Accent => ACCENT_TEXT,
+            Self::Good => FRESH,
+            Self::Warn => WARN,
+        }
+    }
+
+    /// 这个语气用多大的字。
+    fn font_size(self) -> gpui::Pixels {
+        match self {
+            Self::Muted => fs(FS_11_5),
+            Self::Data => fs(FS_11),
+            _ => fs(FS_12),
+        }
+    }
+
+    /// 数字要等宽,才对得齐。
+    const fn monospaced(self) -> bool {
+        matches!(self, Self::Data)
+    }
+
+    /// 每一种语气,给测试遍历用。少一种,那一种就没人查它读不读得清。
+    #[cfg(test)]
+    const ALL: [Self; 6] = [
+        Self::Plain,
+        Self::Muted,
+        Self::Data,
+        Self::Accent,
+        Self::Good,
+        Self::Warn,
+    ];
 }
 
 /// 一个格子。
@@ -148,23 +195,39 @@ impl TableDelegate for SimpleTable {
         else {
             return div();
         };
+        let tone = cell.tone;
         let body = div()
             .h_flex()
             .items_center()
             .size_full()
             .overflow_hidden()
             .whitespace_nowrap()
+            .text_size(tone.font_size())
+            .text_color(c(tone.color()))
             .child(cell.text.clone());
-        match cell.tone {
-            Tone::Plain => body.text_size(fs(FS_12)).text_color(c(TEXT_PRIMARY)),
-            Tone::Muted => body.text_size(fs(FS_11_5)).text_color(muted()),
-            Tone::Data => body
-                .font_family(FONT_MONO)
-                .text_size(fs(FS_11))
-                .text_color(c(TEXT_DATA)),
-            Tone::Accent => body.text_size(fs(FS_12)).text_color(c(ACCENT_TEXT)),
-            Tone::Good => body.text_size(fs(FS_12)).text_color(hit_green()),
-            Tone::Warn => body.text_size(fs(FS_12)).text_color(warn_amber()),
+        if tone.monospaced() {
+            body.font_family(FONT_MONO)
+        } else {
+            body
+        }
+    }
+
+    /// 斑马行的底色。
+    ///
+    /// 为什么自己画而不是开上游的 `stripe`:上游那个开关顺带会在数据行下面
+    /// 补一批空的假行,把整张表铺满 —— 屏幕上就是一串没有内容的条纹,看起来
+    /// 像"还有几条正在加载"。关掉 `stripe` 就没有假行了,条纹自己在这儿画。
+    fn render_tr(
+        &mut self,
+        row_ix: usize,
+        _: &mut Window,
+        _: &mut Context<TableState<Self>>,
+    ) -> Stateful<Div> {
+        let row = div().id(("row", row_ix));
+        if row_ix % 2 == 1 {
+            row.bg(c(ZEBRA))
+        } else {
+            row
         }
     }
 
@@ -298,6 +361,35 @@ mod pages_tests {
                         "{name} 第 {index} 行的格子数对不上列数 ({language})"
                     );
                 }
+            }
+        }
+    }
+
+    /// 每一种语气的字,压在表格真会出现的四种底色上都得读得清。
+    ///
+    /// 四种底是:面板(普通行)、斑马行,以及这两种被选中时那块半透明覆盖层
+    /// 压完之后的颜色。选中那两档是这条测试的由来 —— 屏幕上出现过"选中了、
+    /// 一个字都看不见"的行,而那正是"字色和它身下的底色撞了"的样子。
+    #[test]
+    fn every_tone_reads_on_every_row_background() {
+        use crate::theme::{
+            PANEL, SELECTED_ALPHA, SELECTED_WASH, ZEBRA, blend, contrast_ratio, selected_row_bg,
+        };
+
+        for tone in Tone::ALL {
+            // 安静的灰本来就是"次要信息",3:1 是它的线;别的按正文算。
+            let floor = if tone == Tone::Muted { 3.0 } else { 4.5 };
+            for (name, background) in [
+                ("面板", PANEL),
+                ("斑马行", ZEBRA),
+                ("选中行", selected_row_bg()),
+                ("选中的斑马行", blend(SELECTED_WASH, SELECTED_ALPHA, ZEBRA)),
+            ] {
+                let ratio = contrast_ratio(tone.color(), background);
+                assert!(
+                    ratio >= floor,
+                    "{tone:?} 压在{name}上只有 {ratio:.2}:1(要 {floor}:1)"
+                );
             }
         }
     }

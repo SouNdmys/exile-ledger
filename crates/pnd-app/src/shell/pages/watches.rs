@@ -46,11 +46,18 @@ const LABEL_FROM_ID_CHARS: usize = 10;
 pub struct WatchesForm {
     pub search: Entity<InputState>,
     pub label: Entity<InputState>,
+    /// 留空 = 用设置页那个联赛。
+    pub league: Entity<InputState>,
     pub cap: Entity<InputState>,
     pub currency: ChoiceSelect,
     /// 新加的这条要不要立刻启用 / 要不要开 live 秒推。
     pub enabled: bool,
     pub live: bool,
+    /// 表单现在是"新增"还是"改这一条"。
+    ///
+    /// 存 id 不存行号:行号在删掉一条之后就指向别人了,而按保存的时候
+    /// 屏幕上写的还是原来那个名字 —— 那一下会把改动写到另一条搜索上。
+    pub editing: Option<WatchId>,
 }
 
 impl WatchesForm {
@@ -64,6 +71,8 @@ impl WatchesForm {
             .new(|cx| InputState::new(window, cx).placeholder(text.watches_add_search_placeholder));
         let label =
             cx.new(|cx| InputState::new(window, cx).placeholder(text.watches_label_placeholder));
+        let league =
+            cx.new(|cx| InputState::new(window, cx).placeholder(text.watches_league_placeholder));
         let cap = cx
             .new(|cx| InputState::new(window, cx).placeholder(text.watches_price_cap_placeholder));
         // 货币是专有名词,不翻译,所以这个下拉换语言时不用重造。
@@ -71,12 +80,38 @@ impl WatchesForm {
         Self {
             search,
             label,
+            league,
             cap,
             currency,
             // 默认和 `WatchEntry::default()` 一致:加进来就是要它跑。
             enabled: true,
             live: !settings.poesessid.is_empty(),
+            editing: None,
         }
+    }
+
+    /// 把一条现有的搜索装进表单,表单随之进入"改这一条"的模式。
+    ///
+    /// 搜索那一格也填上(填的是 id),但它在这个模式下是灰的:换搜索等于
+    /// 换一条别的东西,该走"删了重加"。
+    pub fn load(&mut self, entry: &WatchEntry, window: &mut Window, cx: &mut Context<AppShell>) {
+        for (input, value) in [
+            (&self.search, entry.search_id.clone()),
+            (&self.label, entry.label.clone()),
+            (&self.league, entry.league.clone()),
+            (&self.cap, milli_text(entry.price_cap.amount_milli)),
+        ] {
+            input.update(cx, |state, cx| {
+                state.set_value(value, window, cx);
+            });
+        }
+        let currency = SharedString::from(entry.price_cap.currency.code().to_owned());
+        self.currency.update(cx, |state, cx| {
+            state.set_selected_value(&currency, window, cx);
+        });
+        self.enabled = entry.enabled;
+        self.live = entry.live;
+        self.editing = Some(entry.id.clone());
     }
 
     /// 换语言之后把占位符换掉。占位符是造控件那一刻复制走的,不会自己跟着变。
@@ -90,6 +125,7 @@ impl WatchesForm {
         for (input, placeholder) in [
             (&self.search, text.watches_add_search_placeholder),
             (&self.label, text.watches_label_placeholder),
+            (&self.league, text.watches_league_placeholder),
             (&self.cap, text.watches_price_cap_placeholder),
         ] {
             input.update(cx, |state, cx| {
@@ -98,14 +134,17 @@ impl WatchesForm {
         }
     }
 
-    /// 加完一条之后清空三个输入框,货币和两个开关留着 —— 连着加几条时
-    /// 它们多半是同一个值。
-    fn clear(&self, window: &mut Window, cx: &mut Context<AppShell>) {
-        for input in [&self.search, &self.label, &self.cap] {
+    /// 清空输入框并退回"新增"模式。加完一条、改完一条、按取消都走这里。
+    ///
+    /// 货币和两个开关留着 —— 连着加几条时它们多半是同一个值。名字必须清:
+    /// 上一条的备注名留在框里,下一条会顶着"风暴合唱"这个名字加进来。
+    fn clear(&mut self, window: &mut Window, cx: &mut Context<AppShell>) {
+        for input in [&self.search, &self.label, &self.league, &self.cap] {
             input.update(cx, |state, cx| {
                 state.set_value("", window, cx);
             });
         }
+        self.editing = None;
     }
 }
 
@@ -158,6 +197,10 @@ pub fn watch_rows(
     text: &'static Text,
     now: i64,
 ) -> Vec<Vec<Cell>> {
+    // 秒推连上之后轮询会自己放慢一档。不说出来的话,状态那一格上的倒计时
+    // 突然从 5 分钟变成 15 分钟,看起来就像"轮询出问题了"。
+    let relaxed =
+        settings.watcher.poll_interval_when_live_seconds > settings.watcher.poll_interval_seconds;
     settings
         .watches
         .iter()
@@ -168,7 +211,10 @@ pub fn watch_rows(
                 Cell::plain(entry.label.clone()),
                 Cell::muted(entry.league.clone()),
                 Cell::data(entry.price_cap.display()),
-                Cell::new(status_text(state, live, text, now), status_tone(state)),
+                Cell::new(
+                    status_text(state, live, text, now, relaxed),
+                    status_tone(state),
+                ),
                 match live.and_then(|status| status.last_poll_at) {
                     Some(at) => Cell::data(local_clock(at)),
                     None => Cell::muted(text.watches_never),
@@ -251,6 +297,7 @@ fn status_text(
     status: Option<&WatchStatus>,
     text: &'static Text,
     now: i64,
+    relaxed: bool,
 ) -> String {
     let word = status_word(state, text);
     if state == WatchRunState::Disabled {
@@ -267,6 +314,12 @@ fn status_text(
     if let Some(status) = status {
         line.push_str(" · ");
         line.push_str(&live_text(status.live, text, now));
+        // 只在"真连上了"而且"设置里那两档确实不一样"的时候说。连接中、
+        // 退避中都还在按普通档轮询,说了就是句假话。
+        if relaxed && matches!(status.live, LiveRunState::Connected { .. }) {
+            line.push(' ');
+            line.push_str(text.watches_live_relaxed);
+        }
     }
     line
 }
@@ -311,24 +364,49 @@ impl AppShell {
             .child(self.budget_strip())
     }
 
-    /// 新增表单:粘一条搜索进来,给它起个名字和一个价格上限。
+    /// 表单:新增一条搜索,或者改选中的那一条。
+    ///
+    /// 两种模式共用同一组框,差别只有三处:标题那一行、搜索框灰不灰、
+    /// 右下角那个按钮写什么。做成两套表单的话,"备注名填在哪儿"这种事
+    /// 要在两处各写一遍,迟早分家。
     fn watches_add_form(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let text = self.text();
         let enabled = self.watches_form.enabled;
         let live = self.watches_form.live;
         let error = self.watch_error.clone();
+        let editing = self.watches_form.editing.clone();
+        let editing_label = editing.as_ref().and_then(|id| {
+            self.settings
+                .watches
+                .iter()
+                .find(|entry| &entry.id == id)
+                .map(|entry| entry.label.clone())
+        });
+        let is_editing = editing.is_some();
         panel()
             .flex_none()
             .p(px(10.))
             .gap(px(8.))
+            // 改的是哪一条,写在最上面:表单里那些框长得和新增时一模一样,
+            // 没有这一行就分不出自己按下去会发生什么。
+            .children(editing_label.map(|label| {
+                div()
+                    .text_size(fs(FS_11_5))
+                    .text_color(c(ACCENT_TEXT))
+                    .child(SharedString::from(i18n::fill(
+                        text.watches_editing,
+                        &[&label],
+                    )))
+            }))
             .child(
                 field_row()
                     .child(field_label(text.watches_add_search_label))
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(Input::new(&self.watches_form.search).with_size(Size::Small)),
+                        div().flex_1().min_w(px(0.)).child(
+                            Input::new(&self.watches_form.search)
+                                .with_size(Size::Small)
+                                .disabled(is_editing),
+                        ),
                     ),
             )
             .child(
@@ -339,6 +417,18 @@ impl AppShell {
                             .w(px(200.))
                             .flex_none()
                             .child(Input::new(&self.watches_form.label).with_size(Size::Small)),
+                    )
+                    .child(
+                        div()
+                            .text_size(fs(FS_11_5))
+                            .text_color(muted())
+                            .child(text.watches_league_label),
+                    )
+                    .child(
+                        div()
+                            .w(px(160.))
+                            .flex_none()
+                            .child(Input::new(&self.watches_form.league).with_size(Size::Small)),
                     )
                     .child(
                         div()
@@ -380,15 +470,31 @@ impl AppShell {
                             })),
                     )
                     .child(div().flex_grow())
-                    .child(
+                    .children(is_editing.then(|| {
+                        Button::new("watch-cancel-edit")
+                            .label(text.watches_cancel_edit)
+                            .with_size(Size::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel_watch_edit(window, cx);
+                            }))
+                    }))
+                    .child(if is_editing {
+                        Button::new("watch-save")
+                            .primary()
+                            .label(text.watches_save_changes)
+                            .with_size(Size::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_watch_edit(window, cx);
+                            }))
+                    } else {
                         Button::new("watch-add")
                             .primary()
                             .label(text.watches_add_button)
                             .with_size(Size::Small)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.add_watch(window, cx);
-                            })),
-                    ),
+                            }))
+                    }),
             )
             // 粘错了的东西就说在表单底下,而不是状态行:错在这儿,话也该在这儿。
             .children((!error.is_empty()).then(|| {
@@ -397,6 +503,7 @@ impl AppShell {
                     .text_color(c(DANGER_TEXT))
                     .child(SharedString::from(error))
             }))
+            .children(is_editing.then(|| hint(text.watches_edit_search_locked)))
     }
 
     /// 选中一行之后能对它做的四件事。
@@ -546,37 +653,23 @@ impl AppShell {
     fn add_watch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.text();
         let raw = text_of(&self.watches_form.search, cx);
-        let Some(search_ref) = parse_search_reference(&raw, &self.settings.league) else {
+        let league = self.form_league(cx);
+        let Some(mut search_ref) = parse_search_reference(&raw, &league) else {
             self.watch_error = text.watches_invalid_search.to_owned();
             cx.notify();
             return;
         };
-        let Some(cap) = text_of(&self.watches_form.cap, cx)
-            .parse::<f64>()
-            .ok()
-            .filter(|amount| amount.is_finite() && *amount > 0.0)
-        else {
+        // URL 里自带联赛,但用户在框里明写的那个说了算 —— 明说的意图
+        // 压过从地址里猜出来的。
+        search_ref.league = league;
+        let Some(cap) = self.form_cap(cx) else {
             self.watch_error = text.watches_invalid_cap.to_owned();
             cx.notify();
             return;
         };
-        let currency = self
-            .watches_form
-            .currency
-            .read(cx)
-            .selected_value()
-            .map_or_else(|| "divine".to_owned(), ToString::to_string);
 
-        let mut label = text_of(&self.watches_form.label, cx);
-        if label.is_empty() {
-            label = search_ref
-                .search_id
-                .chars()
-                .take(LABEL_FROM_ID_CHARS)
-                .collect();
-        }
-
-        let mut entry = WatchEntry::new(label, &search_ref, Price::from_trade(cap, &currency));
+        let label = self.form_label(&search_ref.search_id, cx);
+        let mut entry = WatchEntry::new(label, &search_ref, cap);
         entry.enabled = self.watches_form.enabled;
         entry.live = self.watches_form.live;
         self.push_log(format!("watch added: {} ({})", entry.label, entry.league));
@@ -585,10 +678,118 @@ impl AppShell {
         self.watch_error.clear();
         if self.save_and_apply() {
             self.set_notice(text.watches_added.to_owned());
+            // 加完必须清干净:上一条的备注名留在框里,下一条会顶着
+            // 别人的名字加进来。
             self.watches_form.clear(window, cx);
         }
         self.watches_dirty = true;
         cx.notify();
+    }
+
+    /// 把表单里的改动写回**同一条**搜索。
+    ///
+    /// `WatchId` 一个字都不动:运行状态、提醒历史、去重记录全挂在它上面,
+    /// 换个 id 等于把这条搜索的过去全丢了,而屏幕上看起来只是改了个名字。
+    fn save_watch_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.text();
+        let Some(id) = self.watches_form.editing.clone() else {
+            return;
+        };
+        let Some(index) = self
+            .settings
+            .watches
+            .iter()
+            .position(|entry| entry.id == id)
+        else {
+            // 改到一半这条被删了。退回新增模式,而不是把它又写回去。
+            self.watches_form.clear(window, cx);
+            cx.notify();
+            return;
+        };
+        let Some(cap) = self.form_cap(cx) else {
+            self.watch_error = text.watches_invalid_cap.to_owned();
+            cx.notify();
+            return;
+        };
+        let league = self.form_league(cx);
+        let search_id = self.settings.watches[index].search_id.clone();
+        let label = self.form_label(&search_id, cx);
+        let (enabled, live) = (self.watches_form.enabled, self.watches_form.live);
+
+        let entry = &mut self.settings.watches[index];
+        entry.label = label;
+        entry.league = league;
+        entry.price_cap = cap;
+        entry.enabled = enabled;
+        entry.live = live;
+        let (label, league) = (entry.label.clone(), entry.league.clone());
+        self.push_log(format!("watch updated: {label} ({league})"));
+
+        self.watch_error.clear();
+        if self.save_and_apply() {
+            self.set_notice(text.watches_changes_saved.to_owned());
+            self.watches_form.clear(window, cx);
+        }
+        self.watches_dirty = true;
+        cx.notify();
+    }
+
+    /// 不改了。表单退回新增模式,那一条搜索一个字都没动过。
+    fn cancel_watch_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.watch_error.clear();
+        self.watches_form.clear(window, cx);
+        cx.notify();
+    }
+
+    /// 联赛那一格。留空 = 用设置页那个。
+    fn form_league(&self, cx: &Context<Self>) -> String {
+        let league = text_of(&self.watches_form.league, cx);
+        if league.is_empty() {
+            self.settings.league.clone()
+        } else {
+            league
+        }
+    }
+
+    /// 上限 + 货币。填的不是个大于 0 的数就返回 `None`。
+    fn form_cap(&self, cx: &Context<Self>) -> Option<Price> {
+        let amount = text_of(&self.watches_form.cap, cx)
+            .parse::<f64>()
+            .ok()
+            .filter(|amount| amount.is_finite() && *amount > 0.0)?;
+        let currency = self
+            .watches_form
+            .currency
+            .read(cx)
+            .selected_value()
+            .map_or_else(|| "divine".to_owned(), ToString::to_string);
+        Some(Price::from_trade(amount, &currency))
+    }
+
+    /// 备注名。留空就拿搜索 id 的前几个字符顶上 —— 第一列全空的话,
+    /// 三条搜索长得一模一样。
+    fn form_label(&self, search_id: &str, cx: &Context<Self>) -> String {
+        let label = text_of(&self.watches_form.label, cx);
+        if label.is_empty() {
+            search_id.chars().take(LABEL_FROM_ID_CHARS).collect()
+        } else {
+            label
+        }
+    }
+
+    /// 表格里选中了一行 → 把那条搜索装进表单。
+    ///
+    /// 只能在 render 里做:写输入框要 `&mut Window`,而发出"选中了第几行"
+    /// 那条事件的订阅回调手上没有窗口。
+    pub(crate) fn sync_watch_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.watches_form_load.take() else {
+            return;
+        };
+        let Some(entry) = self.settings.watches.get(row).cloned() else {
+            return;
+        };
+        self.watch_error.clear();
+        self.watches_form.load(&entry, window, cx);
     }
 
     /// 表格里选中的那条搜索。
@@ -627,6 +828,10 @@ impl AppShell {
         let removed = self.settings.watches.remove(index);
         self.push_log(format!("watch removed: {}", removed.label));
         self.watch_status.remove(&removed.id);
+        // 正在改的就是它:表单不能再停在"改这一条"上,那条已经不存在了。
+        if self.watches_form.editing.as_ref() == Some(&removed.id) {
+            self.watches_form.editing = None;
+        }
         if self.save_and_apply() {
             self.set_notice(text.watches_removed.to_owned());
         }
@@ -766,6 +971,66 @@ mod watches_page_tests {
         // 没跑过就没有上次轮询,也没有今日命中,这两格不能空着。
         assert_eq!(rows[1][4].text(), "never");
         assert_eq!(rows[1][5].text(), "—");
+    }
+
+    /// 秒推连上之后轮询自己放慢一档。状态那一格必须说出来 —— 倒计时从
+    /// 5 分钟跳到 15 分钟,不解释的话看起来就像"轮询停了"。
+    #[test]
+    fn a_relaxed_poll_interval_says_why() {
+        let mut settings = settings();
+        let status = BTreeMap::from([(
+            WatchId("w-1".to_string()),
+            WatchStatus {
+                state: WatchRunState::Live,
+                live: LiveRunState::Connected { since: 999_000 },
+                next_poll_at: Some(1_000_900),
+                last_poll_at: Some(1_000_000),
+                ..WatchStatus::default()
+            },
+        )]);
+
+        // 默认设置里普通档 300 秒、秒推档 900 秒 —— 确实放宽了。
+        assert!(
+            settings.watcher.poll_interval_when_live_seconds
+                > settings.watcher.poll_interval_seconds
+        );
+        let rows = watch_rows(&settings, &status, &i18n::ENGLISH, 1_000_000);
+        assert!(
+            rows[0][3]
+                .text()
+                .ends_with("(live connected, polling relaxed)"),
+            "{}",
+            rows[0][3].text()
+        );
+
+        // 两档一样就没有"放宽"这回事,那句话不该出现。
+        settings.watcher.poll_interval_when_live_seconds = settings.watcher.poll_interval_seconds;
+        let rows = watch_rows(&settings, &status, &i18n::ENGLISH, 1_000_000);
+        assert!(
+            !rows[0][3].text().contains("relaxed"),
+            "{}",
+            rows[0][3].text()
+        );
+    }
+
+    /// 只有真连上了才说。连接中、退避中都还在按普通档轮询,说了就是假话。
+    #[test]
+    fn a_live_connection_that_is_not_up_yet_claims_nothing() {
+        let status = BTreeMap::from([(
+            WatchId("w-1".to_string()),
+            WatchStatus {
+                state: WatchRunState::Polling,
+                live: LiveRunState::Connecting,
+                last_poll_at: Some(1_000_000),
+                ..WatchStatus::default()
+            },
+        )]);
+        let rows = watch_rows(&settings(), &status, &i18n::ENGLISH, 1_000_000);
+        assert!(
+            !rows[0][3].text().contains("relaxed"),
+            "{}",
+            rows[0][3].text()
+        );
     }
 
     #[test]

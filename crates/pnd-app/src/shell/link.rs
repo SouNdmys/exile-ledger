@@ -56,6 +56,12 @@ const REMEMBERED_CARDS: usize = 16;
 const CARD_TITLE_CHARS: usize = 46;
 const CARD_LINE_CHARS: usize = 60;
 
+/// 交易站的报错正文裁到这个长度。
+///
+/// 它偶尔回的是一整页 HTML;整页跟在"失败 HTTP 503:"后面,真正有用的
+/// 那半句会被挤到屏幕外,而卡片脚注根本放不下。
+const HIDEOUT_MESSAGE_CHARS: usize = 120;
+
 // ---------------------------------------------------------------------
 // 启动
 // ---------------------------------------------------------------------
@@ -240,6 +246,9 @@ impl AppShell {
             }
             RuntimeEvent::Log(line) => self.push_log(line),
             RuntimeEvent::Fault(line) => {
+                // 状态行不走 `push_log`,所以脱敏要在这儿再做一次:后台报错
+                // 的正文里出现过 token,而这一句是常驻在屏幕最下面的。
+                let line = crate::logbook::redact_for_log(&line);
                 self.push_log(format!("runtime fault: {line}"));
                 self.set_sticky_notice(i18n::fill(text.notice_runtime_failed, &[&line]));
             }
@@ -420,6 +429,12 @@ impl AppShell {
                 // **一次点击 = 一条命令**。程序自己永远不发这条命令,也永远
                 // 不重试到底 —— 计划里那句"每个游戏内动作都是你自己点一次"
                 // 就是这里。结果由 `HideoutResult` 事件写回卡片脚注。
+                //
+                // 界面这一侧**不预判**这一下有没有意义。卖家离线不是理由
+                // (一口价的东西就摆在他藏身处的商店里,官网对几小时没上线的
+                // 卖家照样给 Travel 按钮),没有 token 也不是(runtime 会先
+                // 重抓一次,当初匿名抓回来的那条可能这次就带上了)。谁有资格
+                // 说"不行"由 runtime 决定,它答得起也答得准。
                 self.travel_to_hideout(alert_id);
             }
             CardButton::Dismiss => {
@@ -746,11 +761,18 @@ pub(crate) fn hideout_text(outcome: &HideoutOutcome, text: &'static Text) -> Str
         HideoutOutcome::NoSession => text.hideout_no_session.to_owned(),
         HideoutOutcome::TokenMissing => text.hideout_token_missing.to_owned(),
         HideoutOutcome::Refreshed => text.hideout_refreshing.to_owned(),
-        // 状态码是失败时唯一的线索(503 = token 过期,403 = 会话不对):
-        // 吞掉它等于让人只能重试到死。
-        HideoutOutcome::Failed { status, .. } => {
-            i18n::fill(text.hideout_failed_status, &[&status.to_string()])
-        }
+        // 状态码 0 = 请求压根没出门(网络断了、URL 拼不出来)。写成
+        // "HTTP 0" 只会让人去查一个不存在的状态码,所以这一档单独说。
+        HideoutOutcome::Failed { status: 0, message } => i18n::fill(
+            text.hideout_not_sent,
+            &[&clip(message, HIDEOUT_MESSAGE_CHARS)],
+        ),
+        // 状态码和交易站自己说的那句话是失败时仅有的线索(503 = token 过期,
+        // 403 = 会话不对):吞掉它们等于让人只能重试到死。
+        HideoutOutcome::Failed { status, message } => i18n::fill(
+            text.hideout_failed_http,
+            &[&status.to_string(), &clip(message, HIDEOUT_MESSAGE_CHARS)],
+        ),
     }
 }
 
@@ -963,8 +985,8 @@ mod link_tests {
         assert_eq!(age_text("whenever", &i18n::ENGLISH), "whenever");
     }
 
-    /// 五种进展各说各的话,而且失败那句必须带上状态码:503(token 过期)
-    /// 和 403(会话不对)要做的下一步完全不同。
+    /// 五种进展各说各的话,而且失败那句必须带上状态码和交易站的原话:
+    /// 503(token 过期)和 403(会话不对)要做的下一步完全不同。
     #[test]
     fn every_hideout_outcome_says_something_of_its_own() {
         let outcomes = [
@@ -985,11 +1007,53 @@ mod link_tests {
                 .collect();
             assert!(lines.iter().all(|line| !line.trim().is_empty()));
             assert!(lines[4].contains("503"), "{}", lines[4]);
+            assert!(lines[4].contains("busy"), "{}", lines[4]);
             lines.sort();
             let count = lines.len();
             lines.dedup();
             assert_eq!(lines.len(), count, "{language} 里有两种结局撞词了");
         }
+    }
+
+    /// 状态码 0 = 请求压根没出门。这一档不能写成 "HTTP 0",那是个查不到的
+    /// 状态码;要说的是"没发出去",后面跟上原因。
+    #[test]
+    fn a_request_that_never_left_does_not_pretend_to_be_an_http_status() {
+        let outcome = HideoutOutcome::Failed {
+            status: 0,
+            message: "no session cookie".to_string(),
+        };
+        assert_eq!(
+            hideout_text(&outcome, &i18n::ENGLISH),
+            "hideout: not sent — no session cookie"
+        );
+        assert_eq!(
+            hideout_text(&outcome, &i18n::SIMPLIFIED_CHINESE),
+            "去藏身处:没发出去 —— no session cookie"
+        );
+        // 真有状态码的那一档写全:码 + 原话。
+        assert_eq!(
+            hideout_text(
+                &HideoutOutcome::Failed {
+                    status: 403,
+                    message: "forbidden".to_string(),
+                },
+                &i18n::ENGLISH
+            ),
+            "hideout: failed HTTP 403: forbidden"
+        );
+    }
+
+    /// 交易站偶尔回一整页 HTML。整页跟在后面会把状态行和卡片脚注淹掉。
+    #[test]
+    fn a_novel_of_an_error_message_gets_cut_down() {
+        let outcome = HideoutOutcome::Failed {
+            status: 503,
+            message: "x".repeat(5_000),
+        };
+        let line = hideout_text(&outcome, &i18n::ENGLISH);
+        assert!(line.chars().count() < 160, "{} 个字", line.chars().count());
+        assert!(line.ends_with('…'), "{line}");
     }
 
     /// 结局要能塞进卡片脚注 —— 那一行有长度上限,超了整张卡片就构造不出来。

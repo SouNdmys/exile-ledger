@@ -10,6 +10,7 @@
 pub mod assets;
 pub mod crashlog;
 pub mod i18n;
+pub mod logbook;
 pub mod shell;
 pub mod theme;
 
@@ -53,6 +54,15 @@ pub fn ninja_db_path() -> PathBuf {
     redirect(&pnd_storage::default_ninja_db_path(), DATA_DIR_ENV)
 }
 
+/// 日志文件的位置。
+///
+/// 和两个 sqlite 放在同一个数据目录下,所以 `PND_DATA_DIR` 一并搬走它 ——
+/// 手测时不该往本机那份真日志里掺测试的行。
+#[must_use]
+pub fn app_log_path() -> PathBuf {
+    data_dir().join("app.log")
+}
+
 /// 登录窗那个 Edge 内核的用户数据目录。
 ///
 /// 和两个 sqlite 放在同一个数据目录下,单独一个子目录:里面是本程序自己
@@ -60,10 +70,14 @@ pub fn ninja_db_path() -> PathBuf {
 /// 登录出问题时把这个目录整个删掉就是"重来一次"。
 #[must_use]
 pub fn webview2_data_dir() -> PathBuf {
-    let base = env_override(DATA_DIR_ENV)
+    data_dir().join("webview2")
+}
+
+/// 这次启动往哪个目录写东西。
+fn data_dir() -> PathBuf {
+    env_override(DATA_DIR_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(pnd_storage::default_data_dir);
-    base.join("webview2")
+        .unwrap_or_else(pnd_storage::default_data_dir)
 }
 
 /// 环境变量的值,空串当成没设 —— `set PND_DATA_DIR=` 的意思是"别改",

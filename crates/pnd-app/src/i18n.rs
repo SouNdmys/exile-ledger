@@ -77,6 +77,9 @@ catalogue! {
     watches_add_search_placeholder,
     watches_label_label,
     watches_label_placeholder,
+    /// 表单里的联赛格。留空就用设置页那个联赛。
+    watches_league_label,
+    watches_league_placeholder,
     watches_price_cap_label,
     watches_price_cap_placeholder,
     watches_currency_label,
@@ -103,6 +106,17 @@ catalogue! {
     watches_invalid_search,
     watches_invalid_cap,
     watches_poll_requested,
+    /// 选中一行之后表单变成"改这一条":按钮换字,旁边多一个取消。
+    /// "正在编辑 {}"
+    watches_editing,
+    watches_save_changes,
+    watches_cancel_edit,
+    watches_changes_saved,
+    /// 改搜索本身要走"删了重加",因为 runtime 的一切都挂在这条搜索的 id 上。
+    watches_edit_search_locked,
+    /// live 连上之后轮询会自动放慢,状态那一格得说出来 —— 否则看起来像
+    /// "轮询停了"。
+    watches_live_relaxed,
     /// "1 divine = {} chaos / {} exalted"
     watches_rates,
     watches_rates_unknown,
@@ -337,9 +351,12 @@ catalogue! {
     hideout_token_missing,
     hideout_refreshing,
     hideout_failed,
-    /// "hideout: failed ({})" —— 带上交易站的状态码。失败的时候那是唯一的线索,
-    /// 而提醒记录里只存了动作码、存不下状态码,所以要两条。
-    hideout_failed_status,
+    /// "hideout: not sent — {}" —— 状态码 0 = 请求压根没出门(网络断了、
+    /// 会话拼不出来)。这时候写个 "HTTP 0" 只会让人去查一个不存在的状态码。
+    hideout_not_sent,
+    /// "hideout: failed HTTP {}: {}" —— 状态码 + 交易站自己说的那句话。
+    /// 失败时那两样是唯一的线索,而提醒记录里只存得下动作码,所以要单列一条。
+    hideout_failed_http,
 
     // -- 状态行上的一句话 --
     notice_opened_trade,
@@ -356,6 +373,16 @@ catalogue! {
     /// "提醒卡片没起来:{}"
     notice_card_failed,
     notice_card_missing,
+
+    // -- 日志抽屉 --
+    // 状态行只放得下最后一条。真出事的时候要看的是前面那几条,所以给它
+    // 一个抽屉,并且每一条都落到盘上 —— 程序关掉之后还查得回来。
+    log_toggle,
+    log_copy,
+    log_copied,
+    log_empty,
+    /// "写到 {}"
+    log_file_path,
 }
 
 /// 支持的语言码。设置里存的就是这两个字符串。
@@ -436,6 +463,8 @@ pub static ENGLISH: Text = Text {
     watches_add_search_placeholder: "https://www.pathofexile.com/trade2/search/poe2/... or H4sI...",
     watches_label_label: "Label",
     watches_label_placeholder: "Choir of the Storm",
+    watches_league_label: "League",
+    watches_league_placeholder: "empty = the league from Settings",
     watches_price_cap_label: "Price cap",
     watches_price_cap_placeholder: "20",
     watches_currency_label: "Currency",
@@ -459,6 +488,12 @@ pub static ENGLISH: Text = Text {
     watches_invalid_search: "That is not a trade search URL or id.",
     watches_invalid_cap: "The price cap has to be a number above zero.",
     watches_poll_requested: "Polling that watch now.",
+    watches_editing: "Editing {}",
+    watches_save_changes: "Save changes",
+    watches_cancel_edit: "Cancel",
+    watches_changes_saved: "Changes saved.",
+    watches_edit_search_locked: "The search itself cannot be edited. To point this watch somewhere else, remove it and add the new search.",
+    watches_live_relaxed: "(live connected, polling relaxed)",
     watches_rates: "1 divine = {} chaos / {} exalted",
     watches_rates_unknown: "rates not loaded yet",
     status_disabled: "disabled",
@@ -642,7 +677,8 @@ pub static ENGLISH: Text = Text {
     hideout_token_missing: "hideout: no token",
     hideout_refreshing: "hideout: refreshing the token",
     hideout_failed: "hideout: failed",
-    hideout_failed_status: "hideout: failed ({})",
+    hideout_not_sent: "hideout: not sent — {}",
+    hideout_failed_http: "hideout: failed HTTP {}: {}",
 
     notice_opened_trade: "Opened the trade page in your browser.",
     notice_open_failed: "Could not open the browser: {}",
@@ -654,6 +690,12 @@ pub static ENGLISH: Text = Text {
     notice_runtime_gone: "The background runtime is not running.",
     notice_card_failed: "The alert card did not start: {}",
     notice_card_missing: "No alert card on screen — the alert is on the Alerts page.",
+
+    log_toggle: "Log",
+    log_copy: "Copy",
+    log_copied: "Log copied to the clipboard.",
+    log_empty: "Nothing logged yet.",
+    log_file_path: "written to {}",
 };
 
 pub static SIMPLIFIED_CHINESE: Text = Text {
@@ -689,6 +731,8 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     watches_add_search_placeholder: "https://www.pathofexile.com/trade2/search/poe2/… 或 H4sI…",
     watches_label_label: "备注名",
     watches_label_placeholder: "风暴合唱",
+    watches_league_label: "联赛",
+    watches_league_placeholder: "留空 = 用设置页那个联赛",
     watches_price_cap_label: "价格上限",
     watches_price_cap_placeholder: "20",
     watches_currency_label: "货币",
@@ -712,6 +756,12 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     watches_invalid_search: "这不是一条交易站搜索 URL 或 id。",
     watches_invalid_cap: "价格上限得是个大于 0 的数。",
     watches_poll_requested: "这就去轮询一次。",
+    watches_editing: "正在改「{}」",
+    watches_save_changes: "保存修改",
+    watches_cancel_edit: "取消",
+    watches_changes_saved: "已保存修改。",
+    watches_edit_search_locked: "搜索本身改不了。要让这条搜索盯别的东西,把它删掉,重新粘一条进来。",
+    watches_live_relaxed: "(live 已连上,轮询放宽)",
     watches_rates: "1 divine = {} chaos / {} exalted",
     watches_rates_unknown: "还没读到汇率",
     status_disabled: "已停用",
@@ -895,7 +945,8 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     hideout_token_missing: "去藏身处:没有 token",
     hideout_refreshing: "去藏身处:正在换 token",
     hideout_failed: "去藏身处:失败",
-    hideout_failed_status: "去藏身处:失败({})",
+    hideout_not_sent: "去藏身处:没发出去 —— {}",
+    hideout_failed_http: "去藏身处:失败 HTTP {}:{}",
 
     notice_opened_trade: "已在浏览器里打开交易页。",
     notice_open_failed: "打不开浏览器:{}",
@@ -907,6 +958,12 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     notice_runtime_gone: "后台运行时没在跑。",
     notice_card_failed: "提醒卡片没起来:{}",
     notice_card_missing: "屏幕上没有卡片 —— 这条提醒记在提醒记录页里。",
+
+    log_toggle: "日志",
+    log_copy: "复制",
+    log_copied: "日志已复制到剪贴板。",
+    log_empty: "还没有日志。",
+    log_file_path: "写到 {}",
 };
 
 #[cfg(test)]
