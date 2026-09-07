@@ -22,6 +22,15 @@ use crate::shell::{AppShell, Choice, hint, page_heading, panel, picker, table};
 /// 占比低于这个数的词缀默认不显示(计划里定的阈值)。
 pub const MIN_SHARE_PERCENT: f64 = 2.0;
 
+/// 稀有度下拉一开始停在哪一档。
+///
+/// 停在"稀有"而不是"全部",是因为这一页要回答的问题是**"我该给自己做一件
+/// 什么样的装备"**,而那个问题只有稀有装答得上:能自己搓的就是它。
+pub const DEFAULT_RARITY: &str = "Rare";
+
+/// 暗金那一档在 ninja 角色详情里的原文。
+pub const UNIQUE_RARITY: &str = "Unique";
+
 /// 三个下拉共用的一件事:把库里出现过的值去重排好,前面加一条"全部"。
 fn choices_from(
     values: impl Iterator<Item = String>,
@@ -49,12 +58,15 @@ pub fn slot_choices(mods: &[SlotModStat], text: &'static Text) -> Vec<Choice> {
 }
 
 /// 稀有度下拉。
+///
+/// [`DEFAULT_RARITY`] 那一档**永远在选项里**,哪怕这一轮的统计还是空的:
+/// 它是下拉默认选中的那一项,选项不在的话下拉一开始就是个空占位符。
 pub fn rarity_choices(mods: &[SlotModStat], text: &'static Text) -> Vec<Choice> {
-    choices_from(
-        mods.iter().map(|stat| stat.rarity.clone()),
-        |value| rarity_label(value, text).to_owned(),
-        text,
-    )
+    let values = mods
+        .iter()
+        .map(|stat| stat.rarity.clone())
+        .chain(std::iter::once(DEFAULT_RARITY.to_owned()));
+    choices_from(values, |value| rarity_label(value, text).to_owned(), text)
 }
 
 /// 词缀类型下拉。五种类型在 ninja 的角色详情里是五个数组,统计口径必须分开。
@@ -111,6 +123,11 @@ pub fn table_content(text: &'static Text) -> TableContent {
 ///
 /// 筛选在内存里做:整轮统计一共一千多行,每换一次下拉回去打一次库不值当,
 /// 而且"这一页显示的和那三个下拉说的是同一件事"在同一个函数里看得见。
+///
+/// 稀有度那一档的"全部"**不含暗金**:暗金的词缀是固定的,一件
+/// Wake of Destruction 上写着什么,全联赛每一件都写着一模一样的东西,
+/// 所以它的"携带比例"量的是"多少人穿这件暗金",和稀有装的随机词缀不是
+/// 一个量纲,混在一张表里排序只会把真正有用的行挤下去。想看就明选"暗金"。
 #[must_use]
 pub fn filtered<'a>(
     mods: &'a [SlotModStat],
@@ -123,7 +140,13 @@ pub fn filtered<'a>(
     let mut rows: Vec<&SlotModStat> = mods
         .iter()
         .filter(|stat| slot.is_empty() || stat.slot == slot)
-        .filter(|stat| rarity.is_empty() || stat.rarity == rarity)
+        .filter(|stat| {
+            if rarity.is_empty() {
+                stat.rarity != UNIQUE_RARITY
+            } else {
+                stat.rarity == rarity
+            }
+        })
         .filter(|stat| kind.is_empty() || stat.mod_kind == kind)
         .filter(|stat| mod_share_percent(stat) >= floor)
         .collect();
@@ -375,19 +398,19 @@ mod ninja_mods_tests {
     #[test]
     fn the_three_filters_narrow_down_and_the_rows_come_out_sorted() {
         let mods = mods();
+        // 六行里那一行暗金不进"全部"(见 `the_all_bucket_leaves_unique_mods_out`)。
         let all = filtered(&mods, "", "", "", true);
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 5);
         // Ring 的 40/60 = 66.7% 排最前。
         assert_eq!(all[0].slot, "Ring");
 
+        // 明选暗金那一档,排序照样按比例来:9/26 = 34.6% 要排在
+        // 14/47 = 29.8% 前面,哪怕后者人还多五个。
         let body = filtered(&mods, "BodyArmour", "", "", true);
-        assert_eq!(body.len(), 5);
+        assert_eq!(body.len(), 4);
         assert!(body.iter().all(|stat| stat.slot == "BodyArmour"));
-        // 排的是**比例**不是人数:9/26 = 34.6% 要排在 14/47 = 29.8% 前面,
-        // 哪怕后者人还多五个。
         assert_eq!(body[0].stat_id, "base_cold_damage_resistance_%");
-        assert_eq!(body[1].stat_id, "cannot_be_frozen");
-        assert_eq!(body[2].stat_id, "local_energy_shield");
+        assert_eq!(body[1].stat_id, "local_energy_shield");
 
         let rare_explicit = filtered(&mods, "BodyArmour", "Rare", "explicit", true);
         assert_eq!(rare_explicit.len(), 3);
@@ -482,6 +505,50 @@ mod ninja_mods_tests {
 
         // 库还是空的时候只剩"全部",而不是一个空下拉。
         assert_eq!(slot_choices(&[], &i18n::ENGLISH).len(), 1);
+    }
+
+    /// "全部"那一档要排掉暗金。
+    ///
+    /// 暗金的词缀是**固定**的:一件 Wake of Destruction 上写着什么,
+    /// 全联赛每一件都写着一模一样的东西。把它和稀有装的随机词缀混在一张表里,
+    /// "多少人带着这条词缀"就变成了"多少人穿着这件暗金"——那是暗金热度页的
+    /// 问题,不是词缀热度页的。想看暗金的词缀,下拉里明选"暗金"。
+    #[test]
+    fn the_all_bucket_leaves_unique_mods_out() {
+        let mods = mods();
+        let all = filtered(&mods, "", "", "", true);
+        assert!(
+            all.iter().all(|stat| stat.rarity != UNIQUE_RARITY),
+            "全部那一档里不该有暗金的固定词缀"
+        );
+        assert_eq!(all.len(), 5, "六行里那一行暗金被排掉了");
+
+        // 明选"暗金"就照样看得到,一行都不少。
+        let unique = filtered(&mods, "", UNIQUE_RARITY, "", true);
+        assert_eq!(unique.len(), 1);
+        assert_eq!(unique[0].stat_id, "cannot_be_frozen");
+
+        // 部位那一档也跟着走:BodyArmour 的五行里有一行是暗金。
+        assert_eq!(filtered(&mods, "BodyArmour", "", "", true).len(), 4);
+    }
+
+    /// 稀有度下拉默认停在"稀有",所以**这一档必须永远在选项里** ——
+    /// 哪怕这一轮的统计还是空的(第一次开程序就是这样),
+    /// 选项不在的话下拉一打开是个空的占位符。
+    #[test]
+    fn the_rarity_picker_always_offers_the_default() {
+        let values: Vec<String> = rarity_choices(&[], &i18n::ENGLISH)
+            .iter()
+            .map(|choice| choice.value().to_string())
+            .collect();
+        assert_eq!(values, vec!["", DEFAULT_RARITY]);
+
+        // 库里有别的档次时它们照样都在,不重复。
+        let values: Vec<String> = rarity_choices(&mods(), &i18n::ENGLISH)
+            .iter()
+            .map(|choice| choice.value().to_string())
+            .collect();
+        assert_eq!(values, vec!["", "Rare", "Unique"]);
     }
 
     /// 认不出来的稀有度/类型原样显示,而不是整档消失。

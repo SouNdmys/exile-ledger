@@ -12,17 +12,22 @@
 //! 2. 读 index-state / build-index-state,落一行快照。
 //! 3. NDIC 字典按 sha1 在内存里缓存:9 个分面共用 7 张表,一轮只抓 7 次。
 //! 4. 跑完所有 pending 分区(每个分区一次搜索 + 一个事务)。热门暗金榜到这里就有了。
-//! 5. 逐个抓角色详情,原文整段落库(`stop_after >= Characters` 才跑)。
-//! 6. 从原文重建词缀统计(`stop_after == Aggregated` 才跑)。
-//! 7. 暗金参考价(6 个有文档的经济接口)。**每一轮都跑,而且排在最后**:
-//!    6 个请求、6 秒钟,却能让"这件暗金现在值多少"跟着刚采完的人气榜一起新。
+//! 5. 暗金参考价(6 个有文档的经济接口)。**每一轮都跑,而且排在角色详情前面**:
+//!    6 个请求、几秒钟,而下一步要跑大半个小时——把便宜的排在后面,就等于
+//!    "一被限流打断,暗金页的价格列永远是空的"。
+//! 6. 逐个抓角色详情,原文整段落库(`stop_after >= Characters` 才跑)。
+//! 7. 从原文重建词缀统计(`stop_after == Aggregated` 才跑)。
+//!
+//! 第 4–7 步的顺序写在 [`stage_plan`] 这个纯函数里,`run_sampler` 只照单执行。
 //!
 //! 阶段只许前进:第 4 步在续跑时会空跑一遍(队列是空的,一个请求都不发),
 //! 库里的阶段不能因此从 `characters` 退回 `facets`(见 [`highest_stage`])。
 //!
 //! 对 poe.ninja 的礼貌全压在一个 [`Pacer`] 上:**所有**出站请求都从它过一遍,
-//! 保证两次请求的**起点**至少隔 `min_request_gap_ms`(默认 1 秒),
-//! 每次请求前看一眼取消标志,429/5xx 睡 60 秒再试一次就不再纠缠。
+//! 保证两次请求的**起点**至少隔 `min_request_gap_ms`(默认 1 秒),每次请求前
+//! 看一眼取消标志。撞上 429 就只等不放弃(听 `Retry-After`,没有就爬
+//! [`rate_limit_delay`] 那把阶梯),并且把这一轮剩下的间隔翻一倍;
+//! 5xx 是对面自己的毛病,睡 60 秒再试一次就不纠缠。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -48,9 +53,39 @@ use thiserror::Error;
 
 use crate::now_secs;
 
-/// 撞上 429 或者 5xx 之后先躺多久。一分钟是"明显在道歉"的量级:
+/// 撞上 5xx 之后先躺多久。一分钟是"明显在道歉"的量级:
 /// 对面缓存 30 分钟,我们急这一分钟没有任何意义。
 const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// 连着吃 429 时的等待阶梯,单位秒。
+///
+/// 阶梯而不是一个定值,是因为 429 只有两种成因,而它们要的答案不一样:
+/// 一种是"这一分钟发多了",睡一分钟就过去;另一种是对面把我们整个拉黑了
+/// 一段时间,那再怎么一分钟一试也只是继续敲门。撞得越多越可能是后者,
+/// 所以等得越久;顶到 10 分钟就不再涨——再久就不如让用户自己决定还跑不跑。
+const RATE_LIMIT_LADDER: [u64; 4] = [60, 120, 300, 600];
+
+/// 撞上 429 之后该等多久。`consecutive` 是**连续**第几个 429(从 1 数起),
+/// 成功一次就归零。
+///
+/// `retry_after` 是服务端自己在 `Retry-After` 里写的秒数:**它说了就听它的**。
+/// 我们那把阶梯只是在对面什么都没说时的猜测,而猜测没有理由压过原话。
+#[must_use]
+pub fn rate_limit_delay(consecutive: u32, retry_after: Option<u64>) -> Duration {
+    if let Some(secs) = retry_after {
+        return Duration::from_secs(secs);
+    }
+    let step = (consecutive.max(1) as usize - 1).min(RATE_LIMIT_LADDER.len() - 1);
+    Duration::from_secs(RATE_LIMIT_LADDER[step])
+}
+
+/// 这个错是不是"你太快了"。是的话顺手把服务端说的秒数带出来。
+fn rate_limited(error: &NinjaError) -> Option<Option<u64>> {
+    match error {
+        NinjaError::RateLimited { retry_after_secs } => Some(*retry_after_secs),
+        _ => None,
+    }
+}
 
 /// 睡觉时每隔这么久醒一次看取消标志。关程序不该等满一个 60 秒的退避。
 const CANCEL_SLICE: Duration = Duration::from_millis(100);
@@ -142,6 +177,48 @@ impl SamplerStage {
             _ => SamplerStage::Facets,
         }
     }
+}
+
+/// 一轮采样实际要跑的那几步,按顺序。
+///
+/// 和 [`SamplerStage`] 不是一回事:阶段是"存进库里的进度条",步骤是
+/// "这一轮依次干哪几件事"。参考价就是差别所在 —— 它每一轮都跑,却不占
+/// 阶段阶梯上的一格(库里没有 `prices` 这一档)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplerStep {
+    /// 分区搜索:热门暗金榜的人气数。
+    Facets,
+    /// 暗金参考价,6 个经济接口。
+    Prices,
+    /// 角色详情:两千个人,一秒一个,大半个小时。
+    Characters,
+    /// 词缀统计重建。不出网,从库里的原文算。
+    Aggregated,
+}
+
+/// 这一轮按什么顺序跑哪几步。
+///
+/// 顺序本身就是一个决定,而它决定的是**被限流打断时哪些数据已经落地**:
+/// 参考价只有 6 个请求、几秒钟,角色详情要跑大半个小时,所以便宜的那一步
+/// 排在前面。反过来排的那一版里,角色详情一撞上 429,暗金页的
+/// 参考价 / 挂单数 / 7 天三列就永远是"—"。
+///
+/// 参考价**每一轮都跑**,和 `stop_after` 无关:它是"这件暗金现在值多少",
+/// 半小时前的价格和刚采完的人气榜摆在一起才有意义。
+#[must_use]
+pub fn stage_plan(stop_after: SamplerStage) -> Vec<SamplerStep> {
+    let mut steps = Vec::new();
+    if stage_order(stop_after) >= stage_order(SamplerStage::Facets) {
+        steps.push(SamplerStep::Facets);
+    }
+    steps.push(SamplerStep::Prices);
+    if stage_order(stop_after) >= stage_order(SamplerStage::Characters) {
+        steps.push(SamplerStep::Characters);
+    }
+    if stage_order(stop_after) >= stage_order(SamplerStage::Aggregated) {
+        steps.push(SamplerStep::Aggregated);
+    }
+    steps
 }
 
 /// 跑一轮采样要知道的全部东西。
@@ -430,7 +507,8 @@ fn nap(total: Duration, cancel: &AtomicBool) -> Result<(), SamplerError> {
 /// 再问一百遍也还是没了。
 fn is_transient(error: &NinjaError) -> bool {
     match error {
-        NinjaError::Rejected(status) => *status == 429 || *status >= 500,
+        NinjaError::RateLimited { .. } => true,
+        NinjaError::Rejected(status) => *status >= 500,
         _ => false,
     }
 }
@@ -562,25 +640,26 @@ pub fn run_sampler(
     let mut sampler = Sampler::new(store, config, cancel, emit);
     let league = sampler.open_snapshot(latest.as_ref())?;
 
-    // `Planned` 是个"只把快照行刷新一下"的停车位(存储层的阶段阶梯里有它,
-    // 所以配置里也得能表达)。真正的调用方都从 `Facets` 起步。
-    if stage_order(config.stop_after) >= stage_order(SamplerStage::Facets) {
-        sampler.partition_stage(&league)?;
-        sampler.finish_stage(SamplerStage::Facets)?;
+    // 跑哪几步、什么顺序全在 [`stage_plan`] 里,这儿只负责照单执行 ——
+    // 顺序是个会被改的决定(参考价就从最后挪到了角色详情前面),
+    // 让它待在一个测得动的纯函数里,比散在几个 `if` 中间可靠。
+    for step in stage_plan(config.stop_after) {
+        match step {
+            SamplerStep::Facets => {
+                sampler.partition_stage(&league)?;
+                sampler.finish_stage(SamplerStage::Facets)?;
+            }
+            SamplerStep::Prices => sampler.prices_stage()?,
+            SamplerStep::Characters => {
+                sampler.character_stage()?;
+                sampler.finish_stage(SamplerStage::Characters)?;
+            }
+            SamplerStep::Aggregated => {
+                sampler.aggregate_stage()?;
+                sampler.finish_stage(SamplerStage::Aggregated)?;
+            }
+        }
     }
-
-    if stage_order(config.stop_after) >= stage_order(SamplerStage::Characters) {
-        sampler.character_stage()?;
-        sampler.finish_stage(SamplerStage::Characters)?;
-    }
-    if stage_order(config.stop_after) >= stage_order(SamplerStage::Aggregated) {
-        sampler.aggregate_stage()?;
-        sampler.finish_stage(SamplerStage::Aggregated)?;
-    }
-
-    // 参考价放在最后、而且每一轮都跑:6 个有文档的接口、6 秒钟,
-    // 却让"这件暗金现在值多少"跟着最新一次采样一起新。
-    sampler.prices_stage()?;
 
     emit(SamplerEvent::Finished {
         version: sampler.version.clone(),
@@ -648,6 +727,15 @@ struct Sampler<'a> {
     emit: &'a dyn Fn(SamplerEvent),
     /// 正在跑哪一步。只用来给进度事件贴标签。
     stage: SamplerStage,
+    /// 当前阶段跑到哪了。**出网那一层手上没有循环变量**:限流时要报一句
+    /// "等一下",数字只能从这儿拿 —— 老版本写死 `0/0`,于是界面上是
+    /// "角色 0/0 · 429",而队列里明明还排着两千多个人。
+    progress_done: u32,
+    progress_total: u32,
+    /// 连着吃了几个 429。通一次就归零,决定退避阶梯爬到第几格。
+    rate_limit_hits: u32,
+    /// 这一轮有没有因为 429 把节奏放慢过。只放慢一次,不叠加。
+    slowed_down: bool,
     /// 这个快照**最远**走到过哪一步。库里的阶段只跟着它走,所以只会前进。
     reached: SamplerStage,
     version: String,
@@ -673,6 +761,10 @@ impl<'a> Sampler<'a> {
             cancel,
             emit,
             stage: SamplerStage::Planned,
+            progress_done: 0,
+            progress_total: 0,
+            rate_limit_hits: 0,
+            slowed_down: false,
             reached: SamplerStage::Planned,
             version: String::new(),
             snapshot_name: String::new(),
@@ -682,19 +774,64 @@ impl<'a> Sampler<'a> {
 
     // ---- 出网 --------------------------------------------------------
 
-    /// 所有请求的唯一出口:节流 + 取消 + 429/5xx 重试一次。
+    /// 所有请求的唯一出口:节流 + 取消 + 出错重试。
+    ///
+    /// 两种错分开处置,因为它们说的根本不是同一件事:
+    ///
+    /// - **429("你太快了")只等,不放弃。** 等多久见 [`rate_limit_delay`]。
+    ///   上一版是"睡 60 秒、再试一次、还不行就把这个请求判死",于是限流一来,
+    ///   2,000 个角色变成一人两个请求 + 60 秒的空转,一整夜也采不完一个人,
+    ///   还在持续敲一个明说了"别敲"的门。等待是**唯一**正确的反应。
+    /// - **5xx 照旧只重试一次。** 那是对面自己出问题,和我们的节奏无关,
+    ///   守在这儿一直等没有意义。重试完是回到循环顶上而不是直接返回:
+    ///   万一那一次撞的是 429,它该走上面那条路,而不是被当成"这条抓不到了"。
     fn fetch<T>(
         &mut self,
         call: impl Fn(&NinjaClient) -> Result<T, NinjaError>,
     ) -> Result<T, SamplerError> {
-        match self.attempt(&call) {
-            Err(SamplerError::Ninja(error)) if is_transient(&error) => {
-                self.progress(0, 0, format!("{error} — waiting 60s and retrying once"));
-                nap(RETRY_AFTER, self.cancel)?;
-                self.attempt(&call)
+        let mut server_error_retried = false;
+        loop {
+            match self.attempt(&call) {
+                Ok(value) => {
+                    self.rate_limit_hits = 0;
+                    return Ok(value);
+                }
+                Err(SamplerError::Ninja(error)) => {
+                    if let Some(retry_after) = rate_limited(&error) {
+                        self.back_off(retry_after)?;
+                        continue;
+                    }
+                    if is_transient(&error) && !server_error_retried {
+                        server_error_retried = true;
+                        self.note(format!("{error} — waiting 60s and retrying once"));
+                        nap(RETRY_AFTER, self.cancel)?;
+                        continue;
+                    }
+                    return Err(SamplerError::Ninja(error));
+                }
+                Err(other) => return Err(other),
             }
-            other => other,
         }
+    }
+
+    /// 撞上一个 429:爬一格退避阶梯,把这一轮剩下的请求也放慢一档,然后睡。
+    ///
+    /// 放慢只做一次:再撞第二个 429 时该长的是等待时间,不是间隔 ——
+    /// 间隔翻两次就变成四倍,一轮采样从半小时拖成两小时,而多出来的三小时
+    /// 并不会让对面更高兴。
+    fn back_off(&mut self, retry_after: Option<u64>) -> Result<(), SamplerError> {
+        self.rate_limit_hits += 1;
+        if !self.slowed_down {
+            self.slowed_down = true;
+            self.pacer.gap *= 2;
+        }
+        let wait = rate_limit_delay(self.rate_limit_hits, retry_after);
+        self.note(format!(
+            "poe.ninja asked us to slow down — waiting {}s (attempt {})",
+            wait.as_secs(),
+            self.rate_limit_hits
+        ));
+        nap(wait, self.cancel)
     }
 
     fn attempt<T>(
@@ -852,6 +989,8 @@ impl<'a> Sampler<'a> {
             let total = done + count(pending.len());
             for row in pending {
                 check_cancel(self.cancel)?;
+                // 先记下"正在跑第几个":这一条要是撞上 429,状态行得说得出数字。
+                self.mark_progress(done, total.max(done));
                 let note = match self.run_partition(&row.partition_key, row.tier) {
                     Ok(matched) => format!("{} → {matched} characters", label(&row.partition_key)),
                     Err(SamplerError::Cancelled) => return Err(SamplerError::Cancelled),
@@ -876,6 +1015,8 @@ impl<'a> Sampler<'a> {
     /// `""` 自己也在清单里,而它的响应此刻就在手上——直接标完成,
     /// 不要为了走流程再问一次同样的问题。
     fn first_pass(&mut self, league: &LeagueBuild) -> Result<Vec<Partition>, SamplerError> {
+        // 这一步就一个请求,但它也可能吃 429,所以进度数字先立起来。
+        self.mark_progress(0, 1);
         let response = self.search(&[])?;
         self.ensure_dictionaries(&response)?;
 
@@ -957,6 +1098,7 @@ impl<'a> Sampler<'a> {
         let mut done = 0u32;
         for type_name in UNIQUE_TYPES {
             check_cancel(self.cancel)?;
+            self.mark_progress(done, total);
             let name = league_name.clone();
             match self.fetch(|client| client.unique_prices(&name, type_name)) {
                 Ok(overview) => {
@@ -1004,6 +1146,9 @@ impl<'a> Sampler<'a> {
         let total = count(queue.len());
         for (index, row) in queue.iter().enumerate() {
             check_cancel(self.cancel)?;
+            // 每 10 个才报一次进度,但数字每一个都要更新:中间那 9 个撞上 429 时,
+            // 状态行说的得是"角色 71/2000",不是"角色 0/0"。
+            self.mark_progress(count(index), total);
             let version = self.version.clone();
             let snapshot = self.snapshot_name.clone();
             let account = row.account.clone();
@@ -1095,7 +1240,23 @@ impl<'a> Sampler<'a> {
         Ok(())
     }
 
-    fn progress(&self, done: u32, total: u32, note: String) {
+    /// 只记下"跑到哪了",不发事件。
+    ///
+    /// 角色那一步每 10 个才报一次进度,中间那 9 个要是撞上 429,
+    /// 状态行也得说得出真数字,而不是把它抹成 `0/0`。
+    fn mark_progress(&mut self, done: u32, total: u32) {
+        self.progress_done = done;
+        self.progress_total = total;
+    }
+
+    /// 一条只带说明、沿用当前阶段进度数字的事件。出网那一层用它。
+    fn note(&mut self, note: String) {
+        let (done, total) = (self.progress_done, self.progress_total);
+        self.progress(done, total, note);
+    }
+
+    fn progress(&mut self, done: u32, total: u32, note: String) {
+        self.mark_progress(done, total);
         (self.emit)(SamplerEvent::Progress {
             stage: self.stage,
             done,
@@ -1487,10 +1648,154 @@ mod ninja_sampler_tests {
         assert_eq!(rows[1].level, 97);
     }
 
+    /// 一个脚本化的"客户端":按顺序把预先排好的结果一个个吐出来。
+    ///
+    /// 真的 [`NinjaClient`] 要联网,而 429 这一段的全部风险都在"第几次、
+    /// 等多久、要不要放弃"上,跟网络没关系 —— 所以拿一份剧本演给它看就够了。
+    fn scripted(
+        script: Vec<Result<u8, NinjaError>>,
+    ) -> impl Fn(&NinjaClient) -> Result<u8, NinjaError> {
+        let queue = std::cell::RefCell::new(script.into_iter());
+        move |_client| queue.borrow_mut().next().expect("剧本演完了还在要下一条")
+    }
+
+    fn limited(retry_after_secs: Option<u64>) -> NinjaError {
+        NinjaError::RateLimited { retry_after_secs }
+    }
+
+    /// 一轮"节奏尽量快"的采样,好让测试不用真的睡。
+    fn brisk_config() -> SamplerConfig {
+        let mut config = SamplerConfig::new("forbiddenrites", "Forbidden Rites");
+        config.tuning.min_request_gap_ms = 2;
+        config
+    }
+
+    /// 连着两个 429 也不能放弃 —— 这就是那次"角色 0/0"卡住的根:
+    /// 老版本只重试一次,第二个 429 就被当成"这个角色抓不到了"抛出去,
+    /// 于是 2,000 个角色一人烧两个请求 + 60 秒,一整夜也采不完一个人。
+    #[test]
+    fn a_rate_limit_is_waited_out_instead_of_dropped_after_one_retry() {
+        let store = NinjaStore::open_in_memory().expect("store");
+        let config = brisk_config();
+        let cancel = AtomicBool::new(false);
+        let emit = |_: SamplerEvent| {};
+        let mut sampler = Sampler::new(store, &config, &cancel, &emit);
+
+        // 服务端自己说"0 秒后再来",所以这条测试不用真的睡满退避阶梯。
+        let call = scripted(vec![Err(limited(Some(0))), Err(limited(Some(0))), Ok(7)]);
+        assert_eq!(sampler.fetch(call).expect("第三次该通了"), 7);
+    }
+
+    /// 429 那条状态行必须说得出"跑到哪了"。
+    ///
+    /// 老版本在出网那一层写死 `progress(0, 0, …)`,于是界面上永远是
+    /// "角色 0/0 · 429" —— 队列里明明还有 2,207 个人在排队。
+    #[test]
+    fn the_rate_limit_note_keeps_the_stage_counters() {
+        let store = NinjaStore::open_in_memory().expect("store");
+        let config = brisk_config();
+        let cancel = AtomicBool::new(false);
+        let seen = std::cell::RefCell::new(Vec::new());
+        let emit = |event: SamplerEvent| seen.borrow_mut().push(event);
+        let mut sampler = Sampler::new(store, &config, &cancel, &emit);
+        sampler.stage = SamplerStage::Characters;
+
+        // 阶段刚报过"第 70 个,共 2,000 个"。
+        sampler.progress(70, 2_000, "KingPinUwU".to_owned());
+        let call = scripted(vec![Err(limited(Some(0))), Ok(1)]);
+        sampler.fetch(call).expect("第二次该通了");
+
+        let notes: Vec<(u32, u32, String)> = seen
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                SamplerEvent::Progress {
+                    done, total, note, ..
+                } => Some((*done, *total, note.clone())),
+                _ => None,
+            })
+            .collect();
+        let slow_down = notes
+            .iter()
+            .find(|(_, _, note)| note.contains("slow down"))
+            .expect("撞上 429 该说一句人话");
+        assert_eq!(
+            (slow_down.0, slow_down.1),
+            (70, 2_000),
+            "429 那条不该把进度数字抹成 0/0"
+        );
+        assert!(slow_down.2.contains("attempt 1"), "{}", slow_down.2);
+    }
+
+    /// 撞过一次 429 之后,这一轮剩下的请求全部改用两倍的间隔:
+    /// 对面已经说过"太快了",按原速跑完只会再撞一次。
+    #[test]
+    fn one_rate_limit_slows_the_rest_of_the_run_down() {
+        let store = NinjaStore::open_in_memory().expect("store");
+        let config = brisk_config();
+        let cancel = AtomicBool::new(false);
+        let emit = |_: SamplerEvent| {};
+        let mut sampler = Sampler::new(store, &config, &cancel, &emit);
+        assert_eq!(sampler.pacer.gap, Duration::from_millis(2));
+
+        sampler
+            .fetch(scripted(vec![Err(limited(Some(0))), Ok(1)]))
+            .expect("重试该通");
+        assert_eq!(sampler.pacer.gap, Duration::from_millis(4));
+
+        // 只放慢一次:再撞一个 429 不该变成 8 毫秒、16 毫秒……
+        sampler
+            .fetch(scripted(vec![Err(limited(Some(0))), Ok(1)]))
+            .expect("重试该通");
+        assert_eq!(sampler.pacer.gap, Duration::from_millis(4));
+    }
+
+    /// 参考价必须排在角色详情**前面**。
+    ///
+    /// 这是那次卡住最贵的一笔账:参考价只有 6 个请求、几秒钟,角色详情却要
+    /// 跑大半个小时。排在后面的那一版里,角色详情一被限流,暗金页的
+    /// 参考价 / 挂单数 / 7 天三列就全是"—",而它们本来早就该到手了。
+    #[test]
+    fn the_cheap_prices_step_runs_before_the_long_character_step() {
+        use SamplerStep::{Aggregated, Characters, Facets, Prices};
+
+        assert_eq!(
+            stage_plan(SamplerStage::Aggregated),
+            vec![Facets, Prices, Characters, Aggregated]
+        );
+        assert_eq!(
+            stage_plan(SamplerStage::Characters),
+            vec![Facets, Prices, Characters]
+        );
+        assert_eq!(stage_plan(SamplerStage::Facets), vec![Facets, Prices]);
+        // `Planned` 是个"只刷新快照行"的停车位,但参考价照样跑:
+        // 它每一轮都跑,和跑到哪一步无关。
+        assert_eq!(stage_plan(SamplerStage::Planned), vec![Prices]);
+    }
+
+    /// 退避阶梯:服务端说了听服务端的,没说就 60 → 120 → 300 → 600 顶住。
+    #[test]
+    fn the_backoff_ladder_climbs_and_then_holds() {
+        assert_eq!(rate_limit_delay(1, None), Duration::from_secs(60));
+        assert_eq!(rate_limit_delay(2, None), Duration::from_secs(120));
+        assert_eq!(rate_limit_delay(3, None), Duration::from_secs(300));
+        assert_eq!(rate_limit_delay(4, None), Duration::from_secs(600));
+        // 封顶之后一直是 600,不会越滚越大。
+        assert_eq!(rate_limit_delay(9, None), Duration::from_secs(600));
+        // 第 0 次不该越界(理论上不会发生,但一次 panic 就是整轮采样没了)。
+        assert_eq!(rate_limit_delay(0, None), Duration::from_secs(60));
+
+        // 服务端说了话就听它的,哪怕它说的比阶梯短。
+        assert_eq!(rate_limit_delay(4, Some(5)), Duration::from_secs(5));
+        assert_eq!(rate_limit_delay(1, Some(0)), Duration::ZERO);
+    }
+
     /// 429 和 5xx 值得再等一分钟,404 和解析失败不值得。
     #[test]
     fn only_rate_limits_and_server_errors_are_retried() {
-        assert!(is_transient(&NinjaError::Rejected(429)));
+        assert!(is_transient(&NinjaError::RateLimited {
+            retry_after_secs: None
+        }));
         assert!(is_transient(&NinjaError::Rejected(503)));
         assert!(!is_transient(&NinjaError::Rejected(404)));
         assert!(!is_transient(&NinjaError::Rejected(403)));

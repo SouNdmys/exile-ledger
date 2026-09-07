@@ -36,8 +36,8 @@ pub use live_worker::{
 };
 pub use ninja_sampler::{
     SamplerConfig, SamplerError, SamplerEvent, SamplerHandle, SamplerPlan, SamplerStage,
-    character_limit, highest_stage, plan_partitions, refresh_prices, run_sampler, should_skip,
-    stage_order,
+    SamplerStep, character_limit, highest_stage, plan_partitions, rate_limit_delay, refresh_prices,
+    run_sampler, should_skip, stage_order, stage_plan,
 };
 pub use poll::{PollEntry, PollOutcome, PollScheduler, budget_floor_interval};
 

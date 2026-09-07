@@ -433,8 +433,15 @@ impl AppShell {
         );
         let mods_slot_select =
             choice_select(pages::ninja_mods::slot_choices(&[], text), "", window, cx);
-        let mods_rarity_select =
-            choice_select(pages::ninja_mods::rarity_choices(&[], text), "", window, cx);
+        // 稀有度是唯一一个不从"全部"起步的下拉:这一页要回答的是"我该给自己
+        // 做一件什么样的装备",而只有稀有装答得上。`rarity_choices` 保证这一档
+        // 永远在选项里,所以这里选得中。
+        let mods_rarity_select = choice_select(
+            pages::ninja_mods::rarity_choices(&[], text),
+            pages::ninja_mods::DEFAULT_RARITY,
+            window,
+            cx,
+        );
         let mods_kind_select =
             choice_select(pages::ninja_mods::kind_choices(&[], text), "", window, cx);
 

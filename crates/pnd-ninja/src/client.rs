@@ -31,10 +31,15 @@ const BUILDS_BASE: &str = "https://poe.ninja/poe2/api/builds";
 const DATA_BASE: &str = "https://poe.ninja/poe2/api/data";
 const ECONOMY_BASE: &str = "https://poe.ninja/poe2/api/economy";
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum NinjaError {
     #[error("poe.ninja rejected the request with status {0}")]
     Rejected(u16),
+    /// 429。单独一档而不是 `Rejected(429)`,是因为**只有它带着一句服务端自己的
+    /// 建议**(`Retry-After`),而调用方对它的处置也和别的拒绝完全不同:
+    /// 别的拒绝是"这条抓不到了",429 是"你太快了,等等再来"。
+    #[error("poe.ninja asked us to slow down (429)")]
+    RateLimited { retry_after_secs: Option<u64> },
     #[error("response exceeded the {MAX_BODY_BYTES} byte limit")]
     TooLarge,
     /// 断网、DNS、TLS、代理——对调用方来说都是"稍后再试"。
@@ -140,15 +145,19 @@ impl Default for NinjaClient {
 impl NinjaClient {
     #[must_use]
     pub fn new() -> Self {
+        // 关掉 `http_status_as_error`(和 `pnd-trade` 那个 agent 同一个理由):
+        // ureq 3 默认把 4xx/5xx 变成一个只剩状态码的错误,响应头连同 429 的
+        // `Retry-After` 一起被扔掉。我们要那一行,所以自己判状态。
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(TIMEOUT))
+            .http_status_as_error(false)
             .build();
         Self {
             agent: config.into(),
         }
     }
 
-    /// 所有请求的唯一出口:一个地方管 User-Agent、gzip 和长度上限。
+    /// 所有请求的唯一出口:一个地方管 User-Agent、gzip、状态码和长度上限。
     /// (gzip 由 ureq 的 `gzip` feature 自动协商,不用手写 Accept-Encoding。)
     fn get_bytes(&self, url: &str) -> Result<Vec<u8>, NinjaError> {
         let mut response = self
@@ -157,6 +166,21 @@ impl NinjaClient {
             .header("User-Agent", USER_AGENT)
             .call()
             .map_err(classify_transport)?;
+
+        let status = response.status().as_u16();
+        if status == 429 {
+            return Err(NinjaError::RateLimited {
+                retry_after_secs: response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_retry_after),
+            });
+        }
+        if !(200..300).contains(&status) {
+            return Err(NinjaError::Rejected(status));
+        }
+
         response
             .body_mut()
             .with_config()
@@ -239,9 +263,27 @@ impl NinjaClient {
     }
 }
 
+/// `Retry-After` 的值 → 秒。
+///
+/// RFC 允许两种写法:一个秒数,或者一个 HTTP 日期。poe.ninja 用的是秒数,
+/// 日期那种**故意不解析** —— 为了一个没见过的写法引一个日期库不划算,
+/// 认不出来时调用方自己有一套退避阶梯兜着,比解析出一个错的秒数安全。
+#[must_use]
+pub fn parse_retry_after(raw: &str) -> Option<u64> {
+    let secs: u64 = raw.trim().parse().ok()?;
+    // 上限一小时:一个离谱的头不该把后台线程钉在那儿睡一整天。
+    Some(secs.min(3_600))
+}
+
 /// 把 ureq 的错分成"对面拒绝""包太大""根本没连上"三类,别的都当连不上。
+///
+/// agent 关了 `http_status_as_error`,所以 `StatusCode` 理论上不会再出现;
+/// 留着这一支是因为 ureq 内部(比如跟重定向)还可能自己抛一个。
 fn classify_transport(error: ureq::Error) -> NinjaError {
     match error {
+        ureq::Error::StatusCode(429) => NinjaError::RateLimited {
+            retry_after_secs: None,
+        },
         ureq::Error::StatusCode(status) => NinjaError::Rejected(status),
         ureq::Error::BodyExceedsLimit(_) => NinjaError::TooLarge,
         other => NinjaError::Unreachable(other.to_string()),
@@ -365,5 +407,34 @@ mod client_tests {
         assert_eq!(encode("aZ0-_.~"), "aZ0-_.~");
         assert_eq!(encode("护甲"), "%E6%8A%A4%E7%94%B2");
         assert_eq!(encode("a/b?c=d"), "a%2Fb%3Fc%3Dd");
+    }
+
+    /// `Retry-After` 只认秒数那种写法,认不出来就交回给调用方的退避阶梯。
+    #[test]
+    fn retry_after_reads_seconds_and_ignores_everything_else() {
+        assert_eq!(parse_retry_after("60"), Some(60));
+        assert_eq!(parse_retry_after(" 120 "), Some(120));
+        assert_eq!(parse_retry_after("0"), Some(0));
+        // HTTP 日期那种写法:不解析,不猜。
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+        assert_eq!(parse_retry_after(""), None);
+        assert_eq!(parse_retry_after("-5"), None);
+        // 离谱的值钉在一小时,而不是让后台线程睡一整天。
+        assert_eq!(parse_retry_after("86400"), Some(3_600));
+    }
+
+    /// 429 有自己的一档:调用方靠它区分"这条抓不到了"和"你太快了"。
+    #[test]
+    fn a_rate_limit_is_its_own_kind_of_error() {
+        assert_eq!(
+            classify_transport(ureq::Error::StatusCode(429)),
+            NinjaError::RateLimited {
+                retry_after_secs: None
+            }
+        );
+        assert_eq!(
+            classify_transport(ureq::Error::StatusCode(404)),
+            NinjaError::Rejected(404)
+        );
     }
 }
