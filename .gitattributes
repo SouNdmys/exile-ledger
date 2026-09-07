@@ -11,3 +11,4 @@ tests/screenshots/*.jpg binary
 # repo and a guess that ever goes the other way costs the exe its icon with no
 # error louder than a cargo:warning.
 crates/ptt-app/assets/icon.ico binary
+crates/pnd-app/assets/icon.ico binary
