@@ -5,11 +5,12 @@
 //! 放在平台无关的模块里(可以在任何机器上测),所有 `unsafe` 和 Win32 调用
 //! 关在私有的 `win32` 里。
 //!
-//! 三块内容:
+//! 四块内容:
 //!
 //! - [`ValidatedWave`] / [`LoopingWavePlayer`] / [`built_in_alert_wave`] —— 报警音,
 //!   整段搬自 POE-Alarm;
 //! - [`AlertCardService`] —— 屏幕角落那张不抢焦点的提醒卡片;
+//! - [`LoginService`] —— 装着 Edge 内核(WebView2)的登录窗,用来取 `POESESSID`;
 //! - [`open_url`] —— 用默认浏览器打开官方交易页。
 
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -17,6 +18,7 @@
 mod alert_card;
 mod alert_cue;
 mod error;
+mod login;
 #[cfg(not(windows))]
 mod non_windows;
 mod wave;
@@ -30,6 +32,12 @@ pub use alert_card::{
 };
 pub use alert_cue::built_in_alert_wave;
 pub use error::PlatformError;
+pub use login::{
+    ACCOUNT_URL, AfterNavigation, COOKIE_ORIGIN, LOGIN_LOGICAL_HEIGHT, LOGIN_LOGICAL_WIDTH,
+    LOGIN_URL, LoginConfig, LoginEvent, LoginFailure, LoginService, MAX_AUTO_NAVIGATIONS,
+    SESSION_COOKIE, SITE_PREFIX, after_navigation, is_account_url, login_geometry,
+    pick_session_cookie,
+};
 pub use wave::{
     LoopingWavePlayer, PcmWaveFormat, ValidatedWave, WaveValidationError, WaveValidationErrorKind,
     validate_pcm_wave,

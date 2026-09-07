@@ -9,6 +9,7 @@ use std::thread::{self, JoinHandle};
 
 use crate::PlatformError;
 use crate::alert_card::{CardConfig, CardError, CardEvent, CardOwnership, CardShared};
+use crate::login::{LoginConfig, LoginEvent, LoginShared};
 
 pub(crate) fn play_wave(_bytes: &[u8]) -> Result<(), PlatformError> {
     Err(PlatformError::unsupported("WinMM WAV playback"))
@@ -45,4 +46,26 @@ pub(crate) fn wake_card(_thread_id: u32) -> Result<(), CardError> {
     Err(CardError::Platform(PlatformError::unsupported(
         "native alert card",
     )))
+}
+
+pub(crate) fn spawn_login_worker(
+    _config: LoginConfig,
+    _shared: Arc<LoginShared>,
+    _events: mpsc::Sender<LoginEvent>,
+    ready: mpsc::SyncSender<Result<(), PlatformError>>,
+) -> Result<JoinHandle<()>, PlatformError> {
+    // 和卡片一样:立刻通过握手通道报错,`LoginService::start` 就不会白等。
+    thread::Builder::new()
+        .name("pnd-login".to_owned())
+        .spawn(move || {
+            let _ = ready.send(Err(PlatformError::unsupported("WebView2 login window")));
+        })
+        .map_err(|error| PlatformError::Thread {
+            operation: "spawn(pnd-login)",
+            detail: error.to_string(),
+        })
+}
+
+pub(crate) fn wake_login(_thread_id: u32) -> Result<(), PlatformError> {
+    Err(PlatformError::unsupported("WebView2 login window"))
 }

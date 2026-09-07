@@ -15,11 +15,9 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush,
-    DEFAULT_CHARSET, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
-    DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FW_NORMAL, FW_SEMIBOLD, FillRect, FrameRect,
-    HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, ScreenToClient,
-    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    BeginPaint, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, EndPaint,
+    FW_NORMAL, FW_SEMIBOLD, FillRect, FrameRect, InvalidateRect, PAINTSTRUCT, ScreenToClient,
+    SetBkMode, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -32,17 +30,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GWL_EXSTYLE, GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW,
     GetWindowRect, HTCAPTION, HTCLIENT, HWND_TOPMOST, IDC_ARROW, IsWindow, KillTimer, LWA_ALPHA,
     LoadCursorW, MA_NOACTIVATE, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
-    RegisterClassExW, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetLayeredWindowAttributes,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
-    WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
-use super::error_from_windows;
+use super::paint::{
+    BORDER, BUTTON_FILL, BUTTON_HOVER, BUTTON_PRESSED, BUTTON_TEXT, Brush, Font, GOLD, HAIRLINE,
+    PANEL, RAIL, TEXT_META, TEXT_PRIMARY, TEXT_SECONDARY, draw_text,
+};
+use super::{error_from_windows, work_area};
 use crate::PlatformError;
 use crate::alert_card::{
     CardButton, CardCommand, CardConfig, CardError, CardEvent, CardOwnership, CardShared,
@@ -550,26 +551,6 @@ impl Drop for CardWindow {
     }
 }
 
-fn work_area() -> Result<RectI, PlatformError> {
-    let mut rect = RECT::default();
-    // SAFETY: SPI_GETWORKAREA 要求 pvparam 指向一个 RECT,这里正是。
-    unsafe {
-        SystemParametersInfoW(
-            SPI_GETWORKAREA,
-            0,
-            Some(std::ptr::from_mut(&mut rect).cast()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-    }
-    .map_err(|error| error_from_windows("SystemParametersInfoW(SPI_GETWORKAREA)", error))?;
-    Ok(RectI::new(
-        rect.left,
-        rect.top,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-    ))
-}
-
 fn ensure_class() -> Result<(), CardError> {
     CLASS_READY
         .get_or_init(|| {
@@ -769,25 +750,6 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
-    COLORREF((red as u32) | ((green as u32) << 8) | ((blue as u32) << 16))
-}
-
-/// 深色卡片配色,和 POE-Trade-Tracker 的 HUD 用同一套 token,免得两个工具
-/// 摆在一起像两家做的。
-const PANEL: COLORREF = rgb(0x17, 0x1B, 0x23);
-const BORDER: COLORREF = rgb(0x39, 0x42, 0x4F);
-const RAIL: COLORREF = rgb(0x1C, 0x21, 0x2B);
-const HAIRLINE: COLORREF = rgb(0x22, 0x28, 0x34);
-const GOLD: COLORREF = rgb(0xD9, 0xB9, 0x78);
-const TEXT_PRIMARY: COLORREF = rgb(0xE6, 0xE9, 0xEF);
-const TEXT_SECONDARY: COLORREF = rgb(0xA9, 0xB1, 0xBE);
-const TEXT_META: COLORREF = rgb(0x78, 0x82, 0x8F);
-const BUTTON_FILL: COLORREF = rgb(0x22, 0x28, 0x34);
-const BUTTON_HOVER: COLORREF = rgb(0x2E, 0x36, 0x44);
-const BUTTON_PRESSED: COLORREF = rgb(0x3A, 0x44, 0x54);
-const BUTTON_TEXT: COLORREF = rgb(0xD9, 0xE0, 0xEA);
-
 fn paint_card(hwnd: HWND, context: &WindowContext) {
     let mut paint = PAINTSTRUCT::default();
     // SAFETY: BeginPaint/EndPaint 在本函数内配对。
@@ -927,81 +889,5 @@ fn paint_card(hwnd: HWND, context: &WindowContext) {
     // SAFETY: 与上面的 BeginPaint 配对。
     unsafe {
         let _ = EndPaint(hwnd, &paint);
-    }
-}
-
-fn draw_text(
-    dc: HDC,
-    font: HFONT,
-    color: COLORREF,
-    text: &str,
-    mut bounds: RECT,
-    format: DRAW_TEXT_FORMAT,
-) {
-    // 空串的 Vec<u16> 是悬垂指针,DrawTextW 会访问违例;直接跳过。
-    if text.is_empty() {
-        return;
-    }
-    let mut utf16 = text.encode_utf16().collect::<Vec<_>>();
-    // SAFETY: dc/font 在本次绘制内有效;DrawTextW 只在 bounds 内绘制。
-    unsafe {
-        let previous = SelectObject(dc, HGDIOBJ(font.0));
-        SetTextColor(dc, color);
-        DrawTextW(dc, &mut utf16, &mut bounds, format);
-        SelectObject(dc, previous);
-    }
-}
-
-struct Brush(HBRUSH);
-
-impl Brush {
-    fn new(color: COLORREF) -> Self {
-        // SAFETY: CreateSolidBrush 无前置条件;Drop 里 DeleteObject。
-        Self(unsafe { CreateSolidBrush(color) })
-    }
-}
-
-impl Drop for Brush {
-    fn drop(&mut self) {
-        if !self.0.0.is_null() {
-            // SAFETY: 本类型独占这个画刷,至多删一次。
-            let _ = unsafe { DeleteObject(HGDIOBJ(self.0.0)) };
-        }
-    }
-}
-
-struct Font(HFONT);
-
-impl Font {
-    fn new(pixels: i32, weight: i32) -> Self {
-        // 用雅黑:卡片上会出现中文物品名和界面文案,Segoe UI 画中文要靠字体回退。
-        // SAFETY: 固定字体名的 CreateFontW;Drop 里 DeleteObject。
-        Self(unsafe {
-            CreateFontW(
-                -pixels.max(1),
-                0,
-                0,
-                0,
-                weight,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                0,
-                w!("Microsoft YaHei UI"),
-            )
-        })
-    }
-}
-
-impl Drop for Font {
-    fn drop(&mut self) {
-        if !self.0.0.is_null() {
-            // SAFETY: 本类型独占这个字体,至多删一次。
-            let _ = unsafe { DeleteObject(HGDIOBJ(self.0.0)) };
-        }
     }
 }

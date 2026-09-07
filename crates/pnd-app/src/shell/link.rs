@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use gpui::{ClipboardItem, Context};
 use pnd_domain::{ListingSummary, SearchRef, search_page_url};
 use pnd_platform_win::{
-    AlertCardService, CardButton, CardConfig, CardError, CardEvent, CardText, Corner,
-    ValidatedWave, built_in_alert_wave, open_url,
+    AlertCardService, CardButton, CardConfig, CardError, CardEvent, CardText, Corner, LoginConfig,
+    LoginEvent, LoginFailure, LoginService, ValidatedWave, built_in_alert_wave, open_url,
 };
 use pnd_runtime::{
     HideoutOutcome, MatchedListing, RuntimeCommand, RuntimeEvent, RuntimeHandle, RuntimePaths,
@@ -28,8 +28,12 @@ use pnd_runtime::{
 use pnd_settings::AppSettings;
 use pnd_trade::{BucketUsage, FETCH_POLICY, SEARCH_POLICY};
 
-use super::AppShell;
+use super::{AppShell, LoginPhase};
 use crate::i18n::{self, Text};
+
+/// 装 WebView2 的官方页面。没有 Edge 内核时那个按钮开的就是它。
+pub(crate) const WEBVIEW2_DOWNLOAD_URL: &str =
+    "https://developer.microsoft.com/microsoft-edge/webview2/";
 
 /// 提醒记录页一次读多少行。多到"这周的都在",少到一次查询感觉不到。
 pub(crate) const RECENT_ALERTS: u32 = 200;
@@ -147,6 +151,13 @@ impl AppShell {
             self.on_card_event(event, cx);
             changed = true;
         }
+        loop {
+            let Some(event) = self.login.as_ref().and_then(LoginService::try_next_event) else {
+                break;
+            };
+            self.on_login_event(event);
+            changed = true;
+        }
         // ninja 采样是第三个事件源。它和交易那两条完全无关(不碰交易站、
         // 不碰 actor),只是同样需要有人定期来取。
         changed |= self.drain_sampler_events();
@@ -220,6 +231,12 @@ impl AppShell {
                 // 那一串是唯一能拿去查的东西。
                 self.session_check_line = format!("{word} · {detail}");
                 self.set_notice(word.to_owned());
+                // 这一次检查是登录窗抓完会话自己发起的:那句"正在测试"已经有了
+                // 答案,擦掉,别让它永远挂在登录那一行上。别的状态字(比如
+                // "没有 WebView2,请手动粘")还得留着给人看。
+                if self.login_line == text.settings_login_captured {
+                    self.login_line.clear();
+                }
             }
             RuntimeEvent::Log(line) => self.push_log(line),
             RuntimeEvent::Fault(line) => {
@@ -227,6 +244,144 @@ impl AppShell {
                 self.set_sticky_notice(i18n::fill(text.notice_runtime_failed, &[&line]));
             }
         }
+    }
+
+    // ---- 程序内登录 --------------------------------------------------
+
+    /// 点了"登录官网"。
+    ///
+    /// 线程是懒起的:大多数启动根本用不上它。窗口标题和顶上那条提示是起线程
+    /// 时定死的,所以换过语言就先把旧线程扔掉再起一条 —— 中文界面配一句
+    /// 英文提示,看着像别人的窗口。
+    pub(crate) fn open_login_window(&mut self) {
+        let text = self.text();
+        if self.login.is_some() && self.login_language != self.settings.ui_language {
+            self.login = None;
+        }
+        if self.login.is_none() {
+            let config = LoginConfig {
+                user_data_dir: crate::webview2_data_dir(),
+                title: text.settings_login_window_title.to_owned(),
+                hint_text: text.settings_login_window_hint.to_owned(),
+            };
+            self.push_log(format!(
+                "login: webview2 data dir {}",
+                config.user_data_dir.display()
+            ));
+            match LoginService::start(config) {
+                Ok(service) => {
+                    self.login = Some(service);
+                    self.login_language = self.settings.ui_language.clone();
+                }
+                Err(error) => {
+                    self.push_log(format!("login thread failed to start: {error}"));
+                    self.login_phase = LoginPhase::Idle;
+                    self.login_line = i18n::fill(text.settings_login_failed, &[&error.to_string()]);
+                    return;
+                }
+            }
+        }
+        if let Some(login) = &self.login
+            && let Err(error) = login.open()
+        {
+            self.push_log(format!("login open failed: {error}"));
+            self.login_phase = LoginPhase::Idle;
+            self.login_line = i18n::fill(text.settings_login_failed, &[&error.to_string()]);
+            return;
+        }
+        // 乐观地当成"开着":建 WebView2 环境要一两秒,这期间按钮该是灰的,
+        // 否则手快点两下就是两次开窗请求。真开不出来时 `Failed` 会把它拨回来。
+        self.login_phase = LoginPhase::Open;
+        self.login_line = text.settings_login_opening.to_owned();
+    }
+
+    /// 点了"我已登录,现在核对"。
+    pub(crate) fn recheck_login(&mut self) {
+        let text = self.text();
+        let Some(login) = &self.login else {
+            return;
+        };
+        match login.capture() {
+            Ok(()) => self.login_line = text.settings_login_rechecking.to_owned(),
+            Err(error) => {
+                self.push_log(format!("login recheck failed: {error}"));
+                self.login_line = i18n::fill(text.settings_login_failed, &[&error.to_string()]);
+            }
+        }
+    }
+
+    fn on_login_event(&mut self, event: LoginEvent) {
+        let text = self.text();
+        match event {
+            LoginEvent::Opened => {
+                self.login_phase = LoginPhase::Open;
+                self.login_line = text.settings_login_opening.to_owned();
+            }
+            LoginEvent::Navigated { url, http_status } => {
+                // 只进日志。每一跳都往状态行上写一句,会把"已读到会话"这种
+                // 真正要看的话冲掉。
+                self.push_log(format!("login: {url} → {http_status:?}"));
+            }
+            // 名字不是秘密,值一个字符都没有出现在这个事件里。
+            LoginEvent::CookieNames(names) => {
+                self.push_log(format!("login: cookies {names:?}"));
+            }
+            LoginEvent::SessionCaptured { poesessid } => self.store_captured_session(poesessid),
+            LoginEvent::NotLoggedIn => self.login_line = text.settings_login_waiting.to_owned(),
+            LoginEvent::Closed => {
+                self.login_phase = LoginPhase::Idle;
+                // 抓到会话那条路已经把状态字写成"正在测试"了,别盖掉它。
+                if !self.session_check_busy {
+                    self.login_line = text.settings_login_closed.to_owned();
+                }
+            }
+            LoginEvent::Failed(failure) => {
+                self.push_log(format!("login failed: {failure}"));
+                self.login_phase = match failure {
+                    LoginFailure::RuntimeMissing => LoginPhase::RuntimeMissing,
+                    _ => LoginPhase::Idle,
+                };
+                self.login_line = match failure {
+                    LoginFailure::RuntimeMissing => text.settings_login_runtime_missing.to_owned(),
+                    other => i18n::fill(text.settings_login_failed, &[&other.to_string()]),
+                };
+            }
+        }
+    }
+
+    /// 存下刚登出来的那个会话,然后立刻拿它问一次交易站。
+    ///
+    /// 为什么马上就测:登录窗只能证明"官网认这个 cookie",而这个程序真正要用
+    /// 它的地方是交易站。两边偶尔不是一回事,与其等到下一次 live 连不上才发现,
+    /// 不如当场花掉一次搜索额度问清楚。
+    fn store_captured_session(&mut self, poesessid: String) {
+        let text = self.text();
+        if self.read_only {
+            self.set_sticky_notice(text.settings_read_only.to_owned());
+            self.login_line = text.settings_read_only.to_owned();
+            return;
+        }
+        self.settings.poesessid = poesessid;
+        self.settings.normalize();
+        if let Err(error) = self.settings_store.save(&self.settings) {
+            self.push_log(format!("settings save failed: {error}"));
+            self.login_line = i18n::fill(text.settings_save_failed, &[&error.to_string()]);
+            return;
+        }
+        // 值永远不进日志 —— 这一行只说"存了一个多长的东西"。
+        self.push_log(format!(
+            "login: stored a session of {} chars",
+            self.settings.poesessid.chars().count()
+        ));
+        // 框里还是空的,不写回去的话下一次按保存就把它清掉了。
+        self.poesessid_dirty = true;
+        self.apply_settings_to_runtime();
+        if self.send_runtime(pnd_runtime::RuntimeCommand::TestSession) {
+            self.session_check_busy = true;
+            self.session_check_line = text.settings_session_checking.to_owned();
+        }
+        self.login_line = text.settings_login_captured.to_owned();
+        self.set_notice(text.settings_login_captured.to_owned());
     }
 
     fn on_card_event(&mut self, event: CardEvent, cx: &mut Context<Self>) {

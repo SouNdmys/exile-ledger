@@ -26,7 +26,7 @@ use gpui_component::table::TableState;
 use gpui_component::{IndexPath, Selectable as _, Sizable as _, Size, StyledExt as _};
 
 use pnd_domain::{CurrencyRates, WatchId};
-use pnd_platform_win::AlertCardService;
+use pnd_platform_win::{AlertCardService, LoginService};
 use pnd_runtime::{MatchedListing, RuntimeHandle, SamplerHandle, WatchStatus, now_secs};
 use pnd_storage::{AlertRow, NinjaStore, WatchStore};
 use pnd_trade::BucketUsage;
@@ -128,6 +128,19 @@ impl SelectItem for Choice {
     }
 }
 
+/// 登录窗现在处于哪一档。设置页那两个按钮和那条状态字都看它。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LoginPhase {
+    /// 没开过,或者已经关了。
+    #[default]
+    Idle,
+    /// 窗口开着(或正在开)。这期间两个按钮不该再被按第二下。
+    Open,
+    /// 这台机器上没有 Edge 内核,登录窗根本开不出来 —— 只能手动粘 cookie,
+    /// 旁边给一个"去装 WebView2"的按钮。
+    RuntimeMissing,
+}
+
 /// 一个下拉的状态。
 pub type ChoiceSelect = Entity<SelectState<SearchableVec<Choice>>>;
 
@@ -202,6 +215,15 @@ pub struct AppShell {
     pub(crate) runtime: Option<RuntimeHandle>,
     /// 提醒卡片线程。`None` = 没有卡片,提醒只落在提醒记录页。
     pub(crate) alert_card: Option<AlertCardService>,
+    /// 登录窗那条线程。第一次点"登录官网"时才建 —— 大多数启动根本用不上它,
+    /// 没必要每次开程序都拉起一条 WebView2 线程。
+    pub(crate) login: Option<LoginService>,
+    /// 建那条线程时用的是哪门语言。换了语言就重建:窗口标题和顶上那条提示
+    /// 是启动时传进去的,之后改不了。
+    pub(crate) login_language: String,
+    pub(crate) login_phase: LoginPhase,
+    /// 登录那一行上的状态字。
+    pub(crate) login_line: String,
     /// 提醒记录页自己的一条库连接(actor 那条在别的线程上,不能共用)。
     pub(crate) alerts_store: Option<WatchStore>,
     /// ninja 两页自己的一条库连接。采样线程另开一条,WAL 让两边互不打断。
@@ -246,6 +268,12 @@ pub struct AppShell {
     /// 单独一个标志是因为重造下拉要 `&mut Window`,而 tick 手上没有窗口;
     /// 真正的重造放在 render 里做。
     pub(crate) ninja_filters_dirty: bool,
+    /// 登录窗读到的会话要写回设置页那个掩码输入框。
+    ///
+    /// 单独一个标志的理由和 `ninja_filters_dirty` 一样:改输入框要
+    /// `&mut Window`,而心跳手上没有窗口。不写回的话,框里还是空的,
+    /// 下一次按保存就会把刚登出来的会话清掉。
+    pub(crate) poesessid_dirty: bool,
     /// 两页各自的"显示全部"开关。
     pub(crate) uniques_show_all: bool,
     pub(crate) mods_show_all: bool,
@@ -427,6 +455,10 @@ impl AppShell {
             notice_at: None,
             runtime,
             alert_card,
+            login: None,
+            login_language: String::new(),
+            login_phase: LoginPhase::default(),
+            login_line: String::new(),
             alerts_store,
             ninja_store,
             sampler: None,
@@ -448,6 +480,7 @@ impl AppShell {
             uniques_dirty: true,
             mods_dirty: true,
             ninja_filters_dirty: true,
+            poesessid_dirty: false,
             uniques_show_all: false,
             mods_show_all: false,
             alerts_refresh_at: None,
@@ -649,6 +682,16 @@ impl AppShell {
         }
     }
 
+    /// 登录窗读到的会话写回那个掩码输入框。理由见 `poesessid_dirty`。
+    fn sync_poesessid_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.poesessid_dirty {
+            return;
+        }
+        self.poesessid_dirty = false;
+        let value = self.settings.poesessid.clone();
+        self.settings_form.write_poesessid(value, window, cx);
+    }
+
     /// 换语言之后,把语言烘进去的那些东西重造一遍。
     ///
     /// 表头和下拉选项在造出来的那一刻就把文字复制走了,之后不会自己跟着
@@ -726,6 +769,7 @@ impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_language(window, cx);
         self.sync_ninja_filters(window, cx);
+        self.sync_poesessid_field(window, cx);
         let text = self.text();
 
         let body = match self.page {

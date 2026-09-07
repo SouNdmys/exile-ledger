@@ -12,12 +12,17 @@ description = "Isolated Win32 platform services: alert sound, alert card, shell 
 sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
+# 0.38.x 是最后一条还依赖 windows 0.61 的分支(0.39 跳到了 0.62)。钉在这里
+# 的理由只有一个:workspace 用的就是 0.61.3,版本对上了整棵树里就只有一份
+# `windows` / `windows-core`,COM 接口类型不会分裂成两套互不认识的同名类型。
+webview2-com = "0.38.2"
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Graphics_Gdi",
     "Win32_Media",
     "Win32_Media_Audio",
+    "Win32_System_Com",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
     "Win32_UI_Shell",

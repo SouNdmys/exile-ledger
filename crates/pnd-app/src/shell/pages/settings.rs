@@ -16,8 +16,8 @@ use gpui_component::{Disableable as _, Sizable as _, Size, StyledExt as _};
 
 use crate::i18n::{self, Text};
 use crate::shell::{
-    AppShell, Choice, ChoiceSelect, choice_select, field_label, field_row, hint, page_heading,
-    panel, picker,
+    AppShell, Choice, ChoiceSelect, LoginPhase, choice_select, field_label, field_row, hint,
+    page_heading, panel, picker,
 };
 use crate::theme::*;
 
@@ -231,6 +231,16 @@ impl SettingsForm {
         );
     }
 
+    /// 只把会话那一格写回去。
+    ///
+    /// 登录窗读到会话之后走这一句,而不是整份 `write_back`:那会把用户
+    /// 刚打了一半、还没保存的联赛名之类一起冲掉。
+    pub fn write_poesessid(&self, value: String, window: &mut Window, cx: &mut Context<AppShell>) {
+        self.poesessid.update(cx, |state, cx| {
+            state.set_value(value, window, cx);
+        });
+    }
+
     /// 保存之后把 `normalize` 拉回范围的那些值写回框里。
     ///
     /// 不写回的话,屏幕上还留着刚才那个 5 秒的轮询间隔,而盘上存的是 60 —
@@ -323,9 +333,58 @@ impl AppShell {
         let no_session = self.settings.poesessid.trim().is_empty();
         let checking = self.session_check_busy;
         let session_line = self.session_check_line.clone();
+        // 登录窗开着(或正在开)时两个按钮都不该再被按 —— 按第二下只会
+        // 多一次开窗请求,窗口还是那一个。
+        let login_open = self.login_phase == LoginPhase::Open;
+        let login_line = self.login_line.clone();
         let session = section(
             text.settings_section_session,
             vec![
+                field_row()
+                    // 空标签只为对齐:按钮上已经写着"登录官网",左边再写一遍
+                    // 就是同一句话说两次。
+                    .child(field_label(""))
+                    .child(
+                        Button::new("settings-login")
+                            .primary()
+                            .label(text.settings_login)
+                            .with_size(Size::Small)
+                            .disabled(read_only || login_open || checking)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_login_window();
+                                cx.notify();
+                            })),
+                    )
+                    // 自动那条没触发时的退路。窗口不开着的时候它没有意义。
+                    .children(login_open.then(|| {
+                        Button::new("settings-login-check")
+                            .label(text.settings_login_check_now)
+                            .with_size(Size::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.recheck_login();
+                                cx.notify();
+                            }))
+                    }))
+                    // 没有 Edge 内核时才出现:那一行状态字说了要手动粘,
+                    // 这个按钮给的是另一条出路。
+                    .children((self.login_phase == LoginPhase::RuntimeMissing).then(|| {
+                        Button::new("settings-get-webview2")
+                            .label(text.settings_login_get_webview2)
+                            .with_size(Size::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_webview2_download();
+                                cx.notify();
+                            }))
+                    })),
+                field_row().child(field_label("")).child(
+                    div()
+                        .text_size(fs(FS_11))
+                        .text_color(muted())
+                        .child(SharedString::from(login_line)),
+                ),
+                field_row()
+                    .child(field_label(""))
+                    .child(hint(text.settings_login_hint)),
                 field_row()
                     .child(field_label(text.settings_poesessid))
                     .child(input_box(320., &form.poesessid, read_only))
@@ -488,6 +547,18 @@ impl AppShell {
                     )
                     .children(read_only.then(|| hint(text.settings_read_only))),
             )
+    }
+
+    /// 开微软那个装 WebView2 的页面。只有这台机器上没有 Edge 内核时才用得上。
+    fn open_webview2_download(&mut self) {
+        let text = self.text();
+        match pnd_platform_win::open_url(crate::shell::link::WEBVIEW2_DOWNLOAD_URL) {
+            Ok(()) => self.set_notice(text.notice_opened_trade.to_owned()),
+            Err(error) => {
+                self.push_log(format!("could not open the WebView2 page: {error}"));
+                self.set_notice(i18n::fill(text.notice_open_failed, &[&error.to_string()]));
+            }
+        }
     }
 
     /// 拿存下来的 cookie 去问交易站一次:你还认得它吗。
