@@ -103,6 +103,23 @@ pub struct SparkLine {
     pub data: Vec<Option<f64>>,
 }
 
+impl SparkLine {
+    /// 7 天涨跌。`None` 的意思是**这一周没有可比的历史**,不是"没涨没跌"。
+    ///
+    /// 这个区别是 7 天那一列唯一的难点。新联赛开了没几天时,poe.ninja 给的
+    /// `data` 长这样:`[null, null, null, null, null, null, 0]` —— 一整周只有
+    /// 今天一个点。一个点算不出变化,所以它照实写 `totalChange: 0`。
+    /// 把这个 0 原样存下来、原样画出去,界面上四百多件暗金就全是 `+0%`,
+    /// 读起来像"这一周整个市场纹丝不动",而真相是"还没有一周的数据"。
+    ///
+    /// 所以规矩是:`data` 里至少要有**两个**真数,这条走势才算数。
+    #[must_use]
+    pub fn change_percent(&self) -> Option<f64> {
+        let points = self.data.iter().flatten().count();
+        (points >= 2 && self.total_change.is_finite()).then_some(self.total_change)
+    }
+}
+
 /// 物品榜的表头。这里 `primary` 是 exalted,所以 `primary_value` 的单位是 exalted。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -257,6 +274,79 @@ mod economy_tests {
 
         assert_eq!(overview.lines[1].spark_line.total_change, -4.5);
         assert_eq!(overview.lines[1].spark_line.data[1], Some(1.0));
+    }
+
+    /// 2026-09-07 从线上 `UniqueWeapons` 剪下来的四行(icon、风味文本、词缀文本
+    /// 删掉了,`core.items` 清空,别的一个字没动)。
+    ///
+    /// 留一份真原文是因为 7 天那一列的 bug 完全是**数据形状**的问题:
+    /// 手编一份"看起来对"的 JSON 永远编不出 `[null × 6, 0]` 这个形状,
+    /// 而线上 140 行里有 121 行长这样。
+    const UNIQUE_WEAPONS: &str = include_str!("../fixtures/unique_weapons_overview.json");
+
+    /// 只有一个数据点时,7 天涨跌是"不知道",不是"0%"。
+    ///
+    /// 这就是"几乎每件暗金都显示 +0%"的根:线上 140 行里 121 行的 `data` 是
+    /// `[null × 6, 0]`,`totalChange` 于是照实写 0。把这个 0 当成"这周没变"
+    /// 存下来,整张榜就变成一片绿油油的 `+0%`。
+    #[test]
+    fn a_sparkline_with_a_single_point_has_no_seven_day_change() {
+        let overview: ItemOverview = serde_json::from_str(UNIQUE_WEAPONS).unwrap();
+        assert_eq!(overview.lines.len(), 4);
+
+        let ordained = &overview.lines[0];
+        assert_eq!(ordained.name, "The Ordained");
+        assert_eq!(ordained.spark_line.total_change, 0.0);
+        assert_eq!(ordained.spark_line.data.len(), 7);
+        assert_eq!(
+            ordained.spark_line.data.iter().flatten().count(),
+            1,
+            "一整周只有今天一个点"
+        );
+        assert_eq!(
+            ordained.spark_line.change_percent(),
+            None,
+            "一个点算不出一周的涨跌,该说不知道而不是说 0%"
+        );
+
+        // 两个点的那条才算数,而且值原样保留(-99.53,不是四舍五入的 -100)。
+        let trenchtimbre = &overview.lines[2];
+        assert_eq!(trenchtimbre.base_type, "Spiked Club");
+        assert_eq!(trenchtimbre.listing_count, 1_509);
+        assert_eq!(trenchtimbre.spark_line.change_percent(), Some(-99.53));
+
+        // 同一个名字的另一个底子只有一个点:它是 `None`,不是 0%。
+        let runeforged = &overview.lines[1];
+        assert_eq!(runeforged.base_type, "Runeforged Spiked Club");
+        assert_eq!(runeforged.spark_line.change_percent(), None);
+
+        assert_eq!(overview.lines[3].spark_line.change_percent(), Some(-95.73));
+    }
+
+    /// 手编的几种边角形状。
+    #[test]
+    fn only_two_real_points_make_a_seven_day_change() {
+        let spark = |json: &str| -> SparkLine { serde_json::from_str(json).unwrap() };
+        // 压根没有 `sparkLine` 字段时的默认值:空数组,当然不知道。
+        assert_eq!(SparkLine::default().change_percent(), None);
+        assert_eq!(
+            spark(r#"{"totalChange":-4.5,"data":[]}"#).change_percent(),
+            None
+        );
+        assert_eq!(
+            spark(r#"{"totalChange":-4.5,"data":[null,null,3.0]}"#).change_percent(),
+            None,
+            "只有一个真数还是不知道"
+        );
+        assert_eq!(
+            spark(r#"{"totalChange":-4.5,"data":[null,1.0,2.0]}"#).change_percent(),
+            Some(-4.5)
+        );
+        // 两个点、真的没变:这时候的 0% 是"这周确实平"，该显示出来。
+        assert_eq!(
+            spark(r#"{"totalChange":0,"data":[0,null,0]}"#).change_percent(),
+            Some(0.0)
+        );
     }
 
     #[test]

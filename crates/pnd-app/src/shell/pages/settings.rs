@@ -40,6 +40,7 @@ pub struct SettingsForm {
     pub dismiss_hotkey: Entity<InputState>,
     pub ninja_sample_target: Entity<InputState>,
     pub ninja_refresh_hours: Entity<InputState>,
+    pub ninja_hourly_budget: Entity<InputState>,
     pub ninja_request_gap: Entity<InputState>,
     pub user_agent_mode: ChoiceSelect,
 }
@@ -144,7 +145,12 @@ impl SettingsForm {
         );
         let ninja_sample_target = input(settings.ninja.sample_target.to_string(), "2000", false);
         let ninja_refresh_hours = input(settings.ninja.refresh_hours.to_string(), "24", false);
-        let ninja_request_gap = input(settings.ninja.min_request_gap_ms.to_string(), "1000", false);
+        let ninja_hourly_budget = input(
+            settings.ninja.max_requests_per_hour.to_string(),
+            "100",
+            false,
+        );
+        let ninja_request_gap = input(settings.ninja.min_request_gap_ms.to_string(), "2000", false);
 
         let language = choice_select(language_choices(), &settings.ui_language, window, cx);
         let corner = choice_select(corner_choices(text), &settings.alert.corner, window, cx);
@@ -197,6 +203,7 @@ impl SettingsForm {
             dismiss_hotkey,
             ninja_sample_target,
             ninja_refresh_hours,
+            ninja_hourly_budget,
             ninja_request_gap,
             user_agent_mode: user_agent_select,
         }
@@ -298,6 +305,10 @@ impl SettingsForm {
             (
                 &self.ninja_refresh_hours,
                 settings.ninja.refresh_hours.to_string(),
+            ),
+            (
+                &self.ninja_hourly_budget,
+                settings.ninja.max_requests_per_hour.to_string(),
             ),
             (
                 &self.ninja_request_gap,
@@ -520,6 +531,12 @@ impl AppShell {
                     read_only,
                 ),
                 unit_row(
+                    text.settings_ninja_hourly_budget,
+                    &form.ninja_hourly_budget,
+                    "",
+                    read_only,
+                ),
+                unit_row(
                     text.settings_ninja_request_gap,
                     &form.ninja_request_gap,
                     text.common_milliseconds_short,
@@ -684,6 +701,11 @@ impl AppShell {
             self.settings.ninja.refresh_hours,
             cx,
         );
+        let hourly_budget = number_of(
+            &form.ninja_hourly_budget,
+            self.settings.ninja.max_requests_per_hour,
+            cx,
+        );
         let request_gap = number_of(
             &form.ninja_request_gap,
             self.settings.ninja.min_request_gap_ms,
@@ -705,6 +727,7 @@ impl AppShell {
         self.settings.alert.dismiss_hotkey = dismiss_hotkey;
         self.settings.ninja.sample_target = sample_target;
         self.settings.ninja.refresh_hours = refresh_hours;
+        self.settings.ninja.max_requests_per_hour = hourly_budget;
         self.settings.ninja.min_request_gap_ms = request_gap;
     }
 }

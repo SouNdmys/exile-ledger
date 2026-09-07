@@ -28,7 +28,7 @@ use crate::search::SearchResponse;
 ///
 /// 2,000 这个数是有理由的:真实占比 10% 的词缀在这个样本量下误差约 ±1.3%
 /// (95% 置信),够回答"这个部位大家都上什么词缀";再往上翻倍只换来 ±0.9%,
-/// 但抓取时间也翻倍(角色详情是 1 秒一个)。
+/// 但抓取时间也翻倍(角色详情按小时预算走,默认 36 秒一个)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SampleOptions {
     pub sample_target: u32,

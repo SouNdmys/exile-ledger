@@ -149,11 +149,14 @@ fn divine_text(price_milli: i64, rates: &CurrencyRates) -> Option<String> {
 }
 
 /// 7 天涨跌。涨了标绿、跌了标琥珀 —— 这一列是给"现在该不该买"用的。
+///
+/// 留一位小数,不是四舍五入到整数。整数版把 `-99.53%` 印成 `-100%`
+/// ("这东西归零了"),也把 `+0.4%` 印成 `+0%` —— 两句都不是原话。
 fn change_cell(change: Option<f64>, text: &'static Text) -> Cell {
     let Some(change) = change.filter(|value| value.is_finite()) else {
         return Cell::muted(text.common_none);
     };
-    let body = format!("{change:+.0}{}", text.common_percent);
+    let body = format!("{change:+.1}{}", text.common_percent);
     if change > 0.0 {
         Cell::new(body, Tone::Good)
     } else if change < 0.0 {
@@ -357,10 +360,37 @@ mod ninja_uniques_tests {
         // 29.9 exalted,按 1 divine = 83.42 exalted 换算。
         assert_eq!(built[0][4].text(), "29.9 ex ≈ 0.36 div");
         assert_eq!(built[0][5].text(), "131");
-        assert_eq!(built[0][6].text(), "+6%");
+        assert_eq!(built[0][6].text(), "+6.0%");
         assert_eq!(built[0][6].tone(), Tone::Good);
-        assert_eq!(built[1][6].text(), "-9%");
+        assert_eq!(built[1][6].text(), "-9.0%");
         assert_eq!(built[1][6].tone(), Tone::Warn);
+    }
+
+    /// 跌了 99.53% 就写 `-99.5%`,不是 `-100%`。
+    ///
+    /// 那个 `-100%` 是四舍五入印出来的,而 `-100%` 在人眼里是"归零了"——
+    /// 完全不同的一句话。Trenchtimbre 那条榜上的怪数字就是这么来的。
+    #[test]
+    fn a_big_drop_keeps_its_decimal_instead_of_reading_as_zero() {
+        let text = &i18n::ENGLISH;
+        let cell = |change: Option<f64>| {
+            let rows = vec![UniqueRow {
+                name: "Trenchtimbre".to_owned(),
+                users: 1_000,
+                share_percent: 5.0,
+                price_milli: Some(85),
+                listings: Some(1_509),
+                change_percent: change,
+            }];
+            unique_rows(&rows, &rates(), false, text)[0][6].clone()
+        };
+        assert_eq!(cell(Some(-99.53)).text(), "-99.5%");
+        // 小到看不见的涨幅也是涨,别被抹成 +0%。
+        assert_eq!(cell(Some(0.4)).text(), "+0.4%");
+        assert_eq!(cell(Some(0.4)).tone(), Tone::Good);
+        // 真的没有一周历史时是"—",不是一个编出来的 0。
+        assert_eq!(cell(None).text(), "—");
+        assert_eq!(cell(None).tone(), Tone::Muted);
     }
 
     /// 经济接口里没有的那件东西,三格都写"—",不写 0 —— 0 会被读成"不值钱"。
@@ -391,7 +421,7 @@ mod ninja_uniques_tests {
         assert_eq!(all.len(), 4);
         assert_eq!(all[3][0].text(), "4");
         assert_eq!(all[3][1].text(), "Somebody's Trinket");
-        assert_eq!(all[3][6].text(), "+0%", "不涨不跌也是一个数");
+        assert_eq!(all[3][6].text(), "+0.0%", "有历史、真的没涨没跌,也是一个数");
         assert_eq!(all[3][6].tone(), Tone::Muted);
     }
 

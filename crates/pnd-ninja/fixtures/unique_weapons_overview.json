@@ -1,0 +1,113 @@
+{
+  "core": {
+    "items": [],
+    "rates": {
+      "exalted": 96.56,
+      "chaos": 23.4
+    },
+    "primary": "divine",
+    "secondary": "exalted"
+  },
+  "lines": [
+    {
+      "id": 551,
+      "itemId": "The Ordained Grand Spear",
+      "detailsId": "the-ordained-grand-spear",
+      "name": "The Ordained",
+      "baseType": "Grand Spear",
+      "icon": "https://web.poecdn.com/gen/image/trimmed.png",
+      "levelRequired": 84,
+      "category": "[Spear]",
+      "primaryValue": 53.0,
+      "listingCount": 97,
+      "corrupted": false,
+      "sparkLine": {
+        "totalChange": 0,
+        "data": [
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0
+        ]
+      }
+    },
+    {
+      "id": 440,
+      "itemId": "Trenchtimbre Runeforged Spiked Club",
+      "detailsId": "trenchtimbre-runeforged-spiked-club",
+      "name": "Trenchtimbre",
+      "baseType": "Runeforged Spiked Club",
+      "icon": "https://web.poecdn.com/gen/image/trimmed.png",
+      "levelRequired": 40,
+      "category": "Ezomyte [Mace|One Hand Mace]",
+      "primaryValue": 0.171,
+      "listingCount": 161,
+      "corrupted": false,
+      "sparkLine": {
+        "totalChange": 0,
+        "data": [
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0
+        ]
+      }
+    },
+    {
+      "id": 21,
+      "itemId": "Trenchtimbre Spiked Club",
+      "detailsId": "trenchtimbre-spiked-club",
+      "name": "Trenchtimbre",
+      "baseType": "Spiked Club",
+      "icon": "https://web.poecdn.com/gen/image/trimmed.png",
+      "levelRequired": 16,
+      "category": "Ezomyte [Mace|One Hand Mace]",
+      "primaryValue": 0.08548,
+      "listingCount": 1509,
+      "corrupted": false,
+      "sparkLine": {
+        "totalChange": -99.53,
+        "data": [
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          -99.53
+        ]
+      }
+    },
+    {
+      "id": 678,
+      "itemId": "Splinter of Lorrata Runeforged Hardwood Spear",
+      "detailsId": "splinter-of-lorrata-runeforged-hardwood-spear",
+      "name": "Splinter of Lorrata",
+      "baseType": "Runeforged Hardwood Spear",
+      "icon": "https://web.poecdn.com/gen/image/trimmed.png",
+      "levelRequired": 40,
+      "category": "[Spear]",
+      "primaryValue": 0.04274,
+      "listingCount": 480,
+      "corrupted": false,
+      "sparkLine": {
+        "totalChange": -95.73,
+        "data": [
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          -95.73
+        ]
+      }
+    }
+  ]
+}

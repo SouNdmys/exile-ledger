@@ -240,6 +240,22 @@ pub fn stage_word(stage: SamplerStage, text: &'static Text) -> &'static str {
     }
 }
 
+/// "还需多久":秒 → "3 小时 20 分"。
+///
+/// 和 [`countdown_text`](crate::shell::link::countdown_text) 不一样,这里两个
+/// 单位都留:采样要跑一整天,"还需 19 小时"和"还需 19 小时 50 分"差的那 50
+/// 分钟,正好是"今晚睡前能不能看到结果"的分界。
+#[must_use]
+pub fn eta_text(seconds: u64, text: &'static Text) -> String {
+    i18n::fill(
+        text.ninja_eta_hours_minutes,
+        &[
+            &(seconds / 3_600).to_string(),
+            &((seconds % 3_600) / 60).to_string(),
+        ],
+    )
+}
+
 /// 一条采样事件 → 状态行上的一句话。
 ///
 /// 纯函数带测试:这一句是采样跑起来之后用户唯一看得见的东西,而采样一跑
@@ -265,6 +281,22 @@ pub fn sampler_status(event: &SamplerEvent, text: &'static Text) -> String {
         SamplerEvent::StageDone(stage) => {
             i18n::fill(text.ninja_status_stage_done, &[stage_word(*stage, text)])
         }
+        SamplerEvent::Sampled {
+            characters,
+            target,
+            used_this_hour,
+            hourly_budget,
+            eta_secs,
+        } => i18n::fill(
+            text.ninja_status_sampled,
+            &[
+                &characters.to_string(),
+                &target.to_string(),
+                &used_this_hour.to_string(),
+                &hourly_budget.to_string(),
+                &eta_text(*eta_secs, text),
+            ],
+        ),
         SamplerEvent::Prices { types_done } => i18n::fill(
             text.ninja_status_prices,
             &[&types_done.to_string(), &UNIQUE_TYPES.len().to_string()],
@@ -285,13 +317,20 @@ pub fn is_final(event: &SamplerEvent) -> bool {
 
 /// 这条事件之后要不要重读一遍库。
 ///
-/// 阶段完成和价格刷新会往库里写新行,不重读的话页面上还是上一轮的数;
-/// 进度事件不写库,每条都重读一次会让界面在采样期间一直重建表格。
+/// 阶段完成、价格刷新、每 50 个角色的那次统计重建都会往库里写新行,不重读的话
+/// 页面上还是上一轮的数;进度事件不写库,每条都重读一次会让界面在采样期间
+/// 一直重建表格。
+///
+/// `Sampled` 那一条尤其要算进来:一轮采样要跑一整天,词缀页得跟着一点一点
+/// 长出来,而不是等到今晚收工才一次性冒出来。
 #[must_use]
 pub fn changes_the_cache(event: &SamplerEvent) -> bool {
     matches!(
         event,
-        SamplerEvent::StageDone(_) | SamplerEvent::Prices { .. } | SamplerEvent::Finished { .. }
+        SamplerEvent::StageDone(_)
+            | SamplerEvent::Sampled { .. }
+            | SamplerEvent::Prices { .. }
+            | SamplerEvent::Finished { .. }
     )
 }
 
@@ -482,6 +521,13 @@ mod ninja_tests {
                     note: String::new(),
                 },
                 SamplerEvent::StageDone(SamplerStage::Characters),
+                SamplerEvent::Sampled {
+                    characters: 74,
+                    target: 2_000,
+                    used_this_hour: 88,
+                    hourly_budget: 100,
+                    eta_secs: 69_336,
+                },
                 SamplerEvent::Prices { types_done: 6 },
                 SamplerEvent::Finished {
                     version: "1733".to_owned(),
@@ -533,6 +579,34 @@ mod ninja_tests {
         );
     }
 
+    /// 一轮采样要跑一整天,所以那一天里唯一的问题是"还要多久"。
+    ///
+    /// 这一句必须同时说清三件事:采到哪了、这一小时的配额还剩多少、
+    /// 按这个配额还要等多久。
+    #[test]
+    fn the_sampled_line_says_how_far_along_and_how_much_longer() {
+        let event = SamplerEvent::Sampled {
+            characters: 150,
+            target: 2_000,
+            used_this_hour: 88,
+            hourly_budget: 100,
+            // 还剩 1,850 个,一小时 100 个 = 18 小时 30 分。
+            eta_secs: 66_600,
+        };
+        assert_eq!(
+            sampler_status(&event, &i18n::SIMPLIFIED_CHINESE),
+            "已采 150/2000 · 本小时已用 88/100 · 预计还需 18 小时 30 分"
+        );
+        assert_eq!(
+            sampler_status(&event, &i18n::ENGLISH),
+            "150 / 2000 sampled · 88 / 100 requests this hour · about 18 h 30 min to go"
+        );
+
+        // 不到一小时也照样写两个单位:"0 小时 12 分"比"12 分"少一次心算。
+        assert_eq!(eta_text(720, &i18n::SIMPLIFIED_CHINESE), "0 小时 12 分");
+        assert_eq!(eta_text(0, &i18n::ENGLISH), "0 h 0 min");
+    }
+
     /// 跳过、跑完、失败都算"这一轮结束了",按钮要重新点亮;
     /// 进度和阶段完成不算 —— 那时线程还在跑。
     #[test]
@@ -552,6 +626,22 @@ mod ninja_tests {
             SamplerStage::Facets
         )));
         assert!(changes_the_cache(&SamplerEvent::Prices { types_done: 6 }));
+        // 每 50 个角色重建一次统计,页面得跟着长 —— 不重读的话,词缀页要空
+        // 到今晚收工那一刻。
+        assert!(changes_the_cache(&SamplerEvent::Sampled {
+            characters: 50,
+            target: 2_000,
+            used_this_hour: 88,
+            hourly_budget: 100,
+            eta_secs: 70_200,
+        }));
+        assert!(!is_final(&SamplerEvent::Sampled {
+            characters: 50,
+            target: 2_000,
+            used_this_hour: 88,
+            hourly_budget: 100,
+            eta_secs: 70_200,
+        }));
         assert!(!changes_the_cache(&SamplerEvent::Progress {
             stage: SamplerStage::Facets,
             done: 1,
@@ -596,6 +686,84 @@ mod ninja_tests {
         assert!(data.mods.is_empty());
         assert_eq!(data.characters_done, 0);
         assert_eq!(data.prices_fetched_at, None);
+    }
+
+    /// 抬头那句"已采 N 个角色"数的是**这个联赛累计**采到手的人,不是这一版
+    /// 快照抓了几个。
+    ///
+    /// 一小时 100 个请求下,2,000 个人要采一两天,中途快照会换好几次。按 version
+    /// 数的话,每换一次抬头就归零 —— 用户看到的是"采样一夜回到解放前",
+    /// 而库里那两千份原文明明都还在。
+    #[test]
+    fn the_sampled_count_adds_up_across_snapshots() {
+        let store = NinjaStore::open_in_memory().expect("store");
+        let league = "forbiddenrites";
+        let whole = vec![pnd_ninja::plan::Partition::new(
+            pnd_ninja::plan::PartitionTier::Whole,
+            Vec::new(),
+        )];
+        let queued: Vec<pnd_ninja::plan::SampledCharacter> = [
+            ("heygyus-0416", "ResurrectForbidden"),
+            ("dota-1809", "King"),
+        ]
+        .iter()
+        .map(|(account, name)| pnd_ninja::plan::SampledCharacter {
+            account: (*account).to_owned(),
+            name: (*name).to_owned(),
+            class: "Deadeye".to_owned(),
+            level: 98,
+            from_partition: String::new(),
+            tier: pnd_ninja::plan::PartitionTier::Whole,
+        })
+        .collect();
+
+        // 昨天抓了一个。
+        store
+            .enqueue_partitions(league, "yesterday", &whole)
+            .expect("enqueue");
+        store
+            .complete_partition(league, "yesterday", "", 2, &[], &queued, 1_000)
+            .expect("complete");
+        store
+            .complete_character(
+                league,
+                "heygyus-0416",
+                "ResurrectForbidden",
+                "yesterday",
+                "{}",
+                1_000,
+            )
+            .expect("done");
+
+        // 今天换了一版快照,又抓了一个。
+        store
+            .upsert_snapshot(&SnapshotRow {
+                league_url: league.to_owned(),
+                version: "today".to_owned(),
+                snapshot_name: "forbidden-rites".to_owned(),
+                total_characters: 65_371,
+                stage: pnd_storage::SnapshotStage::Characters,
+                started_at: 5_000,
+                finished_at: None,
+            })
+            .expect("snapshot");
+        store
+            .complete_character(league, "dota-1809", "King", "today", "{}", 5_100)
+            .expect("done");
+
+        let data = load(&store, league, "").expect("load");
+        assert_eq!(data.version(), Some("today"));
+        assert_eq!(data.characters_done, 2, "昨天采的那个不能从抬头里消失");
+        // 抬头那句话直接印这个数(格式由 `ninja_uniques` 那边的测试守)。
+        assert!(
+            crate::shell::pages::ninja_uniques::header_line(
+                "Forbidden Rites",
+                &data,
+                &i18n::SIMPLIFIED_CHINESE,
+                5_100
+            )
+            .contains("已采 2 个角色")
+        );
     }
 
     /// 一份跑完的缓存要能整份读回来:分区清单、暗金榜(拼上价格)、词缀统计。
@@ -650,7 +818,8 @@ mod ninja_tests {
             .expect("complete");
         let line: pnd_ninja::economy::UniquePriceLine = serde_json::from_str(
             r#"{"name":"Wake of Destruction","baseType":"Wrapped Greathelm","category":"Helmet",
-                 "primaryValue":29.9,"listingCount":131,"sparkLine":{"totalChange":-4.5,"data":[]}}"#,
+                 "primaryValue":29.9,"listingCount":131,
+                 "sparkLine":{"totalChange":-4.5,"data":[null,100.0,null,95.5]}}"#,
         )
         .expect("line");
         store

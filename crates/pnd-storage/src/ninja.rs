@@ -3,8 +3,9 @@
 //! 这个库和 `watch.sqlite` 的性质完全不同:**它随手删掉也不心疼**。里面全是能
 //! 重新抓回来的东西,存下来只为两件事——
 //!
-//! 1. **断点续跑。** 一轮完整采样是 ~65 次分区搜索 + 2,000 次角色详情(1 秒一个,
-//!    大半个小时)。程序关掉、断网、换快照,下次开起来必须接着上次跑,
+//! 1. **断点续跑。** 一轮完整采样是 ~65 次分区搜索 + 2,000 次角色详情。builds 接口
+//!    一个 IP 一小时只给 ~120 个请求,所以整轮要跑一两天。程序关掉、断网、换快照,
+//!    下次开起来必须接着上次跑,
 //!    而不是从头再来一遍。所以每个分区、每个角色都是一行带 `status` 的工作单。
 //! 2. **一天只打扰 poe.ninja 一次。** 快照 `version` 一天变好几次,但我们 24 小时
 //!    内不重跑;界面上翻来翻去看的都是库里这份缓存,零网络请求。
@@ -805,7 +806,10 @@ impl NinjaStore {
                     line.category,
                     to_milli(line.primary_value),
                     line.listing_count,
-                    line.spark_line.total_change,
+                    // 存 `change_percent()` 而不是原始的 `total_change`:
+                    // 只有一个数据点时那个 0 的意思是"没有一周的历史",
+                    // 存成 0 会在界面上变成一句"这周没涨没跌"的谎话。
+                    line.spark_line.change_percent(),
                 ])?;
             }
         }
@@ -1022,11 +1026,32 @@ mod ninja_tests {
         }
     }
 
+    /// 一行有一周历史的参考价:`data` 里两个真数,所以 `-4.5%` 算数。
     fn price_line(name: &str, base_type: &str, value: f64, listings: i64) -> UniquePriceLine {
+        priced(
+            name,
+            base_type,
+            value,
+            listings,
+            "[null,100.0,null,95.5]",
+            -4.5,
+        )
+    }
+
+    /// 同上,但走势由调用方给 —— 新联赛那种"一整周只有今天一个点"的形状
+    /// 就是靠它进测试的。
+    fn priced(
+        name: &str,
+        base_type: &str,
+        value: f64,
+        listings: i64,
+        data: &str,
+        total_change: f64,
+    ) -> UniquePriceLine {
         serde_json::from_str(&format!(
             r#"{{"name":"{name}","baseType":"{base_type}","category":"Ring",
                  "primaryValue":{value},"listingCount":{listings},
-                 "sparkLine":{{"totalChange":-4.5,"data":[]}}}}"#
+                 "sparkLine":{{"totalChange":{total_change},"data":{data}}}}}"#
         ))
         .expect("line")
     }
@@ -1486,6 +1511,88 @@ mod ninja_tests {
         );
     }
 
+    /// 角色详情是按 `(联赛, 账号, 角色名)` 缓存的,**和快照 version 无关**。
+    ///
+    /// 一小时 100 个请求意味着 2,000 个人要采一两天,中间快照 version 会换好几
+    /// 次。换一次就把昨天采到的人当成没采过,那这个目标永远也够不着 ——
+    /// 所以三件事必须成立:昨天抓过的今天不排队、计数把昨天的算进去、
+    /// 聚合读得到昨天的原文。
+    #[test]
+    fn character_details_survive_a_snapshot_change_and_stay_in_the_league_pot() {
+        let store = store();
+        // 昨天那一轮:排两个人,抓到一个。
+        store
+            .enqueue_partitions(LEAGUE, "yesterday", &partitions())
+            .expect("enqueue");
+        let yesterday = vec![
+            sampled("heygyus-0416", "ResurrectForbidden", PartitionTier::Whole),
+            sampled("dota2enjoyer-1809", "KingPinUwU", PartitionTier::Whole),
+        ];
+        store
+            .complete_partition(LEAGUE, "yesterday", "", 2, &[], &yesterday, 1_000)
+            .expect("complete");
+        store
+            .complete_character(
+                LEAGUE,
+                "heygyus-0416",
+                "ResurrectForbidden",
+                "yesterday",
+                r#"{"name":"ResurrectForbidden"}"#,
+                1_000,
+            )
+            .expect("done");
+
+        // 今天那一轮:新 version,同一批人加一张新面孔。
+        store
+            .enqueue_partitions(LEAGUE, "today", &partitions())
+            .expect("enqueue");
+        let mut today = yesterday.clone();
+        today.push(sampled(
+            "elinskiy2002-4257",
+            "sqvoznyak",
+            PartitionTier::Whole,
+        ));
+        store
+            .complete_partition(LEAGUE, "today", "", 3, &[], &today, 2_000)
+            .expect("complete");
+
+        // 昨天抓过的那个不再排队,队列里只剩两张没抓过的脸。
+        let queue = store.pending_characters(LEAGUE, 100).expect("pending");
+        assert_eq!(
+            queue
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["KingPinUwU", "sqvoznyak"],
+            "换一版快照不该让已经抓过的人重新排队"
+        );
+
+        // 计数和聚合读的都是整个联赛的锅,不分 version。
+        assert_eq!(store.character_counts(LEAGUE).expect("counts"), (2, 1, 0));
+        assert_eq!(
+            store.done_character_details(LEAGUE).expect("details"),
+            vec![r#"{"name":"ResurrectForbidden"}"#.to_owned()]
+        );
+
+        // 今天再抓一个,昨天那个还在。
+        store
+            .complete_character(
+                LEAGUE,
+                "dota2enjoyer-1809",
+                "KingPinUwU",
+                "today",
+                r#"{"name":"KingPinUwU"}"#,
+                2_100,
+            )
+            .expect("done");
+        assert_eq!(store.character_counts(LEAGUE).expect("counts"), (1, 2, 0));
+        assert_eq!(
+            store.done_character_details(LEAGUE).expect("details").len(),
+            2,
+            "统计要把两天采到的人都算进去"
+        );
+    }
+
     #[test]
     fn item_mods_are_replaced_wholesale_and_filtered_on_read() {
         let store = store();
@@ -1730,6 +1837,62 @@ mod ninja_tests {
             "别的分类不受影响"
         );
         assert_eq!(store.unique_prices_age(LEAGUE).expect("age"), Some(9_500));
+    }
+
+    /// 一整周只有一个数据点时,7 天那一列存进去的是 NULL,不是 0。
+    ///
+    /// 新联赛开头几天,poe.ninja 给的 `data` 是 `[null × 6, 0]` —— 它自己也
+    /// 只能写 `totalChange: 0`。照单存下来的话,榜上四百多件暗金全是 `+0%`,
+    /// 看着像"这周整个市场纹丝不动",而真相是"还没有一周的数据"。
+    #[test]
+    fn a_unique_without_a_weeks_history_stores_no_seven_day_change() {
+        let store = store();
+        store
+            .replace_unique_prices(
+                LEAGUE,
+                "UniqueWeapons",
+                &[
+                    // 线上那 121 行的形状:六个 null + 今天的 0。
+                    priced(
+                        "The Ordained",
+                        "Grand Spear",
+                        53.0,
+                        97,
+                        "[null,null,null,null,null,null,0]",
+                        0.0,
+                    ),
+                    // 线上那 19 行的形状:四天前一个点,今天一个点。
+                    priced(
+                        "Trenchtimbre",
+                        "Spiked Club",
+                        0.085_48,
+                        1_509,
+                        "[null,null,null,0,null,null,-99.53]",
+                        -99.53,
+                    ),
+                ],
+                9_000,
+            )
+            .expect("replace");
+
+        assert_eq!(
+            store
+                .unique_price(LEAGUE, "The Ordained")
+                .expect("read")
+                .expect("row")
+                .total_change,
+            None,
+            "没有一周的历史就该是空的,不是 0%"
+        );
+        assert_eq!(
+            store
+                .unique_price(LEAGUE, "Trenchtimbre")
+                .expect("read")
+                .expect("row")
+                .total_change,
+            Some(-99.53),
+            "真的跌了 99.53% 的那条要原样保留,不许四舍五入成 -100"
+        );
     }
 
     /// 同名不同底子时挑挂单多的那条——挂单少的那条不该当市价。

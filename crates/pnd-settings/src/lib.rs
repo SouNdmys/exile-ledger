@@ -159,7 +159,8 @@ impl Default for AlertTuning {
     }
 }
 
-/// poe.ninja 采样的旋钮。默认值就是计划里定的那套(目标 2000 个角色、1 秒一个请求)。
+/// poe.ninja 采样的旋钮。默认值就是计划里定的那套(目标 2000 个角色、
+/// 一小时 100 个请求)。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct NinjaTuning {
@@ -171,6 +172,14 @@ pub struct NinjaTuning {
     pub top_uniques: u32,
     /// 同一个联赛多久才重新采一次;24 小时内重开程序不该再打一遍 ninja。
     pub refresh_hours: u32,
+    /// **builds 接口的真正上限**:一个 IP 一小时大约 120 个请求,和发多快无关。
+    ///
+    /// 实测两轮都在 130 个左右吃到 429,第二轮还带了 `Retry-After: 3600`
+    /// ——那不是"你太密了",是"这一小时你用完了"。所以节流的主控从
+    /// "两次之间隔多久"换成了"这一小时还剩几个",默认 100 留两成余量。
+    pub max_requests_per_hour: u32,
+    /// 两次请求之间的**下限**。预算大到摊开比它还密时由它兜住;
+    /// 今天默认预算(100/小时 = 36 秒一个)远比它稀,所以它基本不起作用。
     pub min_request_gap_ms: u64,
     pub hardcore: bool,
 }
@@ -184,6 +193,7 @@ impl Default for NinjaTuning {
             top_global_skills: 10,
             top_uniques: 20,
             refresh_hours: 24,
+            max_requests_per_hour: 100,
             min_request_gap_ms: 2000,
             hardcore: false,
         }
@@ -551,6 +561,9 @@ mod settings_tests {
         assert_eq!(settings.alert.dismiss_hotkey, "ctrl+alt+d");
         assert!(!settings.alert.toast);
         assert_eq!(settings.ninja.sample_target, 2000);
+        // 一小时 100 个请求是观察出来的配额(~120)留了两成余量的结果。
+        assert_eq!(settings.ninja.max_requests_per_hour, 100);
+        assert_eq!(settings.ninja.min_request_gap_ms, 2000);
         assert_eq!(settings.user_agent_mode, UserAgentMode::Identified);
     }
 

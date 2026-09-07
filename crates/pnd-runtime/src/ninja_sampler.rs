@@ -13,10 +13,12 @@
 //! 3. NDIC 字典按 sha1 在内存里缓存:9 个分面共用 7 张表,一轮只抓 7 次。
 //! 4. 跑完所有 pending 分区(每个分区一次搜索 + 一个事务)。热门暗金榜到这里就有了。
 //! 5. 暗金参考价(6 个有文档的经济接口)。**每一轮都跑,而且排在角色详情前面**:
-//!    6 个请求、几秒钟,而下一步要跑大半个小时——把便宜的排在后面,就等于
+//!    6 个请求、几分钟,而下一步要跑一整天——把便宜的排在后面,就等于
 //!    "一被限流打断,暗金页的价格列永远是空的"。
-//! 6. 逐个抓角色详情,原文整段落库(`stop_after >= Characters` 才跑)。
-//! 7. 从原文重建词缀统计(`stop_after == Aggregated` 才跑)。
+//! 6. 逐个抓角色详情,原文整段落库(`stop_after >= Characters` 才跑)。**每 50 个
+//!    重建一次词缀统计**:小时预算下 2,000 个人要采一两天,词缀页不该空一整天。
+//! 7. 从原文重建词缀统计(`stop_after == Aggregated` 才跑)。第 6 步已经建过很多
+//!    次了,这一步只是收尾那一次。
 //!
 //! 第 4–7 步的顺序写在 [`stage_plan`] 这个纯函数里,`run_sampler` 只照单执行。
 //!
@@ -24,12 +26,13 @@
 //! 库里的阶段不能因此从 `characters` 退回 `facets`(见 [`highest_stage`])。
 //!
 //! 对 poe.ninja 的礼貌全压在一个 [`Pacer`] 上:**所有**出站请求都从它过一遍,
-//! 保证两次请求的**起点**至少隔 `min_request_gap_ms`(默认 1 秒),每次请求前
-//! 看一眼取消标志。撞上 429 就只等不放弃(听 `Retry-After`,没有就爬
-//! [`rate_limit_delay`] 那把阶梯),并且把这一轮剩下的间隔翻一倍;
-//! 5xx 是对面自己的毛病,睡 60 秒再试一次就不纠缠。
+//! 每次请求前看一眼取消标志。闸门本身是一个 [`HourlyBudget`]:builds 接口的
+//! 真正上限是"一个 IP 一小时多少个请求"(实测 ~120,和发多快无关),
+//! 所以主控是那个小时预算,`min_request_gap_ms` 只当下限。撞上 429 就只等
+//! 不放弃(听 `Retry-After`,没有就爬 [`rate_limit_delay`] 那把阶梯),并且
+//! 把这一轮剩下的小时预算砍一半;5xx 是对面自己的毛病,睡 60 秒再试一次就不纠缠。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,6 +95,13 @@ const CANCEL_SLICE: Duration = Duration::from_millis(100);
 
 /// 角色详情每抓这么多个发一次进度。2,000 个角色发 200 条事件,界面够用又不刷屏。
 const CHARACTER_PROGRESS_EVERY: usize = 10;
+
+/// 每抓这么多个角色就把词缀统计重建一次。
+///
+/// 一小时 100 个请求意味着 2,000 个人要采一整天。等到最后一步才建统计的话,
+/// 词缀页会空一整天,而中途关一次程序就前功尽弃。50 个 ≈ 半小时一次,
+/// 重建本身不出网(从库里的原文算),几百毫秒的事。
+const CHARACTER_AGGREGATE_EVERY: usize = 50;
 
 // ---------------------------------------------------------------------
 // 对外的类型
@@ -190,7 +200,7 @@ pub enum SamplerStep {
     Facets,
     /// 暗金参考价,6 个经济接口。
     Prices,
-    /// 角色详情:两千个人,一秒一个,大半个小时。
+    /// 角色详情:两千个人,按小时预算 36 秒一个,一整天。
     Characters,
     /// 词缀统计重建。不出网,从库里的原文算。
     Aggregated,
@@ -199,7 +209,7 @@ pub enum SamplerStep {
 /// 这一轮按什么顺序跑哪几步。
 ///
 /// 顺序本身就是一个决定,而它决定的是**被限流打断时哪些数据已经落地**:
-/// 参考价只有 6 个请求、几秒钟,角色详情要跑大半个小时,所以便宜的那一步
+/// 参考价只有 6 个请求、几分钟,角色详情要跑一整天,所以便宜的那一步
 /// 排在前面。反过来排的那一版里,角色详情一撞上 429,暗金页的
 /// 参考价 / 挂单数 / 7 天三列就永远是"—"。
 ///
@@ -283,6 +293,25 @@ pub enum SamplerEvent {
         note: String,
     },
     StageDone(SamplerStage),
+    /// 词缀统计又重建了一次(每 [`CHARACTER_AGGREGATE_EVERY`] 个角色一次,
+    /// 外加进出角色那一步各一次)。
+    ///
+    /// 一轮采样要跑一整天,所以这条事件同时干两件事:告诉界面"该重读一遍库了"
+    /// (词缀页于是一点一点长出来,而不是最后一刻才有),以及报一句
+    /// 人看得懂的进度。数字是散的、不是拼好的一句话 —— 界面文案归
+    /// `pnd-app` 的 `i18n` 管,运行时不该内联中文。
+    Sampled {
+        /// 这个联赛累计抓到手的角色数(**跨快照**,不是这一轮抓了几个)。
+        characters: u32,
+        /// `sample_target`。
+        target: u32,
+        /// 滑动的这一小时里已经发了几个请求。
+        used_this_hour: u32,
+        /// 这一小时准发几个(撞过 429 的话已经砍过一半)。
+        hourly_budget: u32,
+        /// 按这个预算,补满还要多少秒。
+        eta_secs: u64,
+    },
     /// 暗金参考价刷新了几类(一共 6 类)。
     Prices {
         types_done: u32,
@@ -357,6 +386,15 @@ pub fn character_limit(sample_target: u32, already_done: u32, max_characters: Op
     max_characters.map_or(remaining, |cap| cap.min(remaining))
 }
 
+/// 按小时预算算,还差 `remaining` 个角色要花多少秒。
+///
+/// 只看预算不看别的:一小时 100 个请求就是一小时 100 个角色,网速、
+/// 对面响应快慢都被那个间隔盖住了。
+#[must_use]
+pub fn budget_eta_secs(remaining: u32, hourly_budget: u32) -> u64 {
+    u64::from(remaining) * 3_600 / u64::from(hourly_budget.max(1))
+}
+
 /// 这一轮该按哪个联赛短名去问 poe.ninja。
 ///
 /// 界面手上只有 `settings.json` 里那个显示名(`Forbidden Rites`),短名是
@@ -371,16 +409,47 @@ fn resolve_league_url(index: &IndexState, league_name: &str, guessed: &str) -> S
         .to_owned()
 }
 
+/// 滑动窗口有多宽。配额是"每滚动一小时多少个",不是"每个整点清零"。
+const HOUR: Duration = Duration::from_secs(3_600);
+
 /// 距离下一次请求还该等多久。
 ///
-/// 节流看的是两次请求的**起点**而不是"上一次回来之后再等一秒":后者会让
-/// 每个慢请求都额外赔上它自己的耗时,一轮 2,000 个角色能白等十几分钟。
+/// 三个输入都是"相对现在"的时长,所以这个函数是纯的:测试里给几个
+/// [`Duration`] 就能把一整个小时的节奏跑完,不用真的睡。
+///
+/// - `used` / `limit`:这一小时已经发了几个、一共准发几个。
+/// - `since_last`:离上一个请求的**起点**过去多久(第一个请求是 `None`)。
+///   看起点而不是"上一次回来之后再等":后者会让每个慢请求都额外赔上
+///   它自己的耗时,一轮 2,000 个角色能白等十几分钟。
+/// - `oldest_age`:窗口里最老那个请求的年龄。
+/// - `floor`:设置里的最小间隔。
+///
+/// 两条约束取更晚的那个:
+///
+/// - **摊平**:一小时的预算均匀铺开(`3600/limit` 秒一个)。不摊平的话,
+///   开头三分钟就把 100 个打光,然后干等 57 分钟——平均值一样漂亮,
+///   可界面上是"要么全有要么全无",而且一被打断就什么都没落地。
+/// - **硬顶**:窗口里已经攒够 `limit` 个,就等最老的那个滚出这一小时。
+///   这一条才是"绝不超额"的保证,摊平只是让它好看。
 #[must_use]
-pub fn pace_delay(last_start: Option<Instant>, gap: Duration) -> Duration {
-    match last_start {
-        None => Duration::ZERO,
-        Some(last) => gap.saturating_sub(last.elapsed()),
+pub fn budget_delay(
+    used: u32,
+    limit: u32,
+    since_last: Option<Duration>,
+    oldest_age: Option<Duration>,
+    floor: Duration,
+) -> Duration {
+    // 0 会让摊平变成除以零。1 是"一小时一个",慢得离谱但不会炸。
+    let limit = limit.max(1);
+    let gap = (HOUR / limit).max(floor);
+    let mut wait = since_last.map_or(Duration::ZERO, |elapsed| gap.saturating_sub(elapsed));
+    if used >= limit {
+        // 窗口没有最老的一条却已经满了,只可能是 `limit` 是 0 被抬成了 1 而
+        // 一条都没发过 —— 那就别等。
+        let age = oldest_age.unwrap_or(HOUR);
+        wait = wait.max(HOUR.saturating_sub(age));
     }
+    wait
 }
 
 /// 一个分区的响应 → 可以直接进 `ninja_facets` 的行。
@@ -460,25 +529,89 @@ fn count(value: usize) -> u32 {
 // 节流
 // ---------------------------------------------------------------------
 
+/// 一小时的请求预算,滑动窗口。分面、参考价、角色详情共用**同一个**——
+/// poe.ninja 数的是这个 IP 一共发了多少个,不管它们分别是干什么的。
+///
+/// 自己不睡也不看表以外的东西:什么时候算"现在"由调用方给,
+/// 于是它是纯的,测试可以把一整个小时钉死时间跑完。
+pub struct HourlyBudget {
+    limit: u32,
+    floor: Duration,
+    /// 这一小时里每个请求的起点,最老的排在前面。
+    starts: VecDeque<Instant>,
+}
+
+impl HourlyBudget {
+    #[must_use]
+    pub fn new(limit: u32, floor: Duration) -> HourlyBudget {
+        HourlyBudget {
+            // 0 会让"摊平"变成除以零。1 是"一小时一个",慢得离谱但不会炸。
+            limit: limit.max(1),
+            floor,
+            starts: VecDeque::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    /// 把滚出这一小时的请求丢掉,返回窗口里还剩几个。进度行上的"本小时已用"。
+    pub fn used(&mut self, now: Instant) -> u32 {
+        while let Some(oldest) = self.starts.front() {
+            if now.duration_since(*oldest) >= HOUR {
+                self.starts.pop_front();
+            } else {
+                break;
+            }
+        }
+        count(self.starts.len())
+    }
+
+    /// 还该等多久。
+    pub fn delay(&mut self, now: Instant) -> Duration {
+        let used = self.used(now);
+        budget_delay(
+            used,
+            self.limit,
+            self.starts.back().map(|last| now.duration_since(*last)),
+            self.starts.front().map(|old| now.duration_since(*old)),
+            self.floor,
+        )
+    }
+
+    /// 记一笔"这个时刻发了一个"。
+    pub fn record(&mut self, at: Instant) {
+        self.starts.push_back(at);
+    }
+
+    /// 撞上 429 之后:这一轮剩下的时间预算砍一半。
+    ///
+    /// 观察到的配额只是估的(~120),吃到 429 说明估高了或者今天这个 IP
+    /// 还有别的东西在用。砍一半是**这一轮**的事,下次开程序重新按设置来。
+    pub fn halve(&mut self) {
+        self.limit = (self.limit / 2).max(1);
+    }
+}
+
 /// 全流程唯一的出网闸门。
 struct Pacer {
-    gap: Duration,
-    last_start: Option<Instant>,
+    budget: HourlyBudget,
 }
 
 impl Pacer {
-    fn new(gap: Duration) -> Pacer {
+    fn new(limit: u32, floor: Duration) -> Pacer {
         Pacer {
-            gap,
-            last_start: None,
+            budget: HourlyBudget::new(limit, floor),
         }
     }
 
     /// 睡到可以发下一个请求,顺便把取消标志看一遍。
     fn before_request(&mut self, cancel: &AtomicBool) -> Result<(), SamplerError> {
-        nap(pace_delay(self.last_start, self.gap), cancel)?;
+        nap(self.budget.delay(Instant::now()), cancel)?;
         check_cancel(cancel)?;
-        self.last_start = Some(Instant::now());
+        self.budget.record(Instant::now());
         Ok(())
     }
 }
@@ -754,7 +887,10 @@ impl<'a> Sampler<'a> {
     ) -> Sampler<'a> {
         Sampler {
             client: NinjaClient::new(),
-            pacer: Pacer::new(Duration::from_millis(config.tuning.min_request_gap_ms)),
+            pacer: Pacer::new(
+                config.tuning.max_requests_per_hour,
+                Duration::from_millis(config.tuning.min_request_gap_ms),
+            ),
             store,
             dictionaries: HashMap::new(),
             config,
@@ -814,16 +950,16 @@ impl<'a> Sampler<'a> {
         }
     }
 
-    /// 撞上一个 429:爬一格退避阶梯,把这一轮剩下的请求也放慢一档,然后睡。
+    /// 撞上一个 429:爬一格退避阶梯,把这一轮剩下的小时预算砍一半,然后睡。
     ///
-    /// 放慢只做一次:再撞第二个 429 时该长的是等待时间,不是间隔 ——
-    /// 间隔翻两次就变成四倍,一轮采样从半小时拖成两小时,而多出来的三小时
+    /// 砍只做一次:再撞第二个 429 时该长的是等待时间,不是预算 ——
+    /// 砍两次就只剩四分之一,一轮采样从一天拖成四天,而多出来的三天
     /// 并不会让对面更高兴。
     fn back_off(&mut self, retry_after: Option<u64>) -> Result<(), SamplerError> {
         self.rate_limit_hits += 1;
         if !self.slowed_down {
             self.slowed_down = true;
-            self.pacer.gap *= 2;
+            self.pacer.budget.halve();
         }
         let wait = rate_limit_delay(self.rate_limit_hits, retry_after);
         self.note(format!(
@@ -1125,6 +1261,9 @@ impl<'a> Sampler<'a> {
     fn character_stage(&mut self) -> Result<(), SamplerError> {
         self.stage = SamplerStage::Characters;
         let league_url = self.config.league_url.clone();
+        // 一个请求都还没发就先建一份统计。词缀表是按 version 存的,而换一天
+        // 就是换一个 version:不先建,词缀页会从今天开工那一刻起空到收工。
+        self.checkpoint()?;
         let (pending_now, already_done, _) = self.store.character_counts(&league_url)?;
         // 名单是按分区档次的顺序插进来的,所以"队列的下 N 个"天然就是
         // `select_sample` 会挑的那 N 个,不用把 6,500 行读进内存再排一次。
@@ -1183,7 +1322,31 @@ impl<'a> Sampler<'a> {
             if position % CHARACTER_PROGRESS_EVERY == 0 || position == queue.len() {
                 self.progress(count(position), total, note);
             }
+            // 每 50 个重算一次词缀统计:一轮要跑一整天,词缀页不该等到最后
+            // 一刻才有东西,中途关一次程序也不该前功尽弃。
+            if position % CHARACTER_AGGREGATE_EVERY == 0 || position == queue.len() {
+                self.checkpoint()?;
+            }
         }
+        Ok(())
+    }
+
+    /// 重建一次词缀统计,顺便报一句"采到哪了、这一小时还剩多少预算"。
+    fn checkpoint(&mut self) -> Result<(), SamplerError> {
+        self.rebuild_mods()?;
+        let league_url = self.config.league_url.clone();
+        let (_, characters, _) = self.store.character_counts(&league_url)?;
+        let target = self.config.tuning.sample_target;
+        let now = Instant::now();
+        let used_this_hour = self.pacer.budget.used(now);
+        let hourly_budget = self.pacer.budget.limit();
+        (self.emit)(SamplerEvent::Sampled {
+            characters,
+            target,
+            used_this_hour,
+            hourly_budget,
+            eta_secs: budget_eta_secs(target.saturating_sub(characters), hourly_budget),
+        });
         Ok(())
     }
 
@@ -1191,6 +1354,23 @@ impl<'a> Sampler<'a> {
 
     fn aggregate_stage(&mut self) -> Result<(), SamplerError> {
         self.stage = SamplerStage::Aggregated;
+        let (characters, rows, broken) = self.rebuild_mods()?;
+        self.progress(
+            count(characters),
+            count(characters + broken as usize),
+            format!("{rows} mod rows from {characters} characters ({broken} unparseable)"),
+        );
+        Ok(())
+    }
+
+    /// 从库里**整个联赛**已抓到手的角色原文重建词缀统计。不出网。
+    ///
+    /// "整个联赛"是重点:详情按 `(联赛, 账号, 角色名)` 缓存,不带 version,
+    /// 所以换一版快照只补新面孔,而统计要把以前采过的人全算进去。
+    /// 只统计这一轮排队的那批人,等于每天把昨天的样本扔掉重来。
+    ///
+    /// 返回 (算进去几个人, 出了几行统计, 几份原文读不动)。
+    fn rebuild_mods(&mut self) -> Result<(usize, usize, u32), SamplerError> {
         let league_url = self.config.league_url.clone();
         let raw = self.store.done_character_details(&league_url)?;
 
@@ -1209,16 +1389,7 @@ impl<'a> Sampler<'a> {
         let stats = aggregate_mods(&details);
         self.store
             .replace_item_mods(&league_url, &self.version, &stats)?;
-        self.progress(
-            count(details.len()),
-            count(raw.len()),
-            format!(
-                "{} mod rows from {} characters ({broken} unparseable)",
-                stats.len(),
-                details.len()
-            ),
-        );
-        Ok(())
+        Ok((details.len(), stats.len(), broken))
     }
 
     // ---- 杂活 --------------------------------------------------------
@@ -1485,22 +1656,235 @@ mod ninja_sampler_tests {
         assert_eq!(SamplerStage::Facets.as_str(), "facets");
     }
 
-    /// 第一次请求不等;隔得不够就补到一秒;已经超了就立刻走。
+    /// 一小时 100 个 = 36 秒一个,而且这个间隔从第一个请求起就生效。
+    ///
+    /// 这是这次改动的核心:老版本只管"两次之间隔 2 秒",于是一轮采样在头两
+    /// 分钟就把 100 多个请求打光,第 130 个左右吃 429 —— 而 `Retry-After: 3600`
+    /// 说得很清楚,对面数的是**这一小时一共发了多少个**,不是发得多密。
     #[test]
-    fn the_pacer_spaces_request_starts_not_request_ends() {
-        let gap = Duration::from_secs(1);
-        assert_eq!(pace_delay(None, gap), Duration::ZERO);
-
-        let left = pace_delay(Some(Instant::now() - Duration::from_millis(300)), gap);
-        assert!(
-            left > Duration::from_millis(500) && left <= Duration::from_millis(700),
-            "{left:?}"
-        );
-
+    fn an_hourly_budget_spreads_the_requests_across_the_hour() {
+        let floor = Duration::from_secs(2);
+        // 第一个请求不等。
+        assert_eq!(budget_delay(0, 100, None, None, floor), Duration::ZERO);
+        // 刚发过一个:补满 3600/100 = 36 秒。
         assert_eq!(
-            pace_delay(Some(Instant::now() - Duration::from_secs(5)), gap),
+            budget_delay(1, 100, Some(Duration::ZERO), Some(Duration::ZERO), floor),
+            Duration::from_secs(36)
+        );
+        // 上一个是 10 秒前发的,还差 26 秒。
+        assert_eq!(
+            budget_delay(
+                1,
+                100,
+                Some(Duration::from_secs(10)),
+                Some(Duration::from_secs(10)),
+                floor
+            ),
+            Duration::from_secs(26)
+        );
+        // 已经隔够了就立刻走。
+        assert_eq!(
+            budget_delay(
+                9,
+                100,
+                Some(Duration::from_secs(50)),
+                Some(Duration::from_secs(400)),
+                floor
+            ),
             Duration::ZERO
         );
+        // 预算减半 = 间隔加倍。
+        assert_eq!(
+            budget_delay(1, 50, Some(Duration::ZERO), Some(Duration::ZERO), floor),
+            Duration::from_secs(72)
+        );
+    }
+
+    /// 窗口满了就硬等最老的那个滚出这一小时 —— 这一条才是"绝不超额"的保证。
+    #[test]
+    fn a_full_window_waits_for_the_oldest_request_to_age_out() {
+        let floor = Duration::from_secs(2);
+        // 100 个都在窗口里,最老的那个是 50 分钟前发的:还要等 10 分钟。
+        assert_eq!(
+            budget_delay(
+                100,
+                100,
+                Some(Duration::from_secs(30)),
+                Some(Duration::from_secs(3_000)),
+                floor
+            ),
+            Duration::from_secs(600)
+        );
+        // 最老的刚好满一小时:硬顶那一条不再有话说,只剩摊平那一条。
+        assert_eq!(
+            budget_delay(100, 100, Some(HOUR), Some(HOUR), floor),
+            Duration::ZERO
+        );
+        // 超额了(设置被人改小)也只等到最老的那个滚出去,不会算出一个负数
+        // 绕回天文数字。上一个请求是两分钟前发的,摊平那一条已经没话说了。
+        assert_eq!(
+            budget_delay(
+                140,
+                100,
+                Some(Duration::from_secs(120)),
+                Some(Duration::from_secs(3_599)),
+                floor
+            ),
+            Duration::from_secs(1)
+        );
+    }
+
+    /// `min_request_gap_ms` 是**下限**:预算大到摊平出来比它还密时由它兜住。
+    #[test]
+    fn the_minimum_gap_is_a_floor_under_the_budget() {
+        let floor = Duration::from_secs(2);
+        // 一小时 36,000 个 = 0.1 秒一个,但设置说最少隔 2 秒。
+        assert_eq!(
+            budget_delay(1, 36_000, Some(Duration::ZERO), Some(Duration::ZERO), floor),
+            floor
+        );
+        // 预算是 0 的时候当成 1(一小时一个),而不是除以零。
+        assert_eq!(
+            budget_delay(1, 0, Some(Duration::ZERO), Some(Duration::ZERO), floor),
+            HOUR
+        );
+    }
+
+    /// 剩下的角色数 ÷ 小时预算 = 还要多少小时。状态行上那句"预计还需"。
+    #[test]
+    fn the_eta_comes_straight_out_of_the_hourly_budget() {
+        // 一个都没采,2,000 个人、一小时 100 个 = 20 小时。
+        assert_eq!(budget_eta_secs(2_000, 100), 20 * 3_600);
+        // 采了 1,850 个,还剩 150 个 = 5.4 小时。
+        assert_eq!(budget_eta_secs(150, 100), 5_400);
+        // 采满了就是 0,不是一个负数绕回来的天文数字。
+        assert_eq!(budget_eta_secs(0, 100), 0);
+        // 撞过 429、预算砍半:同样的活要两倍的时间。
+        assert_eq!(budget_eta_secs(2_000, 50), 40 * 3_600);
+        // 预算是 0 时当成 1,而不是除以零。
+        assert_eq!(budget_eta_secs(1, 0), 3_600);
+    }
+
+    /// 一份最小的角色详情原文:一只带生命的稀有戒指。
+    fn ring_detail(account: &str, name: &str) -> String {
+        format!(
+            r#"{{"account":"{account}","name":"{name}","items":[
+                 {{"itemSlot": 8, "itemData": {{"inventoryId": "Ring", "rarity": "Rare",
+                   "mods": {{"explicit": [
+                     {{"id": "IncreasedLife8", "stats": {{"base_maximum_life": 115}}}}]}}}}}}]}}"#
+        )
+    }
+
+    /// 换一天(= 换一版快照)之后,统计里必须还有昨天采到的那些人。
+    ///
+    /// 这是那个"一整天空白页"的坑:角色详情按 `(联赛, 账号, 角色名)` 缓存、
+    /// **不带 version**,词缀表却是按 version 存的。一小时 100 个请求下,
+    /// 2,000 个人要采一整天 —— 今天开工换了 version,不马上用昨天的原文重建
+    /// 一份挂在新 version 上,词缀页就从今天早上空到今晚收工。
+    #[test]
+    fn a_new_snapshot_rebuilds_the_stats_from_every_character_ever_cached() {
+        let store = NinjaStore::open_in_memory().expect("store");
+        let league = "forbiddenrites";
+        // 昨天那一轮:两个人,原文已经在库里。
+        store
+            .enqueue_partitions(
+                league,
+                "yesterday",
+                &[Partition::new(PartitionTier::Whole, Vec::new())],
+            )
+            .expect("enqueue");
+        let queued: Vec<SampledCharacter> = [
+            ("heygyus-0416", "ResurrectForbidden"),
+            ("dota2enjoyer-1809", "KingPinUwU"),
+        ]
+        .iter()
+        .map(|(account, name)| SampledCharacter {
+            account: (*account).to_owned(),
+            name: (*name).to_owned(),
+            class: "Gemling Legionnaire".to_owned(),
+            level: 98,
+            from_partition: String::new(),
+            tier: PartitionTier::Whole,
+        })
+        .collect();
+        store
+            .complete_partition(league, "yesterday", "", 2, &[], &queued, 1_000)
+            .expect("complete");
+        for character in &queued {
+            store
+                .complete_character(
+                    league,
+                    &character.account,
+                    &character.name,
+                    "yesterday",
+                    &ring_detail(&character.account, &character.name),
+                    1_000,
+                )
+                .expect("done");
+        }
+
+        // 今天:新的 version,而且**一个请求都不发**(`max_characters = 0`)。
+        let mut config = brisk_config();
+        config.max_characters = Some(0);
+        let cancel = AtomicBool::new(false);
+        let seen = std::cell::RefCell::new(Vec::new());
+        let emit = |event: SamplerEvent| seen.borrow_mut().push(event);
+        let mut sampler = Sampler::new(store, &config, &cancel, &emit);
+        sampler.version = "today".to_owned();
+        sampler.character_stage().expect("character stage");
+
+        let stats = sampler
+            .store
+            .slot_mods(league, "today", None, None, 0.0)
+            .expect("mods");
+        let life = stats
+            .iter()
+            .find(|row| row.stat_id == "base_maximum_life")
+            .expect("新 version 下就该有统计,而不是等到今晚聚合那一步");
+        assert_eq!(
+            life.characters, 2,
+            "昨天采到的人不能因为换了一版快照就从统计里消失"
+        );
+
+        // 报出来的也是**跨快照**的累计数,不是"这一轮抓了几个"。
+        let sampled = seen
+            .borrow()
+            .iter()
+            .find_map(|event| match event {
+                SamplerEvent::Sampled {
+                    characters,
+                    target,
+                    hourly_budget,
+                    eta_secs,
+                    ..
+                } => Some((*characters, *target, *hourly_budget, *eta_secs)),
+                _ => None,
+            })
+            .expect("重建一次就该报一句进度");
+        assert_eq!(sampled.0, 2);
+        assert_eq!(sampled.1, 2_000);
+        assert_eq!(sampled.3, budget_eta_secs(1_998, sampled.2));
+    }
+
+    /// 滑动窗口自己会把过期的请求丢掉,`used` 报的就是"本小时已用"。
+    #[test]
+    fn the_window_forgets_requests_older_than_an_hour() {
+        let mut budget = HourlyBudget::new(100, Duration::from_secs(2));
+        let now = Instant::now();
+        assert_eq!(budget.used(now), 0);
+
+        // 两个是 61 分钟前发的(已经滚出去了),一个是 10 分钟前。
+        budget.record(now - Duration::from_secs(3_700));
+        budget.record(now - Duration::from_secs(3_650));
+        budget.record(now - Duration::from_secs(600));
+        assert_eq!(budget.used(now), 1);
+        // 最近一个是 10 分钟前,早就隔够 36 秒了。
+        assert_eq!(budget.delay(now), Duration::ZERO);
+
+        // 429 之后砍一半:100 → 50 → 还是 50(只砍一次是调用方的规矩)。
+        assert_eq!(budget.limit(), 100);
+        budget.halve();
+        assert_eq!(budget.limit(), 50);
     }
 
     fn response() -> SearchResponse {
@@ -1663,9 +2047,11 @@ mod ninja_sampler_tests {
         NinjaError::RateLimited { retry_after_secs }
     }
 
-    /// 一轮"节奏尽量快"的采样,好让测试不用真的睡。
+    /// 一轮"节奏尽量快"的采样,好让测试不用真的睡:预算大到摊平也只有
+    /// 几毫秒,下限再压到 2 毫秒。
     fn brisk_config() -> SamplerConfig {
         let mut config = SamplerConfig::new("forbiddenrites", "Forbidden Rites");
+        config.tuning.max_requests_per_hour = 1_800_000;
         config.tuning.min_request_gap_ms = 2;
         config
     }
@@ -1727,33 +2113,35 @@ mod ninja_sampler_tests {
         assert!(slow_down.2.contains("attempt 1"), "{}", slow_down.2);
     }
 
-    /// 撞过一次 429 之后,这一轮剩下的请求全部改用两倍的间隔:
-    /// 对面已经说过"太快了",按原速跑完只会再撞一次。
+    /// 撞过一次 429 之后,这一轮剩下的**小时预算砍一半**:配额只是估出来的,
+    /// 吃到 429 就说明估高了,按原来的数字跑完只会再撞一次。
     #[test]
-    fn one_rate_limit_slows_the_rest_of_the_run_down() {
+    fn one_rate_limit_halves_the_hourly_budget_for_the_rest_of_the_run() {
         let store = NinjaStore::open_in_memory().expect("store");
+        // 用 brisk 的那个天文数字当预算,测试才不用真的等 36 秒一个请求;
+        // "砍一半"这件事和数字大小无关。
         let config = brisk_config();
         let cancel = AtomicBool::new(false);
         let emit = |_: SamplerEvent| {};
         let mut sampler = Sampler::new(store, &config, &cancel, &emit);
-        assert_eq!(sampler.pacer.gap, Duration::from_millis(2));
+        assert_eq!(sampler.pacer.budget.limit(), 1_800_000);
 
         sampler
             .fetch(scripted(vec![Err(limited(Some(0))), Ok(1)]))
             .expect("重试该通");
-        assert_eq!(sampler.pacer.gap, Duration::from_millis(4));
+        assert_eq!(sampler.pacer.budget.limit(), 900_000);
 
-        // 只放慢一次:再撞一个 429 不该变成 8 毫秒、16 毫秒……
+        // 只砍一次:再撞一个 429 不该变成四分之一、八分之一……那是把一天拖成四天。
         sampler
             .fetch(scripted(vec![Err(limited(Some(0))), Ok(1)]))
             .expect("重试该通");
-        assert_eq!(sampler.pacer.gap, Duration::from_millis(4));
+        assert_eq!(sampler.pacer.budget.limit(), 900_000);
     }
 
     /// 参考价必须排在角色详情**前面**。
     ///
     /// 这是那次卡住最贵的一笔账:参考价只有 6 个请求、几秒钟,角色详情却要
-    /// 跑大半个小时。排在后面的那一版里,角色详情一被限流,暗金页的
+    /// 跑一整天。排在后面的那一版里,角色详情一被限流,暗金页的
     /// 参考价 / 挂单数 / 7 天三列就全是"—",而它们本来早就该到手了。
     #[test]
     fn the_cheap_prices_step_runs_before_the_long_character_step() {
@@ -1810,7 +2198,7 @@ mod ninja_sampler_tests {
             nap(Duration::from_secs(60), &cancel),
             Err(SamplerError::Cancelled)
         ));
-        let mut pacer = Pacer::new(Duration::from_secs(1));
+        let mut pacer = Pacer::new(100, Duration::from_secs(1));
         assert!(matches!(
             pacer.before_request(&cancel),
             Err(SamplerError::Cancelled)

@@ -255,6 +255,11 @@ catalogue! {
     ninja_status_stage_done,
     /// "参考价 {} / {} 类"
     ninja_status_prices,
+    /// "已采 {}/{} · 本小时已用 {}/{} · 预计还需 {}" —— 采样要跑一整天,
+    /// 这一句是那一天里唯一能回答"还要多久"的东西。
+    ninja_status_sampled,
+    /// "{} 小时 {} 分"
+    ninja_eta_hours_minutes,
     ninja_status_finished,
     /// "采样失败:{}"
     ninja_status_failed,
@@ -319,6 +324,8 @@ catalogue! {
     settings_toast_unavailable,
     settings_ninja_sample_target,
     settings_ninja_refresh_hours,
+    /// builds 接口一个 IP 一小时的请求配额。今天节流的主控就是它。
+    settings_ninja_hourly_budget,
     settings_ninja_request_gap,
     settings_user_agent_mode,
     settings_user_agent_identified,
@@ -611,6 +618,8 @@ pub static ENGLISH: Text = Text {
     ninja_status_skipped: "Skipped: {}",
     ninja_status_stage_done: "{} done",
     ninja_status_prices: "reference prices {} / {}",
+    ninja_status_sampled: "{} / {} sampled · {} / {} requests this hour · about {} to go",
+    ninja_eta_hours_minutes: "{} h {} min",
     ninja_status_finished: "Sampling finished.",
     ninja_status_failed: "Sampling failed: {}",
     ninja_store_missing: "ninja.sqlite could not be opened, so the two heat pages stay empty.",
@@ -662,7 +671,8 @@ pub static ENGLISH: Text = Text {
     settings_toast_unavailable: "not available yet — an unpackaged app needs a Start-menu shortcut carrying an AppUserModelID before Windows will show a toast.",
     settings_ninja_sample_target: "Sample target",
     settings_ninja_refresh_hours: "Refresh every",
-    settings_ninja_request_gap: "Request gap",
+    settings_ninja_hourly_budget: "Requests per hour",
+    settings_ninja_request_gap: "Minimum gap",
     settings_user_agent_mode: "User agent",
     settings_user_agent_identified: "Identified",
     settings_user_agent_browser: "Browser",
@@ -886,6 +896,8 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     ninja_status_skipped: "这一轮跳过:{}",
     ninja_status_stage_done: "{}采完了",
     ninja_status_prices: "参考价 {} / {} 类",
+    ninja_status_sampled: "已采 {}/{} · 本小时已用 {}/{} · 预计还需 {}",
+    ninja_eta_hours_minutes: "{} 小时 {} 分",
     ninja_status_finished: "采样跑完了。",
     ninja_status_failed: "采样失败:{}",
     ninja_store_missing: "打不开 ninja.sqlite,两张热度榜会一直是空的。",
@@ -937,7 +949,8 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     settings_toast_unavailable: "暂时用不了 —— 没打包的程序得先在开始菜单里放一个带 AppUserModelID 的快捷方式,Windows 才肯弹通知。",
     settings_ninja_sample_target: "采样目标",
     settings_ninja_refresh_hours: "多久重采一次",
-    settings_ninja_request_gap: "请求间隔",
+    settings_ninja_hourly_budget: "每小时请求数",
+    settings_ninja_request_gap: "最小间隔",
     settings_user_agent_mode: "User-Agent",
     settings_user_agent_identified: "自报家门",
     settings_user_agent_browser: "浏览器",

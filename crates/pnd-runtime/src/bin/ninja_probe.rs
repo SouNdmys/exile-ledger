@@ -526,6 +526,18 @@ fn print_event(event: &SamplerEvent) {
             note,
         } => println!("[{:<10}] {done:>4}/{total:<4} {note}", stage.as_str()),
         SamplerEvent::StageDone(stage) => println!("[stage done] {}", stage.as_str()),
+        SamplerEvent::Sampled {
+            characters,
+            target,
+            used_this_hour,
+            hourly_budget,
+            eta_secs,
+        } => println!(
+            "[sampled]    {characters}/{target} characters  {used_this_hour}/{hourly_budget} \
+             requests this hour  eta {}h{:02}m",
+            eta_secs / 3_600,
+            (eta_secs % 3_600) / 60
+        ),
         SamplerEvent::Prices { types_done } => println!(
             "[prices]     {types_done}/{} unique types refreshed",
             UNIQUE_TYPES.len()
