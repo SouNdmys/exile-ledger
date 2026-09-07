@@ -5,8 +5,9 @@
 //! 1. **汇率** — 交易站的挂单币种五花八门,要换算到 divine 才能和你的价格上限比。
 //! 2. **暗金参考价** — 热门暗金榜的"值多少钱""有几个人在卖"。
 //!
-//! 两个端点的 `core` 都会告诉你计价基准是什么币:交易所是 divine,
-//! 物品榜是 exalted。**不要硬编码基准币**——它换过,以后还会换。
+//! 两个端点的 `core` 都会告诉你计价基准是什么币,**读它,别硬编码**——
+//! 物品榜的基准币 2026-09-06 还是 `exalted`,2026-09-07 就成了 `divine`。
+//! 硬编码那一版把 `0.08548`(≈ 8 个 exalted)读成了八分钱。
 
 use std::collections::BTreeMap;
 
@@ -120,7 +121,8 @@ impl SparkLine {
     }
 }
 
-/// 物品榜的表头。这里 `primary` 是 exalted,所以 `primary_value` 的单位是 exalted。
+/// 物品榜的表头。`primary` 就是 `primary_value` 的单位,**每一份原文自己说**:
+/// 2026-09-06 是 `exalted`,2026-09-07 是 `divine`,以后还会再换。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ItemCore {
@@ -321,6 +323,26 @@ mod economy_tests {
         assert_eq!(runeforged.spark_line.change_percent(), None);
 
         assert_eq!(overview.lines[3].spark_line.change_percent(), Some(-95.73));
+    }
+
+    /// 物品榜的计价基准是**这一份原文自己说的**,不是常数。
+    ///
+    /// 2026-09-06 抓到的那份 `core.primary` 是 `exalted`,代码于是把
+    /// "exalted" 写死在了存储和界面里。2026-09-07 这份原文里它已经是
+    /// `divine` —— 同一个 `primaryValue: 0.08548`,读成 exalted 是
+    /// "8 分钱",读成 divine 是"8 个 exalted",差了近百倍。
+    #[test]
+    fn the_item_overview_declares_its_own_base_currency() {
+        let overview: ItemOverview = serde_json::from_str(UNIQUE_WEAPONS).unwrap();
+        assert_eq!(overview.core.primary, "divine");
+
+        let trenchtimbre = &overview.lines[2];
+        assert_eq!(trenchtimbre.name, "Trenchtimbre");
+        assert_eq!(trenchtimbre.primary_value, 0.085_48);
+
+        // 老原文(2026-09-06)是另一个基准币,同样得照它说的读。
+        let older: ItemOverview = serde_json::from_str(ITEM_JSON).unwrap();
+        assert_eq!(older.core.primary, "exalted");
     }
 
     /// 手编的几种边角形状。

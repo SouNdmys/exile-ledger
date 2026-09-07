@@ -11,7 +11,9 @@
 //!    内不重跑;界面上翻来翻去看的都是库里这份缓存,零网络请求。
 //!
 //! 纪律和 `watch.rs` 一样:**库里没有时钟**,所有时间都是调用方传进来的 unix 秒;
-//! 金额存千分整数(暗金参考价 `primary_value_milli` 是 exalted × 1000)。
+//! 金额存千分整数(暗金参考价 `primary_value_milli` × 1000),而**单位跟着行走**
+//! —— 经济接口自报的 `core.primary` 换过一次(2026-09-06 是 exalted,
+//! 2026-09-07 是 divine),所以它存在 `primary_currency` 那一列里,不是常数。
 //!
 //! 角色表的主键是 `(league_url, account, name)` 而**不带 version**:同一个人在
 //! 新快照里还是同一个人,重跑时只补新面孔,已经抓过的不再花那一秒。
@@ -101,11 +103,38 @@ CREATE TABLE IF NOT EXISTS ninja_unique_prices (
     base_type TEXT NOT NULL,
     category TEXT NOT NULL,
     primary_value_milli INTEGER NOT NULL,
+    primary_currency TEXT NOT NULL DEFAULT 'divine',
     listing_count INTEGER NOT NULL,
     total_change REAL,
     PRIMARY KEY (league_url, type_name, name, base_type)
 ) STRICT;
 "#;
+
+/// 2026-09-07 加的一列:参考价的计价基准币。
+///
+/// 建表语句是 `CREATE TABLE IF NOT EXISTS`,所以它对**已经存在**的库一个字
+/// 都改不动 —— 老库里那张表还是没有这一列,读它会直接报错。这里补一次
+/// `ALTER TABLE`,用 `PRAGMA table_info` 判断加没加过(SQLite 没有
+/// "ADD COLUMN IF NOT EXISTS")。
+///
+/// 默认值填 `divine` 而不是 `exalted`:老行是从同一个端点抓来的,而那个端点
+/// 今天报的就是 divine;这张表本来也是一天重抓一次的缓存,下一轮价格一到
+/// 这些老行就全被换掉了。
+fn add_primary_currency_column(conn: &Connection) -> Result<(), StorageError> {
+    let mut columns = conn.prepare("PRAGMA table_info(ninja_unique_prices)")?;
+    let names = columns.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name? == "primary_currency" {
+            return Ok(());
+        }
+    }
+    drop(columns);
+    conn.execute_batch(
+        "ALTER TABLE ninja_unique_prices
+             ADD COLUMN primary_currency TEXT NOT NULL DEFAULT 'divine'",
+    )?;
+    Ok(())
+}
 
 /// 一轮采样跑到哪一步了。四步是顺序推进的,中途杀掉重开就从这里接着走。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -221,21 +250,24 @@ pub struct CharacterRow {
 /// 两张表在库里就拼好了。一行一次 [`NinjaStore::unique_price`] 也能拼出来,
 /// 但全联赛有四百多件暗金,那就是四百多次查询;`LEFT JOIN` 一次就够。
 ///
-/// 价格那三格是 `Option`:没有价格的暗金照样要上榜(新出的、或者压根没人挂单),
+/// 价格那几格是 `Option`:没有价格的暗金照样要上榜(新出的、或者压根没人挂单),
 /// 只是价格那几列写"—"。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UniqueUsagePriced {
     pub name: String,
     /// 这个分区里有多少个角色穿着它。
     pub users: u64,
-    /// 参考价,exalted × 1000。
+    /// 参考价 × 1000。**单位看下面那一格**,不是常数。
     pub price_milli: Option<i64>,
+    /// 上面那个数是什么币(`divine` / `exalted` / `chaos` / …)。
+    /// 和 `price_milli` 同生共死:价格表里没这件东西时两格都是 `None`。
+    pub price_currency: Option<String>,
     pub listings: Option<i64>,
     /// 7 天涨跌,百分比。价格表里有这件东西、但 `sparkLine` 是空的时候也是 `None`。
     pub change_percent: Option<f64>,
 }
 
-/// 一件暗金的参考价快照。价格单位是 exalted × 1000。
+/// 一件暗金的参考价快照。价格是 `primary_currency` × 1000。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UniquePriceRow {
     pub type_name: String,
@@ -243,6 +275,9 @@ pub struct UniquePriceRow {
     pub base_type: String,
     pub category: String,
     pub primary_value_milli: i64,
+    /// 抓这一行时经济接口自报的计价基准币。**不是常数**:2026-09-06 是
+    /// `exalted`,2026-09-07 就成了 `divine`。
+    pub primary_currency: String,
     pub listing_count: i64,
     pub total_change: Option<f64>,
     pub fetched_at: i64,
@@ -278,6 +313,7 @@ impl NinjaStore {
         // 采样线程和界面线程各开一个连接读同一个文件,5 秒足够错开一次写事务。
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(NINJA_SCHEMA)?;
+        add_primary_currency_column(&conn)?;
         Ok(Self { conn })
     }
 
@@ -737,11 +773,11 @@ impl NinjaStore {
         partition_key: &str,
     ) -> Result<Vec<UniqueUsagePriced>, StorageError> {
         let mut statement = self.conn.prepare(
-            "SELECT facets.entry, facets.count,
-                    prices.primary_value_milli, prices.listing_count, prices.total_change
+            "SELECT facets.entry, facets.count, prices.primary_value_milli,
+                    prices.primary_currency, prices.listing_count, prices.total_change
              FROM ninja_facets AS facets
              LEFT JOIN (
-                 SELECT name, primary_value_milli, listing_count, total_change,
+                 SELECT name, primary_value_milli, primary_currency, listing_count, total_change,
                         ROW_NUMBER() OVER (
                             PARTITION BY name ORDER BY listing_count DESC, base_type
                         ) AS seat
@@ -757,8 +793,9 @@ impl NinjaStore {
                 name: row.get(0)?,
                 users: to_u64(row.get::<_, i64>(1)?),
                 price_milli: row.get(2)?,
-                listings: row.get(3)?,
-                change_percent: row.get(4)?,
+                price_currency: row.get(3)?,
+                listings: row.get(4)?,
+                change_percent: row.get(5)?,
             })
         })?;
         let mut out = Vec::new();
@@ -777,10 +814,15 @@ impl NinjaStore {
     ///
     /// 按 `type_name` 分别替换而不是整表清空:6 个分类是 6 次请求,
     /// 其中一次失败不该把另外五类的价格也抹掉。
+    ///
+    /// `primary_currency` 是这一份 overview 的 `core.primary`,一行一存。
+    /// 存在行上而不是当成常数写死,是因为它换过:2026-09-06 是 `exalted`,
+    /// 2026-09-07 是 `divine`。六个分类各抓各的,理论上也可能一时不一致。
     pub fn replace_unique_prices(
         &self,
         league_url: &str,
         type_name: &str,
+        primary_currency: &str,
         lines: &[UniquePriceLine],
         now: i64,
     ) -> Result<(), StorageError> {
@@ -793,8 +835,8 @@ impl NinjaStore {
             let mut insert = tx.prepare(
                 "INSERT OR REPLACE INTO ninja_unique_prices
                      (league_url, fetched_at, type_name, name, base_type, category,
-                      primary_value_milli, listing_count, total_change)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                      primary_value_milli, primary_currency, listing_count, total_change)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             for line in lines {
                 insert.execute(params![
@@ -805,6 +847,7 @@ impl NinjaStore {
                     line.base_type,
                     line.category,
                     to_milli(line.primary_value),
+                    primary_currency,
                     line.listing_count,
                     // 存 `change_percent()` 而不是原始的 `total_change`:
                     // 只有一个数据点时那个 0 的意思是"没有一周的历史",
@@ -828,7 +871,7 @@ impl NinjaStore {
             .conn
             .query_row(
                 "SELECT type_name, name, base_type, category, primary_value_milli,
-                        listing_count, total_change, fetched_at
+                        primary_currency, listing_count, total_change, fetched_at
                  FROM ninja_unique_prices
                  WHERE league_url = ?1 AND name = ?2
                  ORDER BY listing_count DESC, base_type LIMIT 1",
@@ -875,7 +918,8 @@ fn to_u32(value: i64) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
-/// exalted 的浮点参考价 → 千分整数。非有限值(接口给了 NaN/Infinity)记 0,
+/// 浮点参考价 → 千分整数(单位由同一行的 `primary_currency` 说了算)。
+/// 非有限值(接口给了 NaN/Infinity)记 0,
 /// 而不是让一个 `as` 转换悄悄给出随便一个数。
 fn to_milli(value: f64) -> i64 {
     if !value.is_finite() {
@@ -956,9 +1000,10 @@ fn unique_price_from_row(row: &Row<'_>) -> rusqlite::Result<UniquePriceRow> {
         base_type: row.get(2)?,
         category: row.get(3)?,
         primary_value_milli: row.get(4)?,
-        listing_count: row.get(5)?,
-        total_change: row.get(6)?,
-        fetched_at: row.get(7)?,
+        primary_currency: row.get(5)?,
+        listing_count: row.get(6)?,
+        total_change: row.get(7)?,
+        fetched_at: row.get(8)?,
     })
 }
 
@@ -1054,6 +1099,55 @@ mod ninja_tests {
                  "sparkLine":{{"totalChange":{total_change},"data":{data}}}}}"#
         ))
         .expect("line")
+    }
+
+    /// 2026-09-06 建的老库必须能原地升级。
+    ///
+    /// 建表语句是 `CREATE TABLE IF NOT EXISTS`:表已经在了,它一个字都改不动。
+    /// 不补那一次 `ALTER TABLE`,老库一开就是 "no such column: primary_currency",
+    /// 整个暗金页读不出来。
+    #[test]
+    fn an_old_cache_gets_the_currency_column_added() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.execute_batch(
+            "CREATE TABLE ninja_unique_prices (
+                 league_url TEXT NOT NULL,
+                 fetched_at INTEGER NOT NULL,
+                 type_name TEXT NOT NULL,
+                 name TEXT NOT NULL,
+                 base_type TEXT NOT NULL,
+                 category TEXT NOT NULL,
+                 primary_value_milli INTEGER NOT NULL,
+                 listing_count INTEGER NOT NULL,
+                 total_change REAL,
+                 PRIMARY KEY (league_url, type_name, name, base_type)
+             ) STRICT;
+             INSERT INTO ninja_unique_prices VALUES
+                 ('forbiddenrites', 9000, 'UniqueWeapons', 'Skysliver',
+                  'Sacrificial Blade', 'Sceptre', 85, 12, NULL);",
+        )
+        .expect("old schema");
+
+        let store = NinjaStore::initialize(conn).expect("upgrade");
+        let row = store
+            .unique_price(LEAGUE, "Skysliver")
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.primary_value_milli, 85);
+        assert_eq!(
+            row.primary_currency, "divine",
+            "老行是从同一个端点抓的,而它今天报的就是 divine"
+        );
+
+        // 升级那一步每次开库都会走一遍,第二遍必须是空操作。
+        add_primary_currency_column(&store.conn).expect("second run");
+        assert_eq!(
+            store
+                .unique_price(LEAGUE, "Skysliver")
+                .expect("read")
+                .expect("row"),
+            row
+        );
     }
 
     /// 建表语句必须能在同一个库上跑第二遍:每次开库都会执行它。
@@ -1344,6 +1438,7 @@ mod ninja_tests {
             .replace_unique_prices(
                 LEAGUE,
                 "UniqueAccessories",
+                "divine",
                 &[
                     // 同一个名字两个底子:挂单少的那条不该被当成市价。
                     price_line("Berek's Grip", "Coral Ring", 10.0, 2),
@@ -1356,6 +1451,7 @@ mod ninja_tests {
             .replace_unique_prices(
                 LEAGUE,
                 "UniqueWeapons",
+                "divine",
                 &[price_line(
                     "Wake of Destruction",
                     "Wrapped Greathelm",
@@ -1376,6 +1472,7 @@ mod ninja_tests {
                     name: "Wake of Destruction".to_owned(),
                     users: 7_158,
                     price_milli: Some(3_250),
+                    price_currency: Some("divine".to_owned()),
                     listings: Some(900),
                     change_percent: Some(-4.5),
                 },
@@ -1383,6 +1480,7 @@ mod ninja_tests {
                     name: "Berek's Grip".to_owned(),
                     users: 6_413,
                     price_milli: Some(240_000),
+                    price_currency: Some("divine".to_owned()),
                     listings: Some(24),
                     change_percent: Some(-4.5),
                 },
@@ -1390,11 +1488,12 @@ mod ninja_tests {
                     name: "Beira's Anguish".to_owned(),
                     users: 2_000,
                     price_milli: None,
+                    price_currency: None,
                     listings: None,
                     change_percent: None,
                 },
             ],
-            "人多的在前;没挂单的照样上榜,只是价格三格空着"
+            "人多的在前;没挂单的照样上榜,只是价格那几格空着"
         );
 
         // 和老函数说的是同一件事,只是多带了价格。
@@ -1756,6 +1855,8 @@ mod ninja_tests {
             .replace_unique_prices(
                 LEAGUE,
                 "UniqueAccessories",
+                // 两类故意用不同的基准币:这一列是**每行**的事实,不是全表一个常数。
+                "exalted",
                 &[
                     price_line("Berek's Grip", "Two-Stone Ring", 240.5, 24),
                     price_line("Yoke of Suffering", "Bloodstone Amulet", 120.0, 36),
@@ -1767,6 +1868,7 @@ mod ninja_tests {
             .replace_unique_prices(
                 LEAGUE,
                 "UniqueWeapons",
+                "divine",
                 &[price_line(
                     "Wake of Destruction",
                     "Wrapped Greathelm",
@@ -1788,20 +1890,22 @@ mod ninja_tests {
                 name: "Berek's Grip".to_owned(),
                 base_type: "Two-Stone Ring".to_owned(),
                 category: "Ring".to_owned(),
-                // exalted × 1000,不存浮点。
+                // 千分整数,不存浮点;单位就是下面那一格。
                 primary_value_milli: 240_500,
+                primary_currency: "exalted".to_owned(),
                 listing_count: 24,
                 total_change: Some(-4.5),
                 fetched_at: 9_000,
             }
         );
+        let wake = store
+            .unique_price(LEAGUE, "Wake of Destruction")
+            .expect("read")
+            .expect("row");
+        assert_eq!(wake.primary_value_milli, 3_250);
         assert_eq!(
-            store
-                .unique_price(LEAGUE, "Wake of Destruction")
-                .expect("read")
-                .expect("row")
-                .primary_value_milli,
-            3_250
+            wake.primary_currency, "divine",
+            "另一类是另一个基准币,不该被隔壁那一类盖掉"
         );
 
         // 整张表有多旧,看最旧的那一类。
@@ -1812,6 +1916,7 @@ mod ninja_tests {
             .replace_unique_prices(
                 LEAGUE,
                 "UniqueAccessories",
+                "exalted",
                 &[price_line("Berek's Grip", "Two-Stone Ring", 300.0, 30)],
                 10_000,
             )
@@ -1851,6 +1956,7 @@ mod ninja_tests {
             .replace_unique_prices(
                 LEAGUE,
                 "UniqueWeapons",
+                "divine",
                 &[
                     // 线上那 121 行的形状:六个 null + 今天的 0。
                     priced(
@@ -1895,6 +2001,63 @@ mod ninja_tests {
         );
     }
 
+    /// 2026-09-07 从线上 `UniqueWeapons` 剪下来的原文,和 `pnd-ninja` 用的是
+    /// 同一份文件 —— 单位这件事只有拿真原文才试得出来。
+    const UNIQUE_WEAPONS: &str =
+        include_str!("../../pnd-ninja/fixtures/unique_weapons_overview.json");
+
+    /// 价格的单位是**这一份 overview 自己说的**,所以它得跟着价格一起进库。
+    ///
+    /// 不存的话,`0.08548` 到了界面上就只是一个裸数字,只能靠一句写死的
+    /// "它是 exalted" 去猜 —— 那句话 2026-09-06 是对的,2026-09-07 就成了
+    /// 近百倍的错。
+    #[test]
+    fn a_stored_price_carries_the_base_currency_the_feed_declared() {
+        let store = store();
+        let overview: pnd_ninja::economy::ItemOverview =
+            serde_json::from_str(UNIQUE_WEAPONS).expect("fixture");
+        assert_eq!(overview.core.primary, "divine");
+
+        store
+            .replace_unique_prices(
+                LEAGUE,
+                "UniqueWeapons",
+                &overview.core.primary,
+                &overview.lines,
+                9_000,
+            )
+            .expect("replace");
+
+        let trenchtimbre = store
+            .unique_price(LEAGUE, "Trenchtimbre")
+            .expect("read")
+            .expect("row");
+        assert_eq!(trenchtimbre.primary_value_milli, 85);
+        assert_eq!(trenchtimbre.primary_currency, "divine");
+
+        // 榜上那一行也要带着单位:界面读的是这个 JOIN,不是上面那条单行查询。
+        store
+            .enqueue_partitions(LEAGUE, VERSION, &partitions())
+            .expect("enqueue");
+        store
+            .complete_partition(
+                LEAGUE,
+                VERSION,
+                "",
+                61_390,
+                &[("items".to_owned(), "Trenchtimbre".to_owned(), 1_509u64)],
+                &[],
+                5_000,
+            )
+            .expect("complete");
+        let rows = store
+            .unique_usage_with_prices(LEAGUE, VERSION, "")
+            .expect("usage");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].price_milli, Some(85));
+        assert_eq!(rows[0].price_currency.as_deref(), Some("divine"));
+    }
+
     /// 同名不同底子时挑挂单多的那条——挂单少的那条不该当市价。
     #[test]
     fn the_busiest_listing_wins_when_names_collide() {
@@ -1903,6 +2066,7 @@ mod ninja_tests {
             .replace_unique_prices(
                 LEAGUE,
                 "UniqueAccessories",
+                "divine",
                 &[
                     price_line("Berek's Grip", "Coral Ring", 10.0, 2),
                     price_line("Berek's Grip", "Two-Stone Ring", 240.0, 24),

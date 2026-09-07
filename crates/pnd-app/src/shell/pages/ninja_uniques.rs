@@ -13,7 +13,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::switch::Switch;
 use gpui_component::{Disableable as _, Sizable as _, Size, StyledExt as _};
 
-use pnd_domain::CurrencyRates;
+use pnd_domain::{Currency, CurrencyRates};
 use pnd_runtime::now_secs;
 
 use super::watches::milli_text;
@@ -119,33 +119,99 @@ pub fn hidden_count(rows: &[UniqueRow], show_all: bool) -> usize {
         .count()
 }
 
-/// 参考价那一格:"29.9 ex ≈ 0.36 div"。汇率还没读到就只写 exalted,
-/// 不猜一个换算。
+/// 参考价那一格:"0.085 div ≈ 8.2 ex"。
+///
+/// 单位是**这一行自己带回来的**(经济接口那份 overview 报的 `core.primary`),
+/// 不是写死的 "ex"。写死的那一版在 2026-09-07 基准币换成 divine 那天变成了
+/// 近百倍的错:`0.085 div`(≈ 8 个 exalted)被印成 `0.085 ex ≈ 0.00 div`,
+/// 看着像不值钱;`1200 div` 被印成 `1200 ex ≈ 12.10 div`。
+///
+/// 汇率还没读到、或者基准币是我们不认得的那种,就只写数字和它的单位 ——
+/// 编一个换算率只会把"我不知道"说成一个具体的数。
 fn price_text(row: &UniqueRow, rates: &CurrencyRates, text: &'static Text) -> Option<String> {
     let milli = row.price_milli?;
-    let exalted = milli_text(milli);
-    match divine_text(milli, rates) {
-        Some(divine) => Some(i18n::fill(
-            text.uniques_price_with_divine,
-            &[&exalted, &divine],
+    let amount = milli_text(milli);
+    // 有价格却没单位,只可能是这一列还不存在时留下的老行:宁可少说一个单位,
+    // 也不替它猜一个。
+    let Some(currency) = row.price_currency.as_ref() else {
+        return Some(amount);
+    };
+    let unit = currency_label(currency, text);
+    match converted(milli, currency, rates) {
+        Some((value, into)) => Some(i18n::fill(
+            text.uniques_price_approx,
+            &[
+                &amount,
+                unit,
+                &approx_text(value),
+                currency_label(&into, text),
+            ],
         )),
-        None => Some(i18n::fill(text.uniques_price_exalted, &[&exalted])),
+        None => Some(i18n::fill(text.uniques_price_plain, &[&amount, unit])),
     }
 }
 
-/// exalted 千分整数 → divine 的小数写法。
+/// 换到哪个币、换出来多少。
 ///
-/// 两个数的单位相同(都是"千分之一个"),所以直接相除就是"几个 divine"。
-fn divine_text(price_milli: i64, rates: &CurrencyRates) -> Option<String> {
-    let rate_milli = rates.exalted_per_divine_milli?;
-    if rate_milli <= 0 {
-        return None;
+/// divine 计价的往 exalted 换,别的往 divine 换 —— 一格里两个数的用处是
+/// "另一个我熟的单位大概是多少",所以对手币永远是那个不熟的那边。
+/// mirror 和认不出来的币返回 `None`:物品榜从来没拿它们计过价,真轮到了
+/// 也该照写原文,而不是拿一个没验证过的方向去算。
+fn converted(
+    price_milli: i64,
+    currency: &Currency,
+    rates: &CurrencyRates,
+) -> Option<(f64, Currency)> {
+    let amount = price_milli as f64 / 1000.0;
+    let (value, into) = match currency {
+        Currency::Divine => (
+            amount * rate(rates.exalted_per_divine_milli)?,
+            Currency::Exalted,
+        ),
+        Currency::Exalted => (
+            amount / rate(rates.exalted_per_divine_milli)?,
+            Currency::Divine,
+        ),
+        Currency::Chaos => (
+            amount / rate(rates.chaos_per_divine_milli)?,
+            Currency::Divine,
+        ),
+        Currency::Mirror | Currency::Other(_) => return None,
+    };
+    value.is_finite().then_some((value, into))
+}
+
+/// 千分整数的汇率 → 浮点。缺席或者不是正数都当"这一轮没读到汇率"。
+fn rate(rate_milli: Option<i64>) -> Option<f64> {
+    rate_milli
+        .filter(|value| *value > 0)
+        .map(|value| value as f64 / 1000.0)
+}
+
+/// 换算出来那个数写几位小数。
+///
+/// 位数是"这一位还有意义吗"的问题:0.36 divine 里第二位是三成的差别,
+/// 2887 exalted 里第一位小数连一个 chaos 都不到。
+fn approx_text(value: f64) -> String {
+    let size = value.abs();
+    if size < 1.0 {
+        format!("{value:.2}")
+    } else if size < 100.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value:.0}")
     }
-    let divine = price_milli as f64 / rate_milli as f64;
-    if !divine.is_finite() {
-        return None;
+}
+
+/// 参考价那一列的单位写法。认不出来的币照写接口给的代号 —— 一个看得懂的
+/// 怪词好过一个编出来的单位。
+fn currency_label<'a>(currency: &'a Currency, text: &'static Text) -> &'a str {
+    match currency {
+        Currency::Divine => text.common_currency_divine,
+        Currency::Exalted => text.common_currency_exalted,
+        Currency::Chaos => text.common_currency_chaos,
+        other => other.code(),
     }
-    Some(format!("{divine:.2}"))
 }
 
 /// 7 天涨跌。涨了标绿、跌了标琥珀 —— 这一列是给"现在该不该买"用的。
@@ -317,6 +383,7 @@ mod ninja_uniques_tests {
                 users: 7_464,
                 share_percent: 11.42,
                 price_milli: Some(29_900),
+                price_currency: Some(Currency::Divine),
                 listings: Some(131),
                 change_percent: Some(6.0),
             },
@@ -325,6 +392,7 @@ mod ninja_uniques_tests {
                 users: 7_220,
                 share_percent: 11.04,
                 price_milli: Some(2_000),
+                price_currency: Some(Currency::Divine),
                 listings: Some(44),
                 change_percent: Some(-9.0),
             },
@@ -333,6 +401,7 @@ mod ninja_uniques_tests {
                 users: 4_213,
                 share_percent: 6.44,
                 price_milli: None,
+                price_currency: None,
                 listings: None,
                 change_percent: None,
             },
@@ -341,6 +410,7 @@ mod ninja_uniques_tests {
                 users: 120,
                 share_percent: 0.18,
                 price_milli: Some(1_000),
+                price_currency: Some(Currency::Divine),
                 listings: Some(3),
                 change_percent: Some(0.0),
             },
@@ -357,8 +427,8 @@ mod ninja_uniques_tests {
         assert_eq!(built[0][1].tone(), Tone::Accent, "榜首标出来");
         assert_eq!(built[0][2].text(), "7464");
         assert_eq!(built[0][3].text(), "11.4%");
-        // 29.9 exalted,按 1 divine = 83.42 exalted 换算。
-        assert_eq!(built[0][4].text(), "29.9 ex ≈ 0.36 div");
+        // 29.9 divine(接口今天的基准币),按 1 divine = 83.42 exalted 换算。
+        assert_eq!(built[0][4].text(), "29.9 div ≈ 2494 ex");
         assert_eq!(built[0][5].text(), "131");
         assert_eq!(built[0][6].text(), "+6.0%");
         assert_eq!(built[0][6].tone(), Tone::Good);
@@ -379,6 +449,7 @@ mod ninja_uniques_tests {
                 users: 1_000,
                 share_percent: 5.0,
                 price_milli: Some(85),
+                price_currency: Some(Currency::Divine),
                 listings: Some(1_509),
                 change_percent: change,
             }];
@@ -403,11 +474,117 @@ mod ninja_uniques_tests {
         assert_eq!(built[2][6].text(), "—");
     }
 
-    /// 汇率还没读到就只写 exalted,不猜一个 divine 数。
+    /// 汇率还没读到就只写它自己的单位,不猜一个换算值。
     #[test]
-    fn without_rates_the_price_stays_in_exalted() {
+    fn without_rates_the_price_keeps_its_own_currency() {
         let built = unique_rows(&rows(), &CurrencyRates::none(), false, &i18n::ENGLISH);
-        assert_eq!(built[0][4].text(), "29.9 ex");
+        assert_eq!(built[0][4].text(), "29.9 div");
+    }
+
+    /// 和 fixture 同一天(2026-09-07)的汇率:1 divine = 96.56 exalted / 23.4 chaos。
+    fn rates_0907() -> CurrencyRates {
+        CurrencyRates {
+            chaos_per_divine_milli: Some(23_400),
+            exalted_per_divine_milli: Some(96_560),
+            mirror_per_divine_milli: None,
+        }
+    }
+
+    /// 一行只有价格有意义的暗金,专门喂给 `price_text`。
+    fn priced(milli: i64, currency: Option<Currency>) -> UniqueRow {
+        UniqueRow {
+            name: "Skysliver".to_owned(),
+            users: 1_000,
+            share_percent: 5.0,
+            price_milli: Some(milli),
+            price_currency: currency,
+            listings: Some(12),
+            change_percent: None,
+        }
+    }
+
+    /// 经济接口 2026-09-07 报的基准币是 divine:那就写 div,换算方向也反过来。
+    ///
+    /// 写死"ex"的那一版把 Skysliver 印成 `0.085 ex ≈ 0.00 div`("不值钱"),
+    /// 把 Lavianga's Spirits 印成 `1200 ex ≈ 12.10 div` —— 真相是 1200 divine,
+    /// 差了近百倍。
+    #[test]
+    fn a_divine_quoted_price_reads_in_divine() {
+        let text = &i18n::ENGLISH;
+        let say =
+            |milli: i64| price_text(&priced(milli, Some(Currency::Divine)), &rates_0907(), text);
+        assert_eq!(say(85).unwrap(), "0.085 div ≈ 8.2 ex");
+        assert_eq!(say(29_900).unwrap(), "29.9 div ≈ 2887 ex");
+        assert_eq!(say(1_200_000).unwrap(), "1200 div ≈ 115872 ex");
+        // 汇率还没读到时只写 divine,不猜一个换算。
+        assert_eq!(
+            price_text(
+                &priced(85, Some(Currency::Divine)),
+                &CurrencyRates::none(),
+                text
+            )
+            .unwrap(),
+            "0.085 div"
+        );
+    }
+
+    /// 基准币真是 exalted 的那一天(2026-09-06 的原文就是),写法不变。
+    #[test]
+    fn an_exalted_quoted_price_still_reads_in_exalted() {
+        let text = &i18n::ENGLISH;
+        assert_eq!(
+            price_text(&priced(29_900, Some(Currency::Exalted)), &rates(), text).unwrap(),
+            "29.9 ex ≈ 0.36 div"
+        );
+        assert_eq!(
+            price_text(
+                &priced(29_900, Some(Currency::Exalted)),
+                &CurrencyRates::none(),
+                text
+            )
+            .unwrap(),
+            "29.9 ex"
+        );
+    }
+
+    /// chaos 计价的那天(接口换过一次基准币,就还会再换)照样换算到 divine。
+    #[test]
+    fn a_chaos_quoted_price_converts_to_divine() {
+        let text = &i18n::ENGLISH;
+        assert_eq!(
+            price_text(
+                &priced(1_200_000, Some(Currency::Chaos)),
+                &rates_0907(),
+                text
+            )
+            .unwrap(),
+            "1200 chaos ≈ 51.3 div"
+        );
+    }
+
+    /// 认不出来的基准币:照写数字和它的代号,不换算。
+    ///
+    /// 编一个换算率只会把"我不知道"说成一个具体的数。
+    #[test]
+    fn an_unknown_base_currency_shows_the_number_and_its_code() {
+        let text = &i18n::ENGLISH;
+        assert_eq!(
+            price_text(
+                &priced(2_500, Some(Currency::Other("annul".to_owned()))),
+                &rates_0907(),
+                text
+            )
+            .unwrap(),
+            "2.5 annul"
+        );
+        assert_eq!(
+            price_text(&priced(1_000, Some(Currency::Mirror)), &rates_0907(), text).unwrap(),
+            "1 mirror"
+        );
+        // 经济接口里压根没有这件东西:价格那一格什么都不写。
+        let mut none = priced(0, Some(Currency::Divine));
+        none.price_milli = None;
+        assert_eq!(price_text(&none, &rates_0907(), text), None);
     }
 
     /// 打开"显示全部"就把冷门行放出来,而且名次不变 —— 名次是按没筛之前算的。

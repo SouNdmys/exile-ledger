@@ -290,6 +290,7 @@ mod pages_tests {
             users: 7_464,
             share_percent: 11.42,
             price_milli: Some(29_900),
+            price_currency: Some(pnd_domain::Currency::Divine),
             listings: Some(131),
             change_percent: Some(-4.5),
         }];

@@ -54,6 +54,10 @@ catalogue! {
     common_milliseconds_short,
     common_percent,
     common_days_short,
+    /// 参考价那一列的单位。基准币是接口自己报的,所以三种都得有写法。
+    common_currency_divine,
+    common_currency_exalted,
+    common_currency_chaos,
     /// 表格上的动作按钮作用在选中的那一行,没选中就说这一句。
     common_select_row,
     /// 两张热度榜上那个"连冷门的也铺出来"开关。
@@ -204,10 +208,10 @@ catalogue! {
     /// "已采 {} 个角色"
     uniques_sampled,
     uniques_no_snapshot,
-    /// "{} ex"
-    uniques_price_exalted,
-    /// "{} ex ≈ {} div"
-    uniques_price_with_divine,
+    /// "{} {}" —— 参考价 + 它的单位。换算不出来时就这一句。
+    uniques_price_plain,
+    /// "{} {} ≈ {} {}" —— 参考价 + 单位,换算值 + 单位。
+    uniques_price_approx,
     /// "参考价取自 {}"
     uniques_price_age,
     uniques_empty,
@@ -469,6 +473,9 @@ pub static ENGLISH: Text = Text {
     common_milliseconds_short: "ms",
     common_percent: "%",
     common_days_short: "d",
+    common_currency_divine: "div",
+    common_currency_exalted: "ex",
+    common_currency_chaos: "chaos",
     common_select_row: "Select a row first.",
     common_show_all: "Show all",
     common_hidden_rows: "{} rows below {} hidden",
@@ -578,8 +585,8 @@ pub static ENGLISH: Text = Text {
     uniques_snapshot: "snapshot {}",
     uniques_sampled: "{} characters sampled",
     uniques_no_snapshot: "no snapshot yet",
-    uniques_price_exalted: "{} ex",
-    uniques_price_with_divine: "{} ex ≈ {} div",
+    uniques_price_plain: "{} {}",
+    uniques_price_approx: "{} {} ≈ {} {}",
     uniques_price_age: "reference prices from {}",
     uniques_empty: "No snapshot yet. Refresh to take one.",
 
@@ -747,6 +754,9 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     common_milliseconds_short: "毫秒",
     common_percent: "%",
     common_days_short: "天",
+    common_currency_divine: "div",
+    common_currency_exalted: "ex",
+    common_currency_chaos: "chaos",
     common_select_row: "先在表里选中一行。",
     common_show_all: "显示全部",
     common_hidden_rows: "已隐藏 {} 条占比不足 {} 的",
@@ -856,8 +866,8 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     uniques_snapshot: "快照 {}",
     uniques_sampled: "已采 {} 个角色",
     uniques_no_snapshot: "还没有快照",
-    uniques_price_exalted: "{} ex",
-    uniques_price_with_divine: "{} ex ≈ {} div",
+    uniques_price_plain: "{} {}",
+    uniques_price_approx: "{} {} ≈ {} {}",
     uniques_price_age: "参考价取自 {}",
     uniques_empty: "还没有快照。按刷新采一轮。",
 

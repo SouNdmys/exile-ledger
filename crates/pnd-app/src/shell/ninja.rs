@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 use gpui::Context;
 
+use pnd_domain::Currency;
 use pnd_ninja::aggregate::SlotModStat;
 use pnd_ninja::economy::UNIQUE_TYPES;
 use pnd_ninja::index_state::league_url_guess;
@@ -41,9 +42,12 @@ pub struct UniqueRow {
     pub users: u64,
     /// 占这个分区总人数的百分之几。分区没有 total 时是 0。
     pub share_percent: f64,
-    /// 参考价,exalted × 1000。`None` = 经济接口里没有这件东西
+    /// 参考价 × 1000。`None` = 经济接口里没有这件东西
     /// (新暗金、或者压根没人挂单)。
     pub price_milli: Option<i64>,
+    /// 上面那个数是什么币。经济接口的计价基准换过一次(2026-09-06 exalted →
+    /// 2026-09-07 divine),所以它得跟着价格走,不能写死在界面里。
+    pub price_currency: Option<Currency>,
     pub listings: Option<i64>,
     /// 7 天涨跌,百分比。
     pub change_percent: Option<f64>,
@@ -199,6 +203,7 @@ pub fn load_uniques(
             users: row.users,
             share_percent: share_percent(row.users, total),
             price_milli: row.price_milli,
+            price_currency: row.price_currency.as_deref().map(Currency::parse),
             listings: row.listings,
             change_percent: row.change_percent,
         })
@@ -823,7 +828,7 @@ mod ninja_tests {
         )
         .expect("line");
         store
-            .replace_unique_prices("forbiddenrites", "UniqueArmours", &[line], 9_000)
+            .replace_unique_prices("forbiddenrites", "UniqueArmours", "divine", &[line], 9_000)
             .expect("prices");
         store
             .replace_item_mods("forbiddenrites", version, &[stat("BodyArmour", 13, 47)])
@@ -842,6 +847,11 @@ mod ninja_tests {
         assert_eq!(top.name, "Wake of Destruction");
         assert_eq!(top.users, 7_464);
         assert_eq!(top.price_milli, Some(29_900));
+        assert_eq!(
+            top.price_currency,
+            Some(Currency::Divine),
+            "单位跟着价格从库里一路带到界面"
+        );
         assert_eq!(top.listings, Some(131));
         assert_eq!(top.change_percent, Some(-4.5));
         assert!((top.share_percent - 11.418).abs() < 0.01);

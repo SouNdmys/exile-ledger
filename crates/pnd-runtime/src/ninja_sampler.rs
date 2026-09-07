@@ -1238,9 +1238,12 @@ impl<'a> Sampler<'a> {
             let name = league_name.clone();
             match self.fetch(|client| client.unique_prices(&name, type_name)) {
                 Ok(overview) => {
+                    // 计价基准币跟着这一份原文一起落库:接口自己说它是 divine
+                    // 还是 exalted,程序不替它记(它换过一次,还会再换)。
                     self.store.replace_unique_prices(
                         &league_url,
                         type_name,
+                        &overview.core.primary,
                         &overview.lines,
                         now_secs(),
                     )?;

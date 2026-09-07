@@ -671,7 +671,7 @@ fn print_unique_table(
     );
     println!(
         "  {:>2}  {:<34} {:>8} {:>7}  {:>12} {:>9}  {:>7}",
-        "#", "unique", "chars", "share", "exalted", "listings", "7d"
+        "#", "unique", "chars", "share", "price", "listings", "7d"
     );
     for (rank, row) in usage.iter().take(TOP_ROWS).enumerate() {
         let price = store.unique_price(&config.league_url, &row.name)?;
@@ -679,7 +679,11 @@ fn print_unique_table(
             || ("-".to_owned(), "-".to_owned(), "-".to_owned()),
             |row| {
                 (
-                    format!("{:.1}", row.primary_value_milli as f64 / 1000.0),
+                    format!(
+                        "{:.1} {}",
+                        row.primary_value_milli as f64 / 1000.0,
+                        row.primary_currency
+                    ),
                     row.listing_count.to_string(),
                     row.total_change
                         .map_or_else(|| "-".to_owned(), |change| format!("{change:+.1}%")),
