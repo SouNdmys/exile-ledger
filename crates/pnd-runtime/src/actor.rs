@@ -67,11 +67,11 @@ const HIDEOUT_WHISPER_LABEL: &str = "hideout-whisper";
 const SESSION_CHECK_LABEL: &str = "session-check";
 
 /// token 里没有 `exp` 时的兜底:拿到超过这么久就当它过期了。
-/// 计划里定的 10 分钟 —— 那是个短命 JWT。
+/// 2026-09-07 抓包证实 hideout_token 只活 300 秒,这里再减掉和
+/// [`HIDEOUT_TOKEN_EXPIRY_MARGIN_SECS`] 一样的 30 秒余量。
 ///
 /// 只是兜底:token 自己带 `exp` 的时候听它的(见 [`usable_token`])。
-/// 2026-09-07 那次 403 的头号嫌疑就是"真实 TTL 比这条规矩短"。
-const HIDEOUT_TOKEN_MAX_AGE_SECS: i64 = 600;
+const HIDEOUT_TOKEN_MAX_AGE_SECS: i64 = 270;
 
 /// `exp` 只剩这么点(秒)就别发了,先换一张。
 ///
@@ -3673,14 +3673,14 @@ mod actor_tests {
     }
 
     #[test]
-    fn a_token_older_than_ten_minutes_is_not_used() {
+    fn a_token_without_exp_older_than_the_five_minute_ttl_is_not_used() {
         let now = 10_000;
         assert_eq!(
-            usable_token(Some("tok"), Some(now - 599), now),
+            usable_token(Some("tok"), Some(now - 269), now),
             Some("tok".to_string())
         );
         assert_eq!(
-            usable_token(Some("tok"), Some(now - 601), now),
+            usable_token(Some("tok"), Some(now - 271), now),
             None,
             "太老了"
         );
