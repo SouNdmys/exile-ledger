@@ -165,6 +165,18 @@ pub fn whisper_url() -> String {
     format!("{API_BASE}/whisper")
 }
 
+/// whisper 的请求体:**只有 token,没有第二个字段**。
+///
+/// 2026-09-07 主人在 Chrome DevTools 里抄下官网点"Travel to Hideout"发出的
+/// 那一封:`Content-Length: 636`,而里面那张 token 是 624 个字符。
+/// `{"token":"…"}` 的包装正好 12 个字节,624 + 12 = 636 —— 一个字段也塞不下,
+/// 这就把"还有没有别的字段"这个问题彻底关掉了。以前那个 `"continue":true`
+/// 是从早期笔记里抄来的,官网不发它。
+#[must_use]
+pub fn whisper_body(token: &str) -> String {
+    json!({ "token": token }).to_string()
+}
+
 /// 持有连接池的交易站客户端。
 ///
 /// User-Agent 由调用方传进来(设置页可以在"带联系方式"和"浏览器样式"之间切):
@@ -250,34 +262,44 @@ impl TradeClient {
     /// 这个方法是给第二版的卡片按钮用的:**永远由用户点一次才调用**,
     /// 程序自己不会调。
     ///
-    /// # 这几个头是猜的吗
+    /// # 这几个头不再是猜的了
     ///
-    /// 一半是,而且**没有和官网逐字比对过**。计划里核实过的只有地址和
-    /// 请求体(`{"token":…,"continue":true}`)以及"要带 Cookie";
-    /// `Content-Type`/`Accept`/`User-Agent`/`Referer` 是照着 search 和 fetch
-    /// 那两个已经跑通的接口来的,同一套服务端、同一套 Cloudflare 规则。
+    /// 2026-09-07 主人在 Chrome DevTools 里抄下了官网真实的那一封:已登录、
+    /// 在一条即刻购买的挂单上点 "Travel to Hideout"。**这一段以下都是抄件里
+    /// 的事实,不是推测。**
     ///
-    /// `Origin` 和 `X-Requested-With` 这两个是 2026-09-07 之后加的,**它们是
-    /// 一个猜想,不是已核实的事实**。那天一次真跑:会话是好的(测试会话过了,
-    /// 限速规则里有 `Account`,live 连着,轮询也正常),同一个 cookie 上的
-    /// search 和 fetch 都好好的,唯独这个 POST 回了
-    /// `403 {"error":{"code":6,"message":"Forbidden"}}`。cookie 既然没问题,
-    /// 剩下最像的解释就是这个"会改变状态"的接口上有 CSRF 防护:浏览器发这种
-    /// POST 时一定会带 `Origin`,而我们以前一个都不带。`X-Requested-With`
-    /// 是同一套 XHR 身份里的另一半。
+    /// - 地址:`POST https://www.pathofexile.com/api/trade2/whisper`
+    /// - 请求体:逐字就是 `{"token":"<hideout_token>"}`(见 [`whisper_body`])
+    /// - 头:`Content-Type: application/json`、`Accept: */*`、
+    ///   `Origin: https://www.pathofexile.com`、`X-Requested-With: XMLHttpRequest`、
+    ///   `Referer` = 这条挂单所在的那张搜索页、浏览器的 `User-Agent`、
+    ///   以及带 cookie 的 `Cookie`
+    /// - `hideout_token` 的载荷:`{"jti":…,"iss":"<搜索id>","aud":"<uuid>",
+    ///   "tok":"hideout","sub":"<挂单id>","dat":…,"iat":…,"exp":iat+300}`
+    ///   —— **有效期 300 秒**
     ///
-    /// 为什么还是猜:官网那份 JS 拿不到来对照 ——
-    /// `https://www.pathofexile.com/trade2/search/poe2/Standard` 匿名去读回 403
-    /// (Cloudflare),而 CDN 上的 bundle 名字要先读到那张 HTML 才知道。
-    /// 主人以后会在浏览器 DevTools 里把官网真实的那一封请求抄下来;在那之前
-    /// 别再照感觉往这里加头,以那份抄件为准。
+    /// `Origin` 和 `X-Requested-With` 这两个原来是猜的(2026-09-07 那次 403 的
+    /// 当时猜想),抄件把它们坐实了:官网确实发这两个。`Accept` 原来照着
+    /// search/fetch 写成 `application/json`,抄件里是 `*/*`,现在照抄件改了。
+    ///
+    /// # 抄件里有、我们发不出去的东西
+    ///
+    /// 浏览器还发了 `Accept-Language`、`Sec-Fetch-Site/Mode/Dest`
+    /// (`same-origin`/`cors`/`empty`),以及 cookie 里的 `cf_clearance`、
+    /// `cf_chl_rc_ni` 和一张 **`POETOKEN` JWT**(载荷开头是
+    /// `{"aud":"oauth/internal",…}`)。前两类是浏览器自己加的,补上也没意义;
+    /// `cf_clearance` 那两个是 Cloudflare 的,我们的 cookie 罐子里根本没有。
+    ///
+    /// **`POETOKEN` 是唯一还没弄清的那一格。** 它是网站登录时另发的一张票,
+    /// 我们的 WebView2 登录只抄了 `POESESSID`。要是改成官网这封请求之后还是
+    /// 403,下一个该查的就是它 —— 不要再往这里加别的头了。
     pub fn whisper(
         &self,
         token: &str,
         session: &str,
         referer: &str,
     ) -> Result<TradeResponse, TransportError> {
-        let body = json!({ "token": token, "continue": true }).to_string();
+        let body = whisper_body(token);
         collect(self.whisper_request(session, referer).send(body.as_str()))
     }
 
@@ -297,7 +319,8 @@ impl TradeClient {
         self.agent
             .post(whisper_url())
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
+            // 抄件里就是 `*/*`,不是 search/fetch 那两个上的 `application/json`。
+            .header("Accept", "*/*")
             .header("User-Agent", &self.user_agent)
             .header("Origin", ORIGIN)
             .header("X-Requested-With", "XMLHttpRequest")
@@ -540,11 +563,12 @@ mod client_tests {
         assert_eq!(ggg_error(r#"{"error":{"code":6,"messa"#), None);
     }
 
-    /// whisper 是这个程序唯一一个"会改变状态"的请求,而 2026-09-07 那次真跑里
-    /// 它回了 403(同一个 cookie 上的 search 和 fetch 都好好的)。`Origin` 和
-    /// `X-Requested-With` 是那次 403 的当前猜想(见 [`TradeClient::whisper`]),
-    /// 所以它们必须真的发出去:少一个,下次再 403 就分不清是"头没带"还是
-    /// "这个猜想本来就不对"。原来那几个头一个也不能因此丢掉。
+    /// 这一串就是 2026-09-07 那份 DevTools 抄件里我们发得出去的全部头
+    /// (见 [`TradeClient::whisper`])。钉死它是为了下一次再吃 403 时能立刻
+    /// 排除"是不是哪个头掉了" —— 那时该查的是 `POETOKEN`,不是这里。
+    ///
+    /// `Accept` 特意是 `*/*`:抄件里就是这个,和 search/fetch 上的
+    /// `application/json` 不一样。
     #[test]
     fn a_whisper_request_carries_the_browser_headers() {
         let client = TradeClient::new("PoeNinjaData/0.1.0".to_string());
@@ -555,10 +579,23 @@ mod client_tests {
         assert_eq!(headers["Origin"], "https://www.pathofexile.com");
         assert_eq!(headers["X-Requested-With"], "XMLHttpRequest");
         assert_eq!(headers["Content-Type"], "application/json");
-        assert_eq!(headers["Accept"], "application/json");
+        assert_eq!(headers["Accept"], "*/*");
         assert_eq!(headers["User-Agent"], "PoeNinjaData/0.1.0");
         assert_eq!(headers["Referer"], referer);
         assert_eq!(headers["Cookie"], "POESESSID=not-a-real-session");
+    }
+
+    /// 请求体逐字就是抄件里那一行。
+    ///
+    /// 抄件里的 Content-Length 是 636,而 token 有 624 个字符 ——
+    /// `{"token":"…"}` 正好是 12 个字节的包装,一个字段也塞不下了。
+    /// 所以这里是"等于",不是"包含":多一个 `continue` 就是多 16 个字节,
+    /// 那封请求就不是官网发的那一封了。
+    #[test]
+    fn a_whisper_body_is_only_the_token() {
+        let body = whisper_body("eyJhbGciOiJIUzI1NiJ9.payload.sig");
+        assert_eq!(body, r#"{"token":"eyJhbGciOiJIUzI1NiJ9.payload.sig"}"#);
+        assert!(!body.contains("continue"), "{body}");
     }
 
     #[test]

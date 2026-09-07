@@ -2093,6 +2093,10 @@ fn hideout_failure(step: HideoutStep, listing_id: &str, error: &GatewayError) ->
                 ),
             )
         }
+        // 这一句只会从"重新 fetch 拿新 token"那一步走过来:POST 上的
+        // 401/403 在 [`looks_like_a_stale_token`] 那里就被截去换 token 了。
+        // 所以它写死"the refetch",不用 `what` —— 说成"the travel request"
+        // 会让人以为传送请求被会话拒了,而那封 POST 还没发出去呢。
         GatewayError::Status {
             status: status @ (401 | 403),
             excerpt,
@@ -2101,7 +2105,7 @@ fn hideout_failure(step: HideoutStep, listing_id: &str, error: &GatewayError) ->
             (
                 *status,
                 format!(
-                    "{reason}the trade site refused {what} for listing {listing_id} with \
+                    "{reason}the refetch for listing {listing_id} was refused with \
                      HTTP {status} — the POESESSID is probably no longer valid{detail}"
                 ),
             )
@@ -3194,6 +3198,31 @@ mod actor_tests {
         assert!(message.ends_with(": upstream exploded"), "{message}");
     }
 
+    /// 401/403 这一句只可能从"重新 fetch 拿新 token"那一步走过来 ——
+    /// POST 上的 401/403 在 [`looks_like_a_stale_token`] 那里就被截走去换
+    /// token 了,走不到 [`hideout_failure`]。所以这句话必须指名道姓说
+    /// "refetch":含含糊糊说成"the travel request"会让人以为是那封 POST
+    /// 被会话拒了,而那封 POST 根本还没发出去。
+    #[test]
+    fn a_refused_refetch_says_refetch_not_travel_request() {
+        let HideoutOutcome::Failed { status, message } = hideout_failure(
+            HideoutStep::Refetch,
+            "listing-9",
+            &GatewayError::Status {
+                status: 403,
+                excerpt: String::new(),
+            },
+        ) else {
+            unreachable!()
+        };
+        assert_eq!(status, 403);
+        assert_eq!(
+            message,
+            "the refetch for listing listing-9 was refused with HTTP 403 — \
+             the POESESSID is probably no longer valid"
+        );
+    }
+
     /// 最后那句建议要看会话的死活。三条路各说各的:
     /// 会话还好好的 403 说"这封请求被当成不是从网站发的",会话确实被拒过的
     /// 403 才说"换个 cookie",503 谁都不提、只让人看自己的游戏客户端。
@@ -3525,20 +3554,15 @@ mod actor_tests {
             ),
             (
                 GatewayError::Status {
-                    status: 401,
-                    excerpt: String::new(),
-                },
-                401,
-                vec!["401", "POESESSID"],
-            ),
-            (
-                GatewayError::Status {
                     status: 500,
                     excerpt: "boom".to_string(),
                 },
                 500,
                 vec!["500", "boom"],
             ),
+            // 401/403 不在这张表里:那一句写死了"the refetch"(它只可能从
+            // 重新 fetch 那一步走过来),所以过不了下面"哪一步都得说"的检查。
+            // 它由 `a_refused_refetch_says_refetch_not_travel_request` 单独钉。
         ];
 
         for (error, want_status, wants) in cases {
