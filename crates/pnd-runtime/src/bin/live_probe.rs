@@ -156,9 +156,18 @@ fn pump(
                     fetch_and_print(&client, &mut limiter, config, search_ref, &ids);
                 }
             }
-            Ok(LiveMessage::Other(text)) => {
+            // 连上之后服务端立刻发的订阅回执。探针是这条链路上唯一该把它
+            // 拆开看的地方:下一次真跑之后,我们就知道那张 JWT 是干什么用的了。
+            Ok(LiveMessage::Subscribed { token }) => {
                 idle_secs = 0;
-                println!("{} message    {text}", stamp());
+                println!("{} subscribed the server acknowledged this search", stamp());
+                print_subscription_token(&token);
+            }
+            // 已经是"键名 + 值长度"的描述,不是原文 —— 不认识的消息里
+            // 可能有凭证,屏幕和日志都不该替服务端保管它。
+            Ok(LiveMessage::Other(description)) => {
+                idle_secs = 0;
+                println!("{} message    (shape only) {description}", stamp());
             }
             Ok(LiveMessage::Idle) => {
                 // 一次超时 = 一个读超时那么久的沉默。攒够一分钟才吭一声,
@@ -321,6 +330,51 @@ fn describe_token(token: Option<&str>) -> String {
             )
         }
         None => format!("present ({} chars, not a readable JWT)", token.len()),
+    }
+}
+
+/// 把订阅回执那张 JWT 拆开印出来:长度、还有多久过期、header、payload。
+///
+/// **签名那一段从不解码、也不打印。** 这里印的是"这张票是发给谁的、什么时候
+/// 作废",不是那张票本身 —— 有了它就能冒充这次订阅。
+///
+/// 为什么要印:2026-09-07 那次真跑里,这条消息整条掉进了状态栏(当时它还是
+/// `Other`),只看得见前几十个字符。下一次跑完,我们就能凭 `iss`/`exp`
+/// 这些声明说清楚它到底是什么,而不是靠猜。
+fn print_subscription_token(token: &str) {
+    let (header, payload) = jwt_sections(token);
+    println!(
+        "{}            token    {}",
+        stamp(),
+        describe_token(Some(token))
+    );
+    println!("{}            header   {header}", stamp());
+    println!("{}            payload  {payload}", stamp());
+    println!(
+        "{}            (the signature is never decoded or printed)",
+        stamp()
+    );
+}
+
+/// JWT 的头两段解出来的 JSON 原文:(header, payload)。第三段是签名,不碰。
+fn jwt_sections(token: &str) -> (String, String) {
+    let mut parts = token.split('.');
+    let header = decode_jwt_section(parts.next());
+    let payload = decode_jwt_section(parts.next());
+    (header, payload)
+}
+
+/// 一段 base64url → JSON 文本。解不开就照实说是哪一步解不开,别装作没这段。
+fn decode_jwt_section(part: Option<&str>) -> String {
+    let Some(part) = part else {
+        return "(missing)".to_string();
+    };
+    let Some(bytes) = decode_base64url(part) else {
+        return format!("(not base64url, {} chars)", part.chars().count());
+    };
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => value.to_string(),
+        Err(error) => format!("(not JSON: {error})"),
     }
 }
 

@@ -60,6 +60,12 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// 或者"这是 GGG 的一句 JSON 错误",又不至于把整张 HTML 灌进日志。
 const BODY_EXCERPT_CHARS: usize = 200;
 
+/// 描述一条消息时,比这短的值可以原样写进日志,再长就只报长度。
+///
+/// 20 个字符放得下 `true`、`1757203200`、`"ok"` 这种一眼能懂的东西,
+/// 而放不下任何一个 token —— JWT 光是头一段就比它长。
+const SAFE_VALUE_CHARS: usize = 20;
+
 // ---------------------------------------------------------------------
 // 配置
 // ---------------------------------------------------------------------
@@ -140,16 +146,43 @@ pub fn live_ws_url(league: &str, search_id: &str) -> String {
 // ---------------------------------------------------------------------
 
 /// 从 live 连接上读到的一条东西。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` 是手写的:[`LiveMessage::Subscribed`] 里那串是服务端发的凭证,
+/// 而这个类型会出现在日志和 `assert_eq!` 的失败输出里。
+#[derive(Clone, PartialEq, Eq)]
 pub enum LiveMessage {
     /// `{"new":["id1","id2",…]}` —— 有新挂单,按 10 个一批去 fetch。
     /// 空表也是合法的推送,照样回 `New(vec![])`。
     New(Vec<String>),
+    /// 刚连上时服务端立刻回的 `{"result":"<JWT>"}` —— 这条搜索的订阅回执。
+    ///
+    /// 实测那个 JWT 的 payload 里 `iss` 就是搜索 id。我们不用它做任何事
+    /// (推送本身不需要它),但认出来是必须的:早先它落进 `Other`,
+    /// 于是**整串 token 被原样写进了状态栏**。
+    Subscribed { token: String },
     /// 读超时:这段时间服务端什么都没说。连接是好的,只是没货。
     Idle,
-    /// 认得是 JSON、但不是我们认识的形状(比如服务端将来加的心跳、鉴权回执)。
+    /// 认得是 JSON、但不是我们认识的形状(比如服务端将来加的心跳)。
     /// 不当错误:接口随时可能多一种消息,为此断线不划算。
+    ///
+    /// 带的是 [`describe_live_message`] 给的**描述**(键名 + 值长度),
+    /// 不是原文 —— 不认识的消息里可能有凭证,日志不该替服务端保管它。
     Other(String),
+}
+
+impl fmt::Debug for LiveMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LiveMessage::New(ids) => f.debug_tuple("New").field(ids).finish(),
+            // 只说有多长,绝不说是什么。
+            LiveMessage::Subscribed { token } => f
+                .debug_struct("Subscribed")
+                .field("token", &format!("<{} chars>", token.chars().count()))
+                .finish(),
+            LiveMessage::Idle => f.write_str("Idle"),
+            LiveMessage::Other(description) => f.debug_tuple("Other").field(description).finish(),
+        }
+    }
 }
 
 /// 消息压根不是 JSON。
@@ -172,7 +205,72 @@ pub fn parse_live_message(text: &str) -> Result<LiveMessage, ProtocolError> {
             .collect();
         return Ok(LiveMessage::New(ids));
     }
-    Ok(LiveMessage::Other(excerpt(text)))
+    // 只有"`result` 是个字符串"才算订阅回执:哪天服务端拿这个键装别的东西
+    // (对象、数组),它就该老老实实走下面那条"不认识"的路。
+    if let Some(token) = value.get("result").and_then(Value::as_str) {
+        return Ok(LiveMessage::Subscribed {
+            token: token.to_string(),
+        });
+    }
+    Ok(LiveMessage::Other(describe_live_message(text)))
+}
+
+/// 一条消息的"体检报告":有哪些键、每个值多长。**不回显长值。**
+///
+/// 为什么要有它:服务端连上就发 `{"result":"<JWT>"}`,而早先那条日志是把
+/// 原文抄进去的 —— 一串能代表这次订阅的凭证就这么进了状态栏和日志文件。
+/// 认得的形状我们照常解析,不认得的只报形状:键名是服务端定的,可以说;
+/// 值是内容,超过 [`SAFE_VALUE_CHARS`] 个字符一律只说长度。
+#[must_use]
+pub fn describe_live_message(text: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return format!("not JSON ({} chars)", text.chars().count());
+    };
+    match &value {
+        Value::Object(fields) => {
+            let keys: Vec<String> = fields.keys().map(|key| format!("{key:?}")).collect();
+            let mut out = format!("keys=[{}]", keys.join(", "));
+            for (key, value) in fields {
+                out.push(' ');
+                out.push_str(&describe_field(key, value));
+            }
+            out
+        }
+        Value::Array(items) => format!("array len={}", items.len()),
+        Value::String(text) => format!("string len={}", text.chars().count()),
+        other => format!("bare {}", type_name(other)),
+    }
+}
+
+/// 一个字段 → `key=值` 或者 `key_len=N`。
+fn describe_field(key: &str, value: &Value) -> String {
+    let (len, rendered) = match value {
+        Value::String(text) => (text.chars().count(), format!("{text:?}")),
+        Value::Array(items) => (items.len(), String::new()),
+        Value::Object(fields) => (fields.len(), String::new()),
+        other => {
+            let rendered = other.to_string();
+            (rendered.chars().count(), rendered)
+        }
+    };
+    // 短到一眼能懂的标量原样写出来;长的、以及数组/对象这种"长度才是重点"
+    // 的东西,只报长度。
+    if !rendered.is_empty() && len < SAFE_VALUE_CHARS {
+        format!("{key}={rendered}")
+    } else {
+        format!("{key}_len={len}")
+    }
+}
+
+fn type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -630,16 +728,40 @@ mod live_tests {
         );
     }
 
+    /// 服务端一连上就发的 `{"result":"<JWT>"}`。认出来是订阅回执,
+    /// 而不是掉进 `Other` —— 掉进去就意味着整串 token 被抄进日志。
+    #[test]
+    fn the_connect_receipt_is_recognised_as_a_subscription() {
+        let token = format!("eyJhbGciOiJIUzI1NiJ9.{}.sig", "A".repeat(240));
+        let message = parse_live_message(&format!(r#"{{"result":"{token}"}}"#)).unwrap();
+        assert_eq!(
+            message,
+            LiveMessage::Subscribed {
+                token: token.clone()
+            }
+        );
+        // 连 Debug 都不许把它印出来。
+        let debug = format!("{message:?}");
+        assert!(!debug.contains(&token), "{debug}");
+        assert!(debug.contains("chars"), "{debug}");
+
+        // `result` 不是字符串就不是回执,老实走"不认识"那条路。
+        assert_eq!(
+            parse_live_message(r#"{"result":{"a":1}}"#).unwrap(),
+            LiveMessage::Other(r#"keys=["result"] result_len=1"#.to_string())
+        );
+    }
+
     #[test]
     fn an_unknown_shape_is_kept_as_other() {
         assert_eq!(
             parse_live_message(r#"{"auth":true}"#).unwrap(),
-            LiveMessage::Other(r#"{"auth":true}"#.to_string())
+            LiveMessage::Other(r#"keys=["auth"] auth=true"#.to_string())
         );
         // 数组、字符串这些也是合法 JSON,同样不该炸。
         assert_eq!(
             parse_live_message("[1,2,3]").unwrap(),
-            LiveMessage::Other("[1,2,3]".to_string())
+            LiveMessage::Other("array len=3".to_string())
         );
     }
 
@@ -650,14 +772,61 @@ mod live_tests {
         assert!(matches!(LiveError::from(error), LiveError::Protocol(_)));
     }
 
+    /// 描述只说形状:键名照写,长值只报长度。这是那条"token 别进日志"
+    /// 纪律的落点。
+    #[test]
+    fn a_description_reports_keys_and_lengths_but_never_a_long_value() {
+        assert_eq!(
+            describe_live_message(r#"{"result":"eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9"}"#),
+            r#"keys=["result"] result_len=36"#
+        );
+        // 短标量一眼能懂,原样留着。
+        assert_eq!(
+            describe_live_message(r#"{"ok":true,"n":12,"tag":"hi"}"#),
+            r#"keys=["n", "ok", "tag"] n=12 ok=true tag="hi""#
+        );
+        // 数组和对象报的是元素个数 / 字段个数。
+        assert_eq!(
+            describe_live_message(r#"{"new":["a","b"],"meta":{"x":1}}"#),
+            r#"keys=["meta", "new"] meta_len=1 new_len=2"#
+        );
+        assert_eq!(
+            describe_live_message("not json at all"),
+            "not JSON (15 chars)"
+        );
+    }
+
+    /// 任何一个 20 字符以上的值都不许出现在描述里 —— 逐字验一遍。
+    #[test]
+    fn no_long_value_ever_reaches_the_description() {
+        let secret = "x".repeat(SAFE_VALUE_CHARS);
+        for shape in [
+            format!(r#"{{"result":"{secret}"}}"#),
+            format!(r#"{{"a":"{secret}","b":1}}"#),
+            format!(r#"{{"nested":{{"deep":"{secret}"}}}}"#),
+            format!(r#"["{secret}"]"#),
+            format!(r#""{secret}""#),
+        ] {
+            let described = describe_live_message(&shape);
+            assert!(
+                !described.contains(&secret),
+                "{shape} 的描述漏了值:{described}"
+            );
+        }
+        // 刚好差一个字符的短值仍然可见 —— 边界在 20 上,不是"什么都不说"。
+        let short = "x".repeat(SAFE_VALUE_CHARS - 1);
+        assert!(describe_live_message(&format!(r#"{{"a":"{short}"}}"#)).contains(&short));
+    }
+
     /// 一条巨长的怪消息不该把整份日志撑爆。
     #[test]
-    fn other_messages_are_trimmed() {
+    fn other_messages_stay_short() {
         let long = format!(r#"{{"noise":"{}"}}"#, "x".repeat(5000));
         let LiveMessage::Other(text) = parse_live_message(&long).unwrap() else {
             panic!("expected Other");
         };
-        assert_eq!(text.chars().count(), BODY_EXCERPT_CHARS);
+        assert_eq!(text, r#"keys=["noise"] noise_len=5000"#);
+        assert!(text.chars().count() < BODY_EXCERPT_CHARS);
     }
 
     // ---- 错误分类 ----------------------------------------------------

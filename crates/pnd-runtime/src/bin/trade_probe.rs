@@ -340,12 +340,21 @@ fn describe_hideout(outcome: &HideoutOutcome) -> String {
         HideoutOutcome::NoSession => {
             "no session — /whisper needs a POESESSID in settings.json".to_string()
         }
+        // 为什么没有 token(货没了 / 卖家离线 / 这次 fetch 没带 cookie)是一条
+        // 单独的 `log` 事件,就印在这一行的上面 —— `TokenMissing` 本身带不了消息。
         HideoutOutcome::TokenMissing => {
-            "no hideout_token on that listing (it was fetched anonymously)".to_string()
+            "no hideout_token for that listing — see the log line just above for why".to_string()
         }
         HideoutOutcome::Refreshed => "token was stale — fetched a fresh one, retrying".to_string(),
+        // 状态码 0 的意思是"这封请求压根没上过网",不是"服务端回了 0"。
+        // 说清楚这一点,不然屏幕上和卡片上一样看不出发生了什么。
         HideoutOutcome::Failed { status, message } => {
-            format!("failed (status {status}): {message}")
+            let answered = if *status == 0 {
+                "no HTTP answer".to_string()
+            } else {
+                format!("HTTP {status}")
+            };
+            format!("failed ({answered}) — {message}")
         }
     }
 }

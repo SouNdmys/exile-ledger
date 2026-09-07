@@ -1369,7 +1369,10 @@ impl RuntimeActor {
                 alert_id,
                 HideoutOutcome::Failed {
                     status: 0,
-                    message: format!("alert {alert_id} is not in the history"),
+                    message: format!(
+                        "alert {alert_id} is no longer in the alert history — \
+                         the card outlived its database row, so there is nothing to travel to"
+                    ),
                 },
             );
             return;
@@ -1413,9 +1416,13 @@ impl RuntimeActor {
             return;
         };
         if flow.posts >= MAX_WHISPER_POSTS {
+            let listing_id = flow.listing_id.clone();
             let outcome = HideoutOutcome::Failed {
                 status: 0,
-                message: "the trade site refused the travel request twice".to_string(),
+                message: format!(
+                    "this click already posted the travel request twice for listing \
+                     {listing_id} — not trying a third time"
+                ),
             };
             self.finish_hideout(alert_id, outcome);
             return;
@@ -1443,31 +1450,41 @@ impl RuntimeActor {
     }
 
     fn on_hideout_reply(&mut self, alert_id: i64, kind: ReplyKind, now: i64) {
-        if !self.hideout.contains_key(&alert_id) {
-            // 已经收尾了(比如两次 503 之后停手),迟到的回信丢掉。
+        // 已经收尾了(比如两次 503 之后停手),迟到的回信丢掉。挂单 id 顺手
+        // 抄一份:下面每一句失败消息都要说清"是哪一件货"。
+        let Some(listing_id) = self
+            .hideout
+            .get(&alert_id)
+            .map(|flow| flow.listing_id.clone())
+        else {
             return;
-        }
+        };
         match kind {
             ReplyKind::Fetch(Ok(listings)) => self.on_hideout_token(alert_id, &listings, now),
             ReplyKind::Fetch(Err(error)) => {
-                let outcome = HideoutOutcome::Failed {
-                    status: status_of(&error),
-                    message: error.to_string(),
-                };
+                let outcome = hideout_failure(HideoutStep::Refetch, &listing_id, &error);
                 self.finish_hideout(alert_id, outcome);
             }
             ReplyKind::Whisper(Ok(status)) => {
                 let _ = status;
                 self.finish_hideout(alert_id, HideoutOutcome::Sent);
             }
-            ReplyKind::Whisper(Err(GatewayError::Status(503))) => {
+            ReplyKind::Whisper(Err(GatewayError::Status {
+                status: 503,
+                excerpt,
+            })) => {
                 // 503 差不多就是"这个 token 过期了"。换一个再试一次,
                 // 但只换一次。
                 let refreshed = self.hideout.get(&alert_id).is_some_and(|f| f.refreshed);
                 if refreshed {
                     let outcome = HideoutOutcome::Failed {
                         status: 503,
-                        message: "the trade site refused the travel request twice".to_string(),
+                        message: format!(
+                            "the trade site answered 503 to both travel requests for listing \
+                             {listing_id} — a fresh token did not help, so the seller (or your \
+                             own game client) is probably not online{}",
+                            detail_suffix(&excerpt)
+                        ),
                     };
                     self.finish_hideout(alert_id, outcome);
                 } else {
@@ -1475,10 +1492,7 @@ impl RuntimeActor {
                 }
             }
             ReplyKind::Whisper(Err(error)) => {
-                let outcome = HideoutOutcome::Failed {
-                    status: status_of(&error),
-                    message: error.to_string(),
-                };
+                let outcome = hideout_failure(HideoutStep::Whisper, &listing_id, &error);
                 self.finish_hideout(alert_id, outcome);
             }
             // 这条链路上不会有 search,也不会有会话检查。
@@ -1487,17 +1501,49 @@ impl RuntimeActor {
     }
 
     /// 刷新 token 的 fetch 回来了。
+    ///
+    /// 三种"拿不到 token"分得很开:挂单没了、卖家离线、这次 fetch 没带
+    /// cookie。三种都是 [`HideoutOutcome::TokenMissing`],但用户该看见的话
+    /// 完全不一样 —— 第一种是"晚了一步",第二种是"人不在,谁去都没用",
+    /// 第三种是"你的会话有问题"。
     fn on_hideout_token(&mut self, alert_id: i64, listings: &[ListingSummary], now: i64) {
         let Some(flow) = self.hideout.get(&alert_id) else {
             return;
         };
-        let token = listings
-            .iter()
-            .find(|listing| listing.id == flow.listing_id)
-            .and_then(|listing| listing.hideout_token.clone());
-        let Some(token) = token else {
-            // 挂单没了,或者这次 fetch 是匿名发的 —— 没 cookie 就没有 token。
-            self.finish_hideout(alert_id, HideoutOutcome::TokenMissing);
+        let listing_id = flow.listing_id.clone();
+
+        let Some(listing) = listings.iter().find(|listing| listing.id == listing_id) else {
+            self.token_missing(
+                alert_id,
+                format!(
+                    "the refetch of listing {listing_id} came back without it — \
+                     the item has been sold or delisted"
+                ),
+            );
+            return;
+        };
+        if !listing.online {
+            // 卖家不在线,谁也传送不过去。交易站也就不会发 hideout_token。
+            let seller = seller_name(listing);
+            self.token_missing(
+                alert_id,
+                format!(
+                    "refetch of listing {listing_id} says {seller} is offline — \
+                     the trade site only hands out a hideout token for an online seller, \
+                     so there is nothing to send"
+                ),
+            );
+            return;
+        }
+        let Some(token) = listing.hideout_token.clone() else {
+            self.token_missing(
+                alert_id,
+                format!(
+                    "refetch of listing {listing_id} returned no hideout_token \
+                     (the request went out without a POESESSID, or the trade site \
+                     no longer offers travel for this listing)"
+                ),
+            );
             return;
         };
         self.note(
@@ -1505,6 +1551,17 @@ impl RuntimeActor {
             "set_hideout_token",
         );
         self.post_whisper(alert_id, &token);
+    }
+
+    /// 拿不到 token 就收尾。
+    ///
+    /// `TokenMissing` 上没有消息字段(界面按枚举查双语文案),所以"为什么"
+    /// 走一条日志 —— 状态栏里看得见,不然三种完全不同的原因在卡片上长得一样。
+    fn token_missing(&mut self, alert_id: i64, why: String) {
+        self.emit(RuntimeEvent::Log(format!(
+            "hideout alert {alert_id}: {why}"
+        )));
+        self.finish_hideout(alert_id, HideoutOutcome::TokenMissing);
     }
 
     /// 收尾:把这条流程从表里拿掉,回写 `last_action`,广播结果。
@@ -1515,6 +1572,18 @@ impl RuntimeActor {
 
     /// 报一句进展(不一定是结局)。
     fn report_hideout(&mut self, alert_id: i64, outcome: HideoutOutcome) {
+        // 卡片脚注只放得下一个状态码,完整的原因走日志。没有这一条,
+        // 一次失败在界面上就只剩 `失败(0)`,什么也查不出来。
+        if let HideoutOutcome::Failed { status, message } = &outcome {
+            let answered = if *status == 0 {
+                "no HTTP answer".to_string()
+            } else {
+                format!("HTTP {status}")
+            };
+            self.emit(RuntimeEvent::Log(format!(
+                "hideout alert {alert_id}: failed ({answered}) — {message}"
+            )));
+        }
         self.note(
             self.store.set_last_action(alert_id, outcome.action()),
             "set_last_action",
@@ -1835,12 +1904,117 @@ fn flow_for(row: &AlertRow) -> HideoutFlow {
     }
 }
 
-/// 网关的失败里那个 HTTP 状态码;根本没发出去的失败算 0。
-fn status_of(error: &GatewayError) -> u16 {
-    match error {
-        GatewayError::Status(status) => *status,
-        _ => 0,
+/// "去藏身处"链路上的哪一步。
+///
+/// 消息里必须说清是哪一步:同样是 404,"重新抓这条挂单时 404"是货没了,
+/// "POST whisper 时 404"是 token 和挂单对不上,处置完全不同。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HideoutStep {
+    /// 为了换一个新 token 而重新 fetch 这条挂单。
+    Refetch,
+    /// `POST /api/trade2/whisper`。
+    Whisper,
+}
+
+impl HideoutStep {
+    fn label(self) -> &'static str {
+        match self {
+            HideoutStep::Refetch => "the refetch",
+            HideoutStep::Whisper => "the travel request",
+        }
     }
+}
+
+/// 一次网关失败 → 卡片脚注上那句话。
+///
+/// 纯函数,所以每一条路径都能在测试里钉死。`status` 只有在服务端真的答了
+/// 一个状态码时才非零:**0 的意思是"这封请求压根没上过网"**,而它下面
+/// 藏着五种完全不同的原因(断网、没会话、被 Cloudflare 拦、答非所问、
+/// 程序在关机)—— 早先这五种在界面上长得一模一样,都是 `失败(0)`。
+fn hideout_failure(step: HideoutStep, listing_id: &str, error: &GatewayError) -> HideoutOutcome {
+    let what = step.label();
+    let (status, message) = match error {
+        GatewayError::Transport(detail) => (
+            0,
+            format!("{what} for listing {listing_id} never left this machine: {detail}"),
+        ),
+        GatewayError::NoSession => (
+            0,
+            format!(
+                "{what} for listing {listing_id} needs a POESESSID and the gateway has none — \
+                 the trade site most likely just rejected the session; paste a fresh one \
+                 into settings and try again"
+            ),
+        ),
+        GatewayError::Parse(detail) => (
+            0,
+            format!(
+                "the trade site's answer to {what} for listing {listing_id} \
+                 could not be read: {detail}"
+            ),
+        ),
+        GatewayError::CloudflareHold => (
+            0,
+            format!(
+                "Cloudflare answered instead of the trade site, so {what} for listing \
+                 {listing_id} was never sent — every request is held for 5 minutes"
+            ),
+        ),
+        GatewayError::Cancelled => (
+            0,
+            format!("the runtime shut down before {what} for listing {listing_id} went out"),
+        ),
+        GatewayError::Status {
+            status: 404,
+            excerpt,
+        } => (
+            404,
+            format!(
+                "listing {listing_id} is gone — the trade site answered 404 to {what}{}",
+                detail_suffix(excerpt)
+            ),
+        ),
+        GatewayError::Status {
+            status: status @ (401 | 403),
+            excerpt,
+        } => (
+            *status,
+            format!(
+                "the trade site refused {what} for listing {listing_id} with HTTP {status} — \
+                 the POESESSID is probably no longer valid{}",
+                detail_suffix(excerpt)
+            ),
+        ),
+        GatewayError::Status { status, excerpt } => (
+            *status,
+            format!(
+                "the trade site answered HTTP {status} to {what} for listing {listing_id}{}",
+                detail_suffix(excerpt)
+            ),
+        ),
+    };
+    HideoutOutcome::Failed { status, message }
+}
+
+/// 响应 body 有话说才把它接在消息后面。
+fn detail_suffix(excerpt: &str) -> String {
+    if excerpt.is_empty() {
+        String::new()
+    } else {
+        format!(": {excerpt}")
+    }
+}
+
+/// 挂单上那个卖家怎么称呼。账号名空着(服务端偶尔不给)就退回角色名,
+/// 两个都空就说"the seller" —— 一句话里不该出现一个空洞。
+fn seller_name(listing: &ListingSummary) -> String {
+    for name in [&listing.account, &listing.character] {
+        let name = name.trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
+    "the seller".to_string()
 }
 
 /// 本地时区今天零点的 unix 秒。"今天叫了几次"按本地日期算才符合直觉;
@@ -1886,8 +2060,18 @@ mod actor_tests {
         whispers: Vec<String>,
         /// 依次回给 whisper 的状态码;用完了就一律 200。
         whisper_statuses: VecDeque<u16>,
+        /// whisper 响应的 body。`None` = `{}`。非 2xx 时它就是"为什么被拒"。
+        whisper_body: Option<String>,
+        /// whisper 响应看着像不像 HTML(Cloudflare 拦截页)。
+        whisper_html: bool,
+        /// 设了就让 whisper 连发都发不出去(断网、TLS 挂了)。
+        whisper_error: Option<String>,
         /// fetch 回来的挂单带不带 hideout_token(真实世界里取决于带没带 cookie)。
         hideout_token: Option<String>,
+        /// fetch 回来的卖家在不在线。离线的卖家拿不到 hideout_token。
+        seller_offline: bool,
+        /// fetch 回一个空 `result`(那件货在这几秒里被买走了)。
+        fetch_returns_nothing: bool,
         /// search 响应的 `X-Rate-Limit-Rules` 写什么。`None` = 不给限速头。
         /// 会话检查看的就是这一行。
         rate_rules: Option<String>,
@@ -1922,7 +2106,10 @@ mod actor_tests {
 
     /// 按问到的 id 现编一批挂单。价格从 18 divine 起每条便宜 1 个(封底 1),
     /// 所以最后一条最便宜 —— 合成卡片的标题该是它。
-    fn listings_json(ids: &[String], token: Option<&str>) -> String {
+    ///
+    /// `online = false` 时干脆不给 `account.online` 这个键 —— 交易站离线时
+    /// 就是这么回的(不是回 `null`),摘要那一层认的也是"这个键在不在"。
+    fn listings_json(ids: &[String], token: Option<&str>, online: bool) -> String {
         let items: Vec<String> = ids
             .iter()
             .enumerate()
@@ -1930,12 +2117,16 @@ mod actor_tests {
                 let hideout = token
                     .map(|token| format!(r#""hideout_token":"{token}","#))
                     .unwrap_or_default();
+                let presence = if online {
+                    r#","online":{"league":"x"}"#
+                } else {
+                    ""
+                };
                 format!(
                     r#"{{"id":"{id}","listing":{{"indexed":"2026-09-06T10:00:00Z",
                         "whisper":"@{id} hi",{hideout}
                         "price":{{"type":"~price","amount":{},"currency":"divine"}},
-                        "account":{{"name":"Seller{id}","lastCharacterName":"Char{id}",
-                            "online":{{"league":"x"}}}}}},
+                        "account":{{"name":"Seller{id}","lastCharacterName":"Char{id}"{presence}}}}},
                      "item":{{"name":"Choir of the Storm","typeLine":"Lapis Amulet"}}}}"#,
                     (18 - index as i64).max(1)
                 )
@@ -1981,12 +2172,19 @@ mod actor_tests {
             _search_id: &str,
             _session: Option<&str>,
         ) -> Result<TradeResponse, pnd_trade::TransportError> {
-            let token = {
+            let (token, offline, nothing) = {
                 let mut log = self.log.lock().unwrap();
                 log.fetches.push(ids.to_vec());
-                log.hideout_token.clone()
+                (
+                    log.hideout_token.clone(),
+                    log.seller_offline,
+                    log.fetch_returns_nothing,
+                )
             };
-            ok(&listings_json(ids, token.as_deref()))
+            if nothing {
+                return ok(r#"{"result":[]}"#);
+            }
+            ok(&listings_json(ids, token.as_deref(), !offline))
         }
 
         fn whisper(
@@ -1995,16 +2193,24 @@ mod actor_tests {
             _session: &str,
             _referer: &str,
         ) -> Result<TradeResponse, pnd_trade::TransportError> {
-            let status = {
+            let (status, body, html, error) = {
                 let mut log = self.log.lock().unwrap();
                 log.whispers.push(token.to_string());
-                log.whisper_statuses.pop_front().unwrap_or(200)
+                (
+                    log.whisper_statuses.pop_front().unwrap_or(200),
+                    log.whisper_body.clone().unwrap_or_else(|| "{}".to_string()),
+                    log.whisper_html,
+                    log.whisper_error.clone(),
+                )
             };
+            if let Some(error) = error {
+                return Err(pnd_trade::TransportError::Unreachable(error));
+            }
             Ok(TradeResponse {
                 status,
-                body: b"{}".to_vec(),
+                body: body.into_bytes(),
                 rate: None,
-                looks_like_html: false,
+                looks_like_html: html,
             })
         }
     }
@@ -2524,6 +2730,7 @@ mod actor_tests {
             let mut log = log.lock().unwrap();
             log.hideout_token = Some("tok".to_string());
             log.whisper_statuses.extend([503, 503, 503, 503]);
+            log.whisper_body = Some(r#"{"error":{"code":8}}"#.to_string());
         }
         let handle =
             RuntimeHandle::start_offline(hideout_settings(), RuntimePaths::in_memory(), transport)
@@ -2534,10 +2741,15 @@ mod actor_tests {
         let outcomes = hideout_outcomes(&handle, &mut seen, alert_id);
 
         assert_eq!(outcomes[0], HideoutOutcome::Refreshed);
-        assert!(
-            matches!(outcomes[1], HideoutOutcome::Failed { status: 503, .. }),
-            "{outcomes:#?}"
-        );
+        let HideoutOutcome::Failed { status, message } = &outcomes[1] else {
+            panic!("expected a Failed, got {outcomes:#?}");
+        };
+        assert_eq!(*status, 503);
+        // 换过 token 还是 503:该说的是"人多半不在线",而不是干巴巴一句
+        // "被拒了两次" —— 后者不告诉用户下一步该做什么。
+        assert!(message.contains("both travel requests"), "{message}");
+        assert!(message.contains("not online"), "{message}");
+        assert!(message.contains(r#"{"error":{"code":8}}"#), "{message}");
         // 再点一次也还是最多两次:这是"每次点击"的账,不是"每条提醒"的账。
         thread::sleep(Duration::from_millis(200));
         assert_eq!(
@@ -2545,6 +2757,24 @@ mod actor_tests {
             2,
             "第三次 POST 不该存在"
         );
+    }
+
+    /// 事件流里的每一句日志。失败的原因走这条路 —— 卡片脚注只放得下
+    /// 一个状态码。
+    fn logs(seen: &[RuntimeEvent]) -> Vec<String> {
+        seen.iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::Log(message) => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 这批日志里有没有哪一句同时含这几个词。
+    fn logged(seen: &[RuntimeEvent], parts: &[&str]) -> bool {
+        logs(seen)
+            .iter()
+            .any(|line| parts.iter().all(|part| line.contains(part)))
     }
 
     /// 挂单上根本没有 token(当初是匿名 fetch 回来的):重新抓一次也没有,
@@ -2566,6 +2796,268 @@ mod actor_tests {
             "{seen:#?}"
         );
         assert!(log.lock().unwrap().whispers.is_empty(), "没 token 就别发");
+        // `TokenMissing` 上没有消息字段,所以"为什么"必须出现在日志里,
+        // 而且要说清是哪一件货。
+        assert!(
+            logged(&seen, &["no hideout_token", "POESESSID"]),
+            "{:#?}",
+            logs(&seen)
+        );
+    }
+
+    /// 卖家离线:交易站不会给 hideout_token,发过去也没人接。
+    /// 这条必须是 `TokenMissing` + 一句说得清的日志,不是 `Failed(0)`。
+    #[test]
+    fn an_offline_seller_is_a_missing_token_with_a_reason_not_a_bare_failure() {
+        let (transport, log) = FakeTrade::new();
+        let handle =
+            RuntimeHandle::start_offline(hideout_settings(), RuntimePaths::in_memory(), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        let alert_id = first_alert(&handle, &mut seen);
+        {
+            // 重新抓回来的那一条:有 token,但人已经下线了。
+            let mut log = log.lock().unwrap();
+            log.hideout_token = Some("tok".to_string());
+            log.seller_offline = true;
+        }
+        let outcomes = hideout_outcomes(&handle, &mut seen, alert_id);
+
+        assert_eq!(
+            outcomes,
+            vec![HideoutOutcome::Refreshed, HideoutOutcome::TokenMissing],
+            "{seen:#?}"
+        );
+        assert!(log.lock().unwrap().whispers.is_empty(), "人都不在线了,别发");
+        assert!(
+            logged(&seen, &["offline", "Seller", "hideout token"]),
+            "{:#?}",
+            logs(&seen)
+        );
+    }
+
+    /// 重新抓的时候那件货已经被买走了:说"没了",不是说"失败(0)"。
+    #[test]
+    fn a_listing_that_vanished_before_the_refetch_says_it_is_gone() {
+        let (transport, log) = FakeTrade::new();
+        let handle =
+            RuntimeHandle::start_offline(hideout_settings(), RuntimePaths::in_memory(), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        let alert_id = first_alert(&handle, &mut seen);
+        log.lock().unwrap().fetch_returns_nothing = true;
+        let outcomes = hideout_outcomes(&handle, &mut seen, alert_id);
+
+        assert_eq!(
+            outcomes,
+            vec![HideoutOutcome::Refreshed, HideoutOutcome::TokenMissing],
+            "{seen:#?}"
+        );
+        assert!(
+            logged(&seen, &["came back without it", "sold or delisted"]),
+            "{:#?}",
+            logs(&seen)
+        );
+    }
+
+    /// whisper 被拒了(JSON 的 403):状态码要是真的 403,消息里要有
+    /// 服务端 body 的那句话 —— 早先这两样都丢了,只剩一个 `失败(0)`。
+    #[test]
+    fn a_refused_whisper_keeps_the_real_status_and_the_body() {
+        let (transport, log) = FakeTrade::new();
+        {
+            let mut log = log.lock().unwrap();
+            log.hideout_token = Some("tok".to_string());
+            log.whisper_statuses.push_back(403);
+            log.whisper_body = Some(r#"{"error":{"code":6,"message":"Forbidden"}}"#.to_string());
+        }
+        let handle =
+            RuntimeHandle::start_offline(hideout_settings(), RuntimePaths::in_memory(), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        let alert_id = first_alert(&handle, &mut seen);
+        let outcomes = hideout_outcomes(&handle, &mut seen, alert_id);
+
+        let HideoutOutcome::Failed { status, message } = outcomes.last().unwrap() else {
+            panic!("expected a Failed, got {outcomes:#?}");
+        };
+        assert_eq!(*status, 403, "状态码不能被抹成 0");
+        assert!(message.contains("POESESSID"), "{message}");
+        assert!(message.contains("Forbidden"), "body 那句话要带上:{message}");
+        assert!(!message.contains("tok"), "token 不许出现在消息里:{message}");
+        assert_eq!(log.lock().unwrap().whispers.len(), 1, "403 不该重试");
+        assert!(logged(&seen, &["failed (HTTP 403)"]), "{:#?}", logs(&seen));
+    }
+
+    /// whisper 撞上 Cloudflare 的拦截页(403 + HTML):这不是"会话坏了",
+    /// 是整条队列被拦住了,消息必须说的是这件事。
+    #[test]
+    fn a_cloudflare_page_on_the_whisper_says_cloudflare() {
+        let (transport, log) = FakeTrade::new();
+        {
+            let mut log = log.lock().unwrap();
+            log.hideout_token = Some("tok".to_string());
+            log.whisper_statuses.push_back(403);
+            log.whisper_body = Some("<!DOCTYPE html><html>Just a moment…</html>".to_string());
+            log.whisper_html = true;
+        }
+        let handle =
+            RuntimeHandle::start_offline(hideout_settings(), RuntimePaths::in_memory(), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        let alert_id = first_alert(&handle, &mut seen);
+        let outcomes = hideout_outcomes(&handle, &mut seen, alert_id);
+
+        let HideoutOutcome::Failed { status, message } = outcomes.last().unwrap() else {
+            panic!("expected a Failed, got {outcomes:#?}");
+        };
+        // 请求确实发出去了,但回来的不是交易站 —— 状态码在这里没有意义。
+        assert_eq!(*status, 0);
+        assert!(message.contains("Cloudflare"), "{message}");
+        assert!(message.contains("5 minutes"), "{message}");
+        assert!(
+            logged(&seen, &["failed (no HTTP answer)", "Cloudflare"]),
+            "{:#?}",
+            logs(&seen)
+        );
+    }
+
+    /// 请求压根没上过网(断网、TLS 挂了):状态码是 0,但消息要说明白
+    /// "没发出去",还要把传输层那句话带上。
+    #[test]
+    fn a_whisper_that_never_left_the_machine_says_exactly_that() {
+        let (transport, log) = FakeTrade::new();
+        {
+            let mut log = log.lock().unwrap();
+            log.hideout_token = Some("tok".to_string());
+            log.whisper_error = Some("connection reset by peer".to_string());
+        }
+        let handle =
+            RuntimeHandle::start_offline(hideout_settings(), RuntimePaths::in_memory(), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        let alert_id = first_alert(&handle, &mut seen);
+        let outcomes = hideout_outcomes(&handle, &mut seen, alert_id);
+
+        let HideoutOutcome::Failed { status, message } = outcomes.last().unwrap() else {
+            panic!("expected a Failed, got {outcomes:#?}");
+        };
+        assert_eq!(*status, 0);
+        assert!(message.contains("never left this machine"), "{message}");
+        assert!(message.contains("connection reset by peer"), "{message}");
+    }
+
+    /// 每一种网关失败都得有一句自己的话。这是那条"状态码 0 底下藏着五种
+    /// 完全不同的原因"的清单,少一条就意味着界面上又会出现一个说不清的
+    /// `失败(0)`。
+    #[test]
+    fn every_gateway_failure_gets_its_own_sentence() {
+        let cases = [
+            (
+                GatewayError::Transport("dns failed".to_string()),
+                0,
+                vec!["never left this machine", "dns failed"],
+            ),
+            (
+                GatewayError::NoSession,
+                0,
+                vec!["needs a POESESSID", "paste a fresh one"],
+            ),
+            (
+                GatewayError::Parse("missing `result`".to_string()),
+                0,
+                vec!["could not be read", "missing `result`"],
+            ),
+            (
+                GatewayError::CloudflareHold,
+                0,
+                vec!["Cloudflare", "5 minutes"],
+            ),
+            (GatewayError::Cancelled, 0, vec!["shut down"]),
+            (
+                GatewayError::Status {
+                    status: 404,
+                    excerpt: "not found".to_string(),
+                },
+                404,
+                vec!["is gone", "404", "not found"],
+            ),
+            (
+                GatewayError::Status {
+                    status: 401,
+                    excerpt: String::new(),
+                },
+                401,
+                vec!["401", "POESESSID"],
+            ),
+            (
+                GatewayError::Status {
+                    status: 500,
+                    excerpt: "boom".to_string(),
+                },
+                500,
+                vec!["500", "boom"],
+            ),
+        ];
+
+        for (error, want_status, wants) in cases {
+            for step in [HideoutStep::Refetch, HideoutStep::Whisper] {
+                let outcome = hideout_failure(step, "listing-9", &error);
+                let HideoutOutcome::Failed { status, message } = outcome else {
+                    panic!("{error:?} 该是一个 Failed");
+                };
+                assert_eq!(status, want_status, "{error:?}");
+                assert!(message.contains("listing-9"), "哪一件货都没说:{message}");
+                assert!(message.contains(step.label()), "哪一步都没说:{message}");
+                for want in &wants {
+                    assert!(message.contains(want), "{error:?} 少了 {want:?}:{message}");
+                }
+            }
+        }
+
+        // body 是空的就不该多一个孤零零的冒号。
+        let quiet = hideout_failure(
+            HideoutStep::Whisper,
+            "x",
+            &GatewayError::Status {
+                status: 500,
+                excerpt: String::new(),
+            },
+        );
+        let HideoutOutcome::Failed { message, .. } = quiet else {
+            unreachable!()
+        };
+        assert!(message.ends_with("listing x"), "{message}");
+    }
+
+    /// 账号名空着也要说得出一个称呼,不能在句子中间留一个洞。
+    #[test]
+    fn a_seller_without_an_account_name_still_has_a_name() {
+        let mut listing = ListingSummary {
+            id: "a".to_string(),
+            item_name: "x".to_string(),
+            type_line: "x".to_string(),
+            price: None,
+            account: "Seller#1".to_string(),
+            character: "Char".to_string(),
+            online: false,
+            afk: false,
+            indexed: String::new(),
+            whisper: String::new(),
+            whisper_token: None,
+            hideout_token: None,
+            icon: String::new(),
+        };
+        assert_eq!(seller_name(&listing), "Seller#1");
+        listing.account = "  ".to_string();
+        assert_eq!(seller_name(&listing), "Char");
+        listing.character = String::new();
+        assert_eq!(seller_name(&listing), "the seller");
     }
 
     /// 没有会话时点"去藏身处":一句话说清楚,一个请求都不发。

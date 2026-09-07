@@ -421,11 +421,24 @@ fn pump(
             // 读超时:这段时间服务端什么都没说,连接还好着。回到循环顶上
             // 就是为了看一眼取消标志。
             Ok(LiveMessage::Idle) => {}
-            Ok(LiveMessage::Other(text)) => {
-                if events
-                    .send(LiveEvent::Log(format!("live {}: {text}", config.watch_id)))
-                    .is_err()
-                {
+            // 连上时的订阅回执。**只报形状,不报内容** —— 那串是服务端发的
+            // JWT,早先它被原样抄进日志,整条 token 就进了状态栏。
+            Ok(LiveMessage::Subscribed { token }) => {
+                let line = format!(
+                    "live {}: server message keys=[\"result\"] result_len={}",
+                    config.watch_id,
+                    token.chars().count()
+                );
+                if events.send(LiveEvent::Log(line)).is_err() {
+                    stream.close();
+                    return PumpEnd::Cancelled;
+                }
+            }
+            // `description` 已经是"键名 + 值长度",不是原文(见
+            // `pnd_trade::live::describe_live_message`)。
+            Ok(LiveMessage::Other(description)) => {
+                let line = format!("live {}: server message {description}", config.watch_id);
+                if events.send(LiveEvent::Log(line)).is_err() {
                     stream.close();
                     return PumpEnd::Cancelled;
                 }
@@ -545,6 +558,11 @@ pub(crate) mod live_worker_tests {
     pub(crate) enum Step {
         /// 推一批挂单 id。
         New(Vec<String>),
+        /// 服务端发来的一条**原文**,走生产的 `parse_live_message`。
+        ///
+        /// 和 `New` 分开是因为要验的正是解析那一段:`{"result":"<JWT>"}`
+        /// 认不认得出来、认不出来的话日志里会出现什么。
+        Raw(String),
         /// 断线。
         Fail(LiveError),
     }
@@ -604,6 +622,8 @@ pub(crate) mod live_worker_tests {
             let step = self.steps.lock().unwrap().pop_front();
             match step {
                 Some(Step::New(ids)) => Ok(LiveMessage::New(ids)),
+                // 生产的解析函数,不是抄一份:验的就是它。
+                Some(Step::Raw(text)) => Ok(pnd_trade::live::parse_live_message(&text)?),
                 Some(Step::Fail(error)) => Err(error),
                 None => {
                     // 空剧本 = 服务端在发呆。别把 CPU 烧了。
@@ -799,6 +819,57 @@ pub(crate) mod live_worker_tests {
         assert_eq!(connector.connects(), 1, "推送不该让它重连");
         assert_eq!(states(&seen)[0], LiveRunState::Connecting);
         assert!(states(&seen)[1].is_connected());
+    }
+
+    /// 服务端一连上就发 `{"result":"<JWT>"}`。日志里只许出现形状,
+    /// 绝不许出现那串 token —— 这是 2026-09-07 那次真跑里状态栏泄露的东西。
+    #[test]
+    fn the_connect_receipt_is_logged_by_shape_never_by_value() {
+        let token = format!(
+            "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.{}.c2ln",
+            "Z".repeat(260)
+        );
+        let connector = Arc::new(ScriptedConnector::new());
+        connector.push(Step::Raw(format!(r#"{{"result":"{token}"}}"#)));
+        // 一条不认识的消息也走同一条路。
+        connector.push(Step::Raw(
+            r#"{"heartbeat":123,"payload":"aaaaaaaaaaaaaaaaaaaaaaaa"}"#.to_string(),
+        ));
+
+        let seen = drive(
+            worker_config("w-1", "cookie"),
+            Arc::clone(&connector),
+            |seen| {
+                seen.iter()
+                    .filter(|event| matches!(event, LiveEvent::Log(_)))
+                    .count()
+                    >= 2
+            },
+        );
+
+        let logs: Vec<String> = seen
+            .iter()
+            .filter_map(|event| match event {
+                LiveEvent::Log(message) => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            logs,
+            vec![
+                format!("live w-1: server message keys=[\"result\"] result_len={}", token.chars().count()),
+                r#"live w-1: server message keys=["heartbeat", "payload"] heartbeat=123 payload_len=24"#.to_string(),
+            ],
+            "{seen:#?}"
+        );
+        for log in &logs {
+            assert!(!log.contains(&token), "token 漏进日志了:{log}");
+            assert!(
+                !log.contains("aaaaaaaaaaaaaaaaaaaaaaaa"),
+                "长值漏进日志了:{log}"
+            );
+        }
+        assert_eq!(connector.connects(), 1, "一条回执不该让它重连");
     }
 
     #[test]

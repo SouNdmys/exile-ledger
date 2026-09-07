@@ -33,6 +33,12 @@ const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
 /// fetch 接口一次最多 10 个挂单 id,这是服务端定的。
 pub const MAX_FETCH_IDS: usize = 10;
 
+/// 一次失败响应的 body 最多留这么长给人看。
+///
+/// 够看清 GGG 的一句 `{"error":{"code":6,"message":"…"}}`,也够认出
+/// Cloudflare 的拦截页开头,又不至于把一整张 HTML 灌进卡片脚注和日志。
+pub const BODY_EXCERPT_CHARS: usize = 160;
+
 /// 网络层能出的岔子。注意 **HTTP 错误码不在这里**:429/403/503 都是正常返回的
 /// `TradeResponse`,状态码由调用方处理,因为那些响应上的头和 body 都有用。
 #[derive(Debug, Error)]
@@ -73,6 +79,37 @@ impl TradeResponse {
     pub fn body_text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
+
+    /// 一行、最多 [`BODY_EXCERPT_CHARS`] 个字符的 body 摘要,给错误消息用。
+    ///
+    /// 非 2xx 的时候,状态码只说"被拒了",body 才说"为什么被拒" —— 早先
+    /// 这一段被整个丢掉了,于是卡片上只剩一个数字。换行压成空格是为了让它
+    /// 能塞进一行日志。
+    ///
+    /// 这里出去的**只有服务端说的话**:我们发出去的 token 和 cookie 都在
+    /// 请求头/请求体里,不在响应 body 里。
+    #[must_use]
+    pub fn body_excerpt(&self) -> String {
+        excerpt(&String::from_utf8_lossy(&self.body))
+    }
+}
+
+/// 压成一行、掐到 [`BODY_EXCERPT_CHARS`] 个字符。
+fn excerpt(text: &str) -> String {
+    let mut squeezed = String::new();
+    let mut last_was_space = false;
+    for ch in text.trim().chars() {
+        let ch = if ch.is_whitespace() { ' ' } else { ch };
+        if ch == ' ' && last_was_space {
+            continue;
+        }
+        last_was_space = ch == ' ';
+        squeezed.push(ch);
+        if squeezed.chars().count() >= BODY_EXCERPT_CHARS {
+            break;
+        }
+    }
+    squeezed
 }
 
 /// search 接口的响应。
@@ -179,6 +216,19 @@ impl TradeClient {
     ///
     /// 这个方法是给第二版的卡片按钮用的:**永远由用户点一次才调用**,
     /// 程序自己不会调。
+    ///
+    /// # 这几个头是猜的吗
+    ///
+    /// 不是猜的,但也**没有和官网逐字比对过**。计划里核实过的只有地址和
+    /// 请求体(`{"token":…,"continue":true}`)以及"要带 Cookie";
+    /// `Content-Type`/`Accept`/`User-Agent`/`Referer` 是照着 search 和 fetch
+    /// 那两个已经跑通的接口来的,同一套服务端、同一套 Cloudflare 规则。
+    ///
+    /// 2026-09-07 试着匿名去拿官网那份 JS 来对一遍,拿不到:
+    /// `https://www.pathofexile.com/trade2/search/poe2/Standard` 回 403
+    /// (Cloudflare),而 CDN 上的 bundle 名字要先读到那张 HTML 才知道。
+    /// 所以**没有**照猜测加过任何头(比如 `X-Requested-With`);哪天真要动
+    /// 这里的头,先想办法拿到官网那份 JS,别照感觉加。
     pub fn whisper(
         &self,
         token: &str,
@@ -378,6 +428,32 @@ mod client_tests {
             parse_search_response(b"<!DOCTYPE html>"),
             Err(ParseError::NotJson(_))
         ));
+    }
+
+    /// 非 2xx 的时候,body 才是"为什么被拒"。摘要要压成一行、掐短,
+    /// 而且不能因为服务端回了一堆空白就变成一片空格。
+    #[test]
+    fn body_excerpts_are_one_short_line() {
+        let response = |body: &str| TradeResponse {
+            status: 403,
+            body: body.as_bytes().to_vec(),
+            rate: None,
+            looks_like_html: false,
+        };
+
+        assert_eq!(
+            response("{\n  \"error\": {\n    \"code\": 6,\n    \"message\": \"Forbidden\"\n  }\n}")
+                .body_excerpt(),
+            r#"{ "error": { "code": 6, "message": "Forbidden" } }"#
+        );
+        assert_eq!(response("   ").body_excerpt(), "");
+        assert_eq!(response("").body_excerpt(), "");
+
+        let long = response(&"x".repeat(5_000)).body_excerpt();
+        assert_eq!(long.chars().count(), BODY_EXCERPT_CHARS);
+        // 多字节也按字符数掐,不能从半个汉字中间切开。
+        let chinese = response(&"错".repeat(500)).body_excerpt();
+        assert_eq!(chinese.chars().count(), BODY_EXCERPT_CHARS);
     }
 
     #[test]

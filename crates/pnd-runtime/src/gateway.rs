@@ -196,14 +196,36 @@ pub struct SessionCheckOutcome {
 pub enum GatewayError {
     #[error("could not reach the trade site: {0}")]
     Transport(String),
-    #[error("trade site answered {0}")]
-    Status(u16),
+    /// 服务端答了,但不是 2xx。
+    ///
+    /// `excerpt` 是响应 body 的一行摘要(见
+    /// [`TradeResponse::body_excerpt`](pnd_trade::TradeResponse::body_excerpt))。
+    /// 早先这里只有一个状态码,于是"去藏身处"失败时卡片上只剩一个数字,
+    /// 而服务端明明在 body 里写了原因。
+    #[error("trade site answered {status}{}", excerpt_suffix(excerpt))]
+    Status { status: u16, excerpt: String },
     #[error("could not read the response: {0}")]
     Parse(String),
     #[error("held back: the trade site answered with a Cloudflare page")]
     CloudflareHold,
+    /// 这封请求非带 POESESSID 不可,可网关手上没有(设置里就没填,
+    /// 或者服务端刚刚拒了它、网关已经把它丢掉了)。
+    ///
+    /// 单独一类而不是塞进 `Transport`:它压根没上过网,说"连不上交易站"
+    /// 会把人往查网络的方向带。
+    #[error("this request needs a POESESSID and the gateway has none")]
+    NoSession,
     #[error("cancelled")]
     Cancelled,
+}
+
+/// `Status` 的 `Display` 后缀:body 有话说才带上,空的就只报状态码。
+fn excerpt_suffix(excerpt: &str) -> String {
+    if excerpt.is_empty() {
+        String::new()
+    } else {
+        format!(": {excerpt}")
+    }
 }
 
 /// 回信的内容,形状跟着请求走。
@@ -548,6 +570,14 @@ impl TradeGateway {
         };
         let session = self.session.clone();
 
+        // whisper 没有会话根本发不出去。在花掉限速额度**之前**就回掉,
+        // 而且回一个说得清的原因 —— 早先这里伪装成"连不上交易站",
+        // 于是卡片上显示的是"失败(0)",看不出是会话没了。
+        if matches!(pending.request.kind, RequestKind::Whisper { .. }) && session.is_none() {
+            self.reply(pending, GatewayError::NoSession);
+            return;
+        }
+
         let ticket = self.limiter.insert_request(&policy, now);
         let response = match &pending.request.kind {
             RequestKind::Search { league, body_json }
@@ -557,13 +587,11 @@ impl TradeGateway {
             RequestKind::Fetch { ids, search_id } => {
                 self.transport.fetch(ids, search_id, session.as_deref())
             }
-            RequestKind::Whisper { token, referer } => match session.as_deref() {
-                Some(session) => self.transport.whisper(token, session, referer),
-                // whisper 没有会话根本发不出去,当传输错误回掉。
-                None => Err(TransportError::Unreachable(
-                    "whisper needs a POESESSID".to_string(),
-                )),
-            },
+            // 上面那道闸已经保证了这里一定有会话。
+            RequestKind::Whisper { token, referer } => {
+                self.transport
+                    .whisper(token, session.as_deref().unwrap_or_default(), referer)
+            }
         };
 
         let done_at = now_secs();
@@ -641,7 +669,14 @@ impl TradeGateway {
         }
 
         if !response.is_success() {
-            self.reply(pending, GatewayError::Status(response.status));
+            // body 一起带上:状态码只说"被拒了",body 才说"为什么"。
+            self.reply(
+                pending,
+                GatewayError::Status {
+                    status: response.status,
+                    excerpt: response.body_excerpt(),
+                },
+            );
             return;
         }
 
@@ -862,6 +897,106 @@ mod gateway_tests {
         assert!(!headerless.mentions_account);
         assert!(headerless.rules.is_empty());
         assert_eq!(headerless.status, 403);
+    }
+
+    /// 没有会话的 whisper 连发都不该发:回一个说得清的 `NoSession`,
+    /// 而且不占限速额度。早先它伪装成"连不上交易站",于是卡片上只剩
+    /// 一个 `失败(0)`,看不出是会话没了。
+    #[test]
+    fn a_whisper_without_a_session_is_refused_before_it_costs_anything() {
+        /// 一被调用就说话的假交易站:这个测试要证明的正是"它没被调用"。
+        struct NeverCalled(Arc<AtomicBool>);
+
+        impl TradeTransport for NeverCalled {
+            fn search(
+                &self,
+                _league: &str,
+                _body_json: &str,
+                _session: Option<&str>,
+            ) -> Result<TradeResponse, TransportError> {
+                self.0.store(true, Ordering::Relaxed);
+                Err(TransportError::Unreachable("nope".to_string()))
+            }
+
+            fn fetch(
+                &self,
+                _ids: &[String],
+                _search_id: &str,
+                _session: Option<&str>,
+            ) -> Result<TradeResponse, TransportError> {
+                self.0.store(true, Ordering::Relaxed);
+                Err(TransportError::Unreachable("nope".to_string()))
+            }
+
+            fn whisper(
+                &self,
+                _token: &str,
+                _session: &str,
+                _referer: &str,
+            ) -> Result<TradeResponse, TransportError> {
+                self.0.store(true, Ordering::Relaxed);
+                Err(TransportError::Unreachable("nope".to_string()))
+            }
+        }
+
+        let called = Arc::new(AtomicBool::new(false));
+        let (events_tx, _events_rx) = channel();
+        let (reply_tx, reply_rx) = channel();
+        let gateway = TradeGateway::start(
+            Box::new(NeverCalled(Arc::clone(&called))),
+            Budget::default(),
+            // 关键:网关手上没有会话。
+            None,
+            events_tx,
+        );
+        gateway.submit(GatewayRequest {
+            kind: RequestKind::Whisper {
+                token: "tok".to_string(),
+                referer: "https://example.com".to_string(),
+            },
+            priority: Priority::User,
+            reply: reply_tx,
+            tag: RequestTag {
+                watch_id: None,
+                alert_id: Some(7),
+                label: "test",
+            },
+        });
+
+        let reply = reply_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a reply");
+        drop(gateway);
+
+        assert_eq!(reply.tag.alert_id, Some(7));
+        assert!(
+            matches!(reply.kind, ReplyKind::Whisper(Err(GatewayError::NoSession))),
+            "{:?}",
+            reply.kind
+        );
+        assert!(!called.load(Ordering::Relaxed), "一个请求都不该发出去");
+    }
+
+    /// 非 2xx 的时候,body 里那句话要跟着错误一起走 —— 它才是"为什么"。
+    #[test]
+    fn a_status_error_carries_the_body_and_reads_well_without_one() {
+        let with_body = GatewayError::Status {
+            status: 403,
+            excerpt: r#"{"error":{"code":6}}"#.to_string(),
+        };
+        assert_eq!(
+            with_body.to_string(),
+            r#"trade site answered 403: {"error":{"code":6}}"#
+        );
+        // body 是空的就别留一个孤零零的冒号。
+        assert_eq!(
+            GatewayError::Status {
+                status: 500,
+                excerpt: String::new(),
+            }
+            .to_string(),
+            "trade site answered 500"
+        );
     }
 
     #[test]
