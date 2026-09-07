@@ -24,10 +24,11 @@
 //! cargo run -p pnd-runtime --bin trade_probe -- \
 //!     --observe --league "Forbidden Rites" --search <搜索URL或id>
 //!
-//! # 观察运行模式:起真的 actor 跑市场观察,把 discover / recheck 两轮都走一遍
+//! # 观察运行模式:起真的 actor 跑市场观察,把兜底轮询和回查都走一遍
 //! cargo run -p pnd-runtime --bin trade_probe -- \
 //!     --observe-run --search <搜索URL或id> --minutes 1 \
-//!     [--discover-seconds 300] [--recheck-seconds 1800]
+//!     [--live --session <POESESSID>] [--sample-every 1] \
+//!     [--discover-seconds 300] [--recheck-seconds 3600]
 //! ```
 //!
 //! `--observe-run` 和 `--watch` 一样,一行判定逻辑都没有:它造一份带一条
@@ -36,9 +37,13 @@
 //! 库开在临时文件里(actor 和探针各开一个连接读同一个文件),跑完就删掉 ——
 //! 探针不该往用户真正的 `watch.sqlite` 里塞东西。
 //!
-//! 一分钟的窗口里等不到默认 30 分钟的回查,所以第一轮 discover 一跑完,
-//! 探针就发一条 `RecheckNow`:这样一趟就能看到"新挂单入库 → 回查 → 判定"
-//! 整条链路。花掉的请求是 1 次 search + 新面孔那几批 fetch + 回查那几批。
+//! 一分钟的窗口里等不到阶梯上最快的那一档(10 分钟),所以第一轮 discover
+//! 一跑完,探针就发一条 `RecheckNow`:这样一趟就能看到"新挂单入库 → 回查 →
+//! 判定"整条链路。花掉的请求是 1 次 search + 新面孔那几批 fetch + 回查那几批。
+//!
+//! 加上 `--live`(要 `--session`)就再开一条 WebSocket:挂单一上架就被推过来,
+//! 当场去抓详情 —— 抓回来是 null 的那些就是"我们还没看它第一眼就被买走了",
+//! 那批货正是这条功能想量的东西。不给 `--live` 就是原来那条只轮询的路。
 //!
 //! 蹲价模式每条状态行里都带着 live 那一头的档位(`live off` / `live connecting` /
 //! `live up 42s` / `live retry #2 in 18s` / `live disabled: no session`)。
@@ -102,7 +107,8 @@ trade_probe --watch --minutes 3 [--poll-seconds 60] --search <url|id> [--search 
 [--cap 20] [--currency divine] [--session <POESESSID>] [--hideout <alert_id>]\n       \
 trade_probe --observe --search <url|id> [--league \"Forbidden Rites\"]\n       \
 trade_probe --observe-run --search <url|id> [--minutes 1] \
-[--discover-seconds 300] [--recheck-seconds 1800]";
+[--live --session <POESESSID>] [--sample-every 1] \
+[--discover-seconds 300] [--recheck-seconds 3600]";
 
 /// 蹲价模式里多久抽一次事件。事件通道是无界的,抽得慢只是屏幕上晚一点看到,
 /// 不会丢。
@@ -572,9 +578,17 @@ fn run_observe_run(args: &Args) -> Result<(), String> {
     let mut entry = ObservationEntry::new(label.clone(), &search_ref);
     entry.discover_interval_secs = args.discover_seconds;
     entry.recheck_interval_secs = args.recheck_seconds;
+    entry.sample_every = args.sample_every;
     let obs_id = entry.id.clone();
     settings.observations.push(entry);
-    // 两个下限由它兜住(300 / 1800 秒),所以印出来的数就是真正会用的数。
+    // 没给 --live 就一条 WebSocket 都不开:观察只要有会话就会自己去连,
+    // 而这条探针跑的是哪条路,应当由命令行说了算,不该由"你恰好粘了个
+    // cookie"决定。额度设成 0 是关掉它最诚实的写法 —— 走的还是生产那条路。
+    if !args.live {
+        settings.watcher.max_live_connections = 0;
+    }
+    // 几个下限由它兜住(300 / 3600 秒、采样至少 1),所以印出来的数就是
+    // 真正会用的数。
     settings.normalize();
 
     // 库开在临时文件而不是内存里:actor 和探针各开一个连接读同一个文件,
@@ -599,8 +613,20 @@ fn run_observe_run(args: &Args) -> Result<(), String> {
         settings.observations[0].discover_interval_secs
     );
     println!(
-        "recheck       every {} s   (fetch the listings on file, 10 per request)",
+        "recheck       ladder +10m/+30m/+2h/+6h/+1d/+3d, then every {} s until 7 days",
         settings.observations[0].recheck_interval_secs
+    );
+    println!(
+        "live          {}",
+        if args.live {
+            "yes (one WebSocket for this observation; pushed ids are fetched at once)"
+        } else {
+            "no (--live is off, so this run is backstop-poll only)"
+        }
+    );
+    println!(
+        "sample        every {} pushed listing(s)",
+        settings.observations[0].sample_every
     );
     println!("database      {}", db_path.display());
     println!("running for   {} minutes\n", args.minutes);
@@ -611,8 +637,9 @@ fn run_observe_run(args: &Args) -> Result<(), String> {
     let labels: BTreeMap<String, String> =
         [(obs_id.to_string(), label.clone())].into_iter().collect();
     let deadline = Instant::now() + Duration::from_secs(args.minutes * 60);
-    // 默认回查是半小时一次,一分钟的窗口里等不到。第一轮 discover 一落地就
-    // 手动排一次 —— 这条命令正是界面上那个"立刻回查"按钮发的东西。
+    // 回查现在是每条挂单自己的阶梯,最快的一档也要 10 分钟,一分钟的窗口里
+    // 等不到。第一轮 discover 一落地就手动排一次 —— 这条命令正是界面上那个
+    // "立刻回查"按钮发的东西(把在册的挂单全部推到此刻到期)。
     let mut recheck_asked = false;
     while Instant::now() < deadline {
         match handle.try_next_event() {
@@ -1397,6 +1424,13 @@ struct Args {
     observe: bool,
     /// `--observe-run`:起真的 actor 跑市场观察,见 [`run_observe_run`]。
     observe_run: bool,
+    /// `--observe-run --live`:让这条观察也开一条 live WebSocket。
+    ///
+    /// 要会话(接口不接待匿名连接)。不给这个开关就是原来那条只轮询的路,
+    /// 而且**一条 WebSocket 都不开** —— 探针跑的是哪条路,应当由命令行说了算。
+    live: bool,
+    /// `--sample-every N`:秒推来的挂单每 N 条抓一条(1 = 全抓)。
+    sample_every: u32,
     /// 观察的两个节奏(秒)。默认就是设置里的下限 —— 探针一趟只有几分钟,
     /// 跑的是"最勤能多勤",而 `normalize` 会兜住不让它更勤。
     discover_seconds: u64,
@@ -1426,6 +1460,8 @@ impl Args {
         let mut watch = false;
         let mut observe = false;
         let mut observe_run = false;
+        let mut live = false;
+        let mut sample_every: u32 = 1;
         let mut discover_seconds = pnd_settings::MIN_DISCOVER_INTERVAL_SECS;
         let mut recheck_seconds = pnd_settings::MIN_RECHECK_INTERVAL_SECS;
         let mut minutes: u64 = 3;
@@ -1441,6 +1477,13 @@ impl Args {
                 "--watch" => watch = true,
                 "--observe" => observe = true,
                 "--observe-run" => observe_run = true,
+                "--live" => live = true,
+                "--sample-every" => {
+                    let raw = value()?;
+                    sample_every = raw
+                        .parse::<u32>()
+                        .map_err(|_| format!("--sample-every wants a whole number, got {raw:?}"))?;
+                }
                 "--discover-seconds" => {
                     let raw = value()?;
                     discover_seconds = raw.parse::<u64>().map_err(|_| {
@@ -1502,6 +1545,11 @@ impl Args {
         if searches.is_empty() {
             return Err("--search is required".to_string());
         }
+        // live 接口不接待匿名连接:没有会话一条也连不上。与其跑满一分钟再报
+        // "连不上",不如现在就说清楚缺什么。
+        if live && session.as_deref().unwrap_or_default().trim().is_empty() {
+            return Err("--live needs --session <POESESSID>".to_string());
+        }
         Ok(Args {
             league,
             searches,
@@ -1513,6 +1561,8 @@ impl Args {
             watch,
             observe,
             observe_run,
+            live,
+            sample_every,
             discover_seconds,
             recheck_seconds,
             minutes,
@@ -1571,5 +1621,54 @@ mod trade_probe_tests {
             short_id("0123456789abcdef0123456789abcdef"),
             "01234567…89abcdef"
         );
+    }
+
+    fn parse(flags: &[&str]) -> Result<Args, String> {
+        Args::parse(flags.iter().map(|flag| (*flag).to_string()))
+    }
+
+    /// `--live` 必须带会话:live 接口不接待匿名连接,而"跑满一分钟才发现
+    /// 一条都连不上"是最难查的那种失败。
+    #[test]
+    fn live_without_a_session_is_refused_before_anything_goes_out() {
+        // 不用 `expect_err`:那要求 `Args` 能 Debug 打印,而它手里攥着
+        // POESESSID —— 让它可打印,迟早会有一条日志把 cookie 印出来。
+        let error = match parse(&["--observe-run", "--search", "abc", "--live"]) {
+            Ok(_) => panic!("--live without --session must not be accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("--live needs --session"), "{error}");
+        // 空串的 cookie 也一样不算数。
+        assert!(
+            parse(&[
+                "--observe-run",
+                "--search",
+                "abc",
+                "--live",
+                "--session",
+                "  "
+            ])
+            .is_err()
+        );
+
+        let args = parse(&[
+            "--observe-run",
+            "--search",
+            "abc",
+            "--live",
+            "--session",
+            "cookie",
+            "--sample-every",
+            "5",
+        ])
+        .unwrap_or_else(|error| panic!("--live with a session is fine: {error}"));
+        assert!(args.live);
+        assert_eq!(args.sample_every, 5);
+
+        // 不给 --live 就还是原来那条只轮询的路,会话可给可不给。
+        let args = parse(&["--observe-run", "--search", "abc"])
+            .unwrap_or_else(|error| panic!("poll-only: {error}"));
+        assert!(!args.live);
+        assert_eq!(args.sample_every, 1, "默认全抓");
     }
 }

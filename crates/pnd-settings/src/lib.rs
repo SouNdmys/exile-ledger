@@ -108,11 +108,22 @@ pub struct ObservationEntry {
     /// 要和蹲价分着花;10 分钟一次的话,一条观察一天只花 144 次。
     /// [`AppSettings::normalize`] 兜住 300 秒的下限。
     pub discover_interval_secs: u64,
-    /// 多久把在册的挂单回头查一遍(秒)。
+    /// **挂了三天以上**的老货多久再看一眼(秒)。
     ///
-    /// 默认 7200:回查的粒度就是"存活时间"的精度,两小时对"挂了三天"和
-    /// "两小时就没了"这个区别足够了,而更勤只是白花 fetch 额度。
+    /// 名字还叫 recheck,但它已经不是"每隔这么久把在册的挂单全查一遍"了 ——
+    /// 回查走的是 [`pnd_domain::next_check_after`] 那条阶梯(10 分钟、30 分钟、
+    /// 2 小时、6 小时、1 天、3 天),这个数只管阶梯走完之后那一段。
+    ///
+    /// 默认 86400:一件挂了三天还在的货,再精确到小时也不会改变结论
+    /// ("没人要"),一天问一次绰绰有余。
     pub recheck_interval_secs: u64,
+    /// 秒推来的挂单,每 N 条抓一条(1 = 全抓)。
+    ///
+    /// 热门搜索一天能推上万条,而抓详情是要花 fetch 额度的。**在挂单出生的
+    /// 那一刻等距抽样是无偏的**:第 3、6、9 条和第 1、2、3 条一样是随机的一批货,
+    /// 算出来的成交率、中位价都不会偏 —— 所以抽剩下的直接丢掉,不排队等以后,
+    /// 那样只会把"秒掉的"和"慢慢卖的"混成一锅。
+    pub sample_every: u32,
     /// RFC3339;空串合法(手写的设置文件可以不填)。
     pub created_at: String,
 }
@@ -120,9 +131,9 @@ pub struct ObservationEntry {
 /// discover / recheck 的下限。比这更勤对交易站不礼貌,而且换不来更多信息:
 /// 挂单的上架时间本来就只精确到秒级以上,五分钟内的差别看不出什么。
 pub const MIN_DISCOVER_INTERVAL_SECS: u64 = 300;
-/// 回查的下限。半小时一次已经能把"挂了三天"和"两小时就没了"分得很开,
-/// 更勤只是把 fetch 额度烧在同一批挂单上。
-pub const MIN_RECHECK_INTERVAL_SECS: u64 = 1800;
+/// "老货多久看一眼"的下限。一小时:阶梯的最后一档已经是三天,到了那儿
+/// 比一小时还勤只是把 fetch 额度烧在一批卖不掉的货上。
+pub const MIN_RECHECK_INTERVAL_SECS: u64 = 3600;
 
 impl Default for ObservationEntry {
     fn default() -> Self {
@@ -133,7 +144,8 @@ impl Default for ObservationEntry {
             search_id: String::new(),
             enabled: true,
             discover_interval_secs: 600,
-            recheck_interval_secs: 7200,
+            recheck_interval_secs: 86400,
+            sample_every: 1,
             created_at: String::new(),
         }
     }
@@ -325,6 +337,8 @@ impl AppSettings {
                 entry.discover_interval_secs.max(MIN_DISCOVER_INTERVAL_SECS);
             entry.recheck_interval_secs =
                 entry.recheck_interval_secs.max(MIN_RECHECK_INTERVAL_SECS);
+            // 0 会让"每 N 条抓一条"变成一条都不抓,那不是采样,是把这条观察关掉。
+            entry.sample_every = entry.sample_every.max(1);
         }
         if self.ui_language != "zh" && self.ui_language != "en" {
             self.ui_language = "zh".to_string();
@@ -757,7 +771,10 @@ mod settings_tests {
         assert_eq!(entry.search_id, "H4sIAAAA-_09");
         assert!(entry.enabled);
         assert_eq!(entry.discover_interval_secs, 600);
-        assert_eq!(entry.recheck_interval_secs, 7_200);
+        // 回查已经是阶梯的最后一档"三天以上的老货多久看一次",一天一次就够。
+        assert_eq!(entry.recheck_interval_secs, 86_400);
+        // 秒推来的每一条都抓:默认不采样。
+        assert_eq!(entry.sample_every, 1);
         assert!(entry.created_at.starts_with("20"));
 
         let other = ObservationEntry::new("Precursor Tablets", &search);
@@ -820,17 +837,22 @@ mod settings_tests {
         let mut eager = ObservationEntry::new("Tablets", &search);
         eager.discover_interval_secs = 5;
         eager.recheck_interval_secs = 0;
+        eager.sample_every = 0;
         let mut lazy = ObservationEntry::new("Rings", &search);
         lazy.discover_interval_secs = 3_600;
-        lazy.recheck_interval_secs = 86_400;
+        lazy.recheck_interval_secs = 172_800;
+        lazy.sample_every = 4;
         settings.observations = vec![eager, lazy];
         settings.normalize();
 
         assert_eq!(settings.observations[0].discover_interval_secs, 300);
-        assert_eq!(settings.observations[0].recheck_interval_secs, 1_800);
+        assert_eq!(settings.observations[0].recheck_interval_secs, 3_600);
+        // 0 会让"每 N 条抓一条"变成一条都不抓 —— 兜成 1(全抓)。
+        assert_eq!(settings.observations[0].sample_every, 1);
         // 填得比下限还慢就听用户的。
         assert_eq!(settings.observations[1].discover_interval_secs, 3_600);
-        assert_eq!(settings.observations[1].recheck_interval_secs, 86_400);
+        assert_eq!(settings.observations[1].recheck_interval_secs, 172_800);
+        assert_eq!(settings.observations[1].sample_every, 4);
     }
 
     /// 货币走普通字符串、金额走千分整数 —— 手工看设置文件时要能读懂。

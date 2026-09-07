@@ -31,9 +31,9 @@ pub use gateway::{
     TradeTransport,
 };
 pub use live_worker::{
-    LiveConnector, LiveEvent, LiveOffReason, LiveRunState, LiveStream, LiveWorkerConfig,
-    LiveWorkerHandle, TungsteniteConnector, backoff_delay, jitter_for, next_attempt,
-    run_live_worker, spawn_live_worker,
+    LiveConnector, LiveEvent, LiveOffReason, LiveRunState, LiveStream, LiveTarget,
+    LiveWorkerConfig, LiveWorkerHandle, TungsteniteConnector, backoff_delay, jitter_for,
+    next_attempt, run_live_worker, spawn_live_worker,
 };
 pub use ninja_sampler::{
     HourlyBudget, SamplerConfig, SamplerError, SamplerEvent, SamplerHandle, SamplerPlan,
@@ -41,7 +41,7 @@ pub use ninja_sampler::{
     plan_partitions, rate_limit_delay, refresh_prices, run_sampler, should_skip, stage_order,
     stage_plan,
 };
-pub use observe::{ObserveEntry, ObserveKind, ObserveScheduler, fetch_listing_cap};
+pub use observe::{ObserveEntry, ObserveScheduler, SWEEP_INTERVAL_SECS, fetch_listing_cap};
 pub use poll::{PollEntry, PollOutcome, PollScheduler, budget_floor_interval};
 
 /// 现在是 unix 秒。

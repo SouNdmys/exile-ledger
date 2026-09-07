@@ -19,13 +19,13 @@ use std::time::Duration;
 
 use pnd_domain::{
     CurrencyRates, ListingSummary, ObservationId, PriceCap, SearchRef, WatchId, classify_gone,
-    decode_search_id, judge, search_page_url, search_request_body, with_sort,
+    decode_search_id, judge, next_check_after, search_page_url, search_request_body, with_sort,
 };
 use pnd_ninja::client::NinjaClient;
 use pnd_settings::{AppSettings, ObservationEntry, WatchEntry};
 use pnd_storage::{
-    AlertRow, AlertSource, LiveState, NewAlert, ObservationRun, StorageError, WatchState,
-    WatchStore, default_watch_db_path,
+    AlertRow, AlertSource, DueListing, LiveState, NewAlert, ObservationRun, StorageError,
+    WatchState, WatchStore, default_watch_db_path,
 };
 use pnd_trade::live::{LiveConfig, MAX_LIVE_CONNECTIONS_PER_ACCOUNT};
 use pnd_trade::{
@@ -40,10 +40,10 @@ use crate::gateway::{
     RequestKind, RequestTag, SearchOutcome, SessionCheckOutcome, TradeGateway, TradeTransport,
 };
 use crate::live_worker::{
-    LiveConnector, LiveEvent, LiveOffReason, LiveRunState, LiveWorkerConfig, LiveWorkerHandle,
-    TungsteniteConnector, spawn_live_worker,
+    LiveConnector, LiveEvent, LiveOffReason, LiveRunState, LiveTarget, LiveWorkerConfig,
+    LiveWorkerHandle, TungsteniteConnector, spawn_live_worker,
 };
-use crate::observe::{ObserveKind, ObserveScheduler, fetch_listing_cap};
+use crate::observe::{ObserveScheduler, SWEEP_INTERVAL_SECS, fetch_listing_cap};
 use crate::poll::{PollOutcome, PollScheduler, budget_floor_interval};
 use crate::{describe_token, now_secs};
 
@@ -66,9 +66,11 @@ const HIDEOUT_FETCH_LABEL: &str = "hideout-fetch";
 const HIDEOUT_WHISPER_LABEL: &str = "hideout-whisper";
 /// 设置页那个"测试会话"发出去的一次搜索。
 const SESSION_CHECK_LABEL: &str = "session-check";
-/// 市场观察的三步:拉最新 100 条、抓新面孔的详情、回查在册的还在不在。
+/// 市场观察的四步:兜底拉最新 100 条、抓那一轮里新面孔的详情、
+/// 抓秒推来的新面孔、回查到点的在册挂单。
 const OBSERVE_SEARCH_LABEL: &str = "observe-discover";
 const OBSERVE_DISCOVER_FETCH_LABEL: &str = "observe-discover-fetch";
+const OBSERVE_LIVE_FETCH_LABEL: &str = "observe-live-fetch";
 const OBSERVE_RECHECK_LABEL: &str = "observe-recheck";
 
 /// token 里没有 `exp` 时的兜底:拿到超过这么久就当它过期了。
@@ -226,11 +228,20 @@ pub struct ObservationStatus {
     pub active: u32,
     /// 已经不见了的条数(含判成 `Unknown` 的)。
     pub gone: u32,
+    /// WebSocket 那一头现在怎么样。界面上"秒推:已连接 / 重连中 / 未登录"
+    /// 那一行就是它 —— 观察的新挂单主要靠它,轮询只是兜底。
+    pub live: LiveRunState,
+    /// 秒推一共推来过多少条挂单 id(采样掉的也算)。
+    pub pushed_total: u64,
+    /// 其中按 `sample_every` 丢掉、没去抓详情的有多少条。
+    pub sampled_out_total: u64,
     pub last_discover_at: Option<i64>,
     pub last_recheck_at: Option<i64>,
-    /// 下一次 discover / recheck 的 unix 秒;不在排班(停用了、搜索 id 坏了)
+    /// 下一次兜底 discover 的 unix 秒;不在排班(停用了、搜索 id 坏了)
     /// 时是 `None`。
     pub next_discover_at: Option<i64>,
+    /// 在册挂单里最早该回头看的那一刻。回查走的是每条挂单自己的阶梯,
+    /// 所以这不是"下一轮全量回查",而是"下一条到点的挂单"。
     pub next_recheck_at: Option<i64>,
     pub last_error: Option<String>,
 }
@@ -536,12 +547,15 @@ struct ObservationRuntime {
     search_id: String,
     /// discover 的那次 search 正在路上。
     discover_in_flight: bool,
-    /// 这一轮 discover / recheck 还有几批 fetch 没回来。
+    /// 这一轮 discover 还有几批 fetch 没回来。
     ///
     /// 数它是为了知道"这一轮什么时候算跑完":跑完才落 `last_discover_at`、
     /// 才广播一次 `ObservationChanged`,而不是每回来一批就喊一声。
     discover_pending: usize,
-    recheck_pending: usize,
+    /// 秒推来的第几条了。采样("每 N 条抓一条")数的就是它,
+    /// 而且**跨推送连续数** —— 每来一批就从头数的话,一批一条的时候
+    /// 永远只会抓到第一条,那不是抽样,是偏样。
+    pushed_seen: u64,
     status: ObservationStatus,
 }
 
@@ -578,8 +592,15 @@ struct RuntimeActor {
     observations: BTreeMap<ObservationId, ObservationRuntime>,
     /// 怎么去开一条 live 连接。生产是 tungstenite,测试是写好剧本的假货。
     connector: Arc<dyn LiveConnector>,
-    /// 正在跑的 live worker,一条搜索最多一条。
-    live_workers: BTreeMap<WatchId, LiveWorkerHandle>,
+    /// 正在跑的 live worker,一条搜索(或一条观察)最多一条。
+    /// 两种共用同一份"最多几条"的额度,所以也共用这一张表。
+    live_workers: BTreeMap<LiveTarget, LiveWorkerHandle>,
+    /// 已经发出去、还没回来的回查批次:批次号 → 这一批问的是谁的哪几条挂单。
+    ///
+    /// 一批里可以混着好几条观察,而回信只按挂单 id 对号,所以"这条 id 是替
+    /// 哪条观察问的"只能记在这里。
+    sweeps: BTreeMap<u64, Vec<DueListing>>,
+    next_sweep_id: u64,
     /// 手上这个 POESESSID 还能用吗。服务端拒过一次就翻成 false,
     /// 直到用户粘一个新的进来 —— 不拿死会话反复试。
     session_ok: bool,
@@ -640,6 +661,8 @@ impl RuntimeActor {
             observations: BTreeMap::new(),
             connector,
             live_workers: BTreeMap::new(),
+            sweeps: BTreeMap::new(),
+            next_sweep_id: 0,
             session_ok: true,
             session_invalid_reported: false,
             no_session_reported: false,
@@ -665,8 +688,11 @@ impl RuntimeActor {
             for watch_id in self.scheduler.due(now) {
                 self.start_poll(&watch_id, now);
             }
-            for (obs_id, kind) in self.observe_scheduler.due(now) {
-                self.start_observe(&obs_id, kind, now);
+            for obs_id in self.observe_scheduler.due(now) {
+                self.start_discover(&obs_id, now);
+            }
+            if self.observe_scheduler.sweep_due(now) {
+                self.sweep_due_listings(now);
             }
 
             match inbox.recv_timeout(self.wait(now)) {
@@ -739,12 +765,13 @@ impl RuntimeActor {
             }
             RuntimeCommand::TestSession => self.test_session(),
             RuntimeCommand::DiscoverNow { obs_id } => {
-                self.observe_scheduler
-                    .run_now(&obs_id, ObserveKind::Discover, now);
+                self.observe_scheduler.run_now(&obs_id, now);
             }
+            // "立刻回查一次" = 把这条观察在册的挂单全部推到此刻到期,
+            // 然后照常走那一条扫描的路(同一份额度、同样分批)。
             RuntimeCommand::RecheckNow { obs_id } => {
-                self.observe_scheduler
-                    .run_now(&obs_id, ObserveKind::Recheck, now);
+                self.note(self.store.mark_all_due(&obs_id, now), "mark_all_due");
+                self.observe_scheduler.sweep_now(now);
             }
             RuntimeCommand::Shutdown => self.shutdown = true,
         }
@@ -839,7 +866,7 @@ impl RuntimeActor {
             let query_body = if query_stale {
                 // 搜索 id 或联赛变了 = 这是另一次搜索。已经连着的那条 live
                 // 盯的是旧的,停掉它,下面的 `sync_live_workers` 会照新的重开。
-                self.stop_live_worker(&entry.id);
+                self.stop_live_worker(&LiveTarget::Watch(entry.id.clone()));
                 match decode_search_id(&entry.search_id) {
                     Ok(query_json) => {
                         self.persist_watch(entry, &query_json, now);
@@ -915,16 +942,17 @@ impl RuntimeActor {
 
         // 先把"谁该跑、谁跑不了"算清楚,再动 self —— 设置列表借着 self,
         // 一边遍历一边改是借不出来的。
-        let mut start: Vec<(WatchId, LiveConfig)> = Vec::new();
-        let mut planned: BTreeMap<WatchId, LiveRunState> = BTreeMap::new();
+        let mut start: Vec<(LiveTarget, LiveConfig)> = Vec::new();
+        let mut planned: BTreeMap<LiveTarget, LiveRunState> = BTreeMap::new();
         for entry in &self.settings.watches {
+            let target = LiveTarget::Watch(entry.id.clone());
             if !entry.enabled || !entry.live {
-                planned.insert(entry.id.clone(), LiveRunState::Off);
+                planned.insert(target, LiveRunState::Off);
                 continue;
             }
             let Some(session) = session.as_deref() else {
                 planned.insert(
-                    entry.id.clone(),
+                    target,
                     LiveRunState::Disabled(if self.session_ok {
                         LiveOffReason::NoSession
                     } else {
@@ -934,10 +962,7 @@ impl RuntimeActor {
                 continue;
             };
             if start.len() >= cap {
-                planned.insert(
-                    entry.id.clone(),
-                    LiveRunState::Disabled(LiveOffReason::TooMany),
-                );
+                planned.insert(target, LiveRunState::Disabled(LiveOffReason::TooMany));
                 continue;
             }
             let search = SearchRef {
@@ -945,37 +970,72 @@ impl RuntimeActor {
                 search_id: entry.search_id.clone(),
             };
             start.push((
-                entry.id.clone(),
+                target.clone(),
                 LiveConfig::new(&search, session, user_agent.clone()),
             ));
-            planned.insert(entry.id.clone(), LiveRunState::Connecting);
+            planned.insert(target, LiveRunState::Connecting);
+        }
+
+        // 观察排在蹲价**后面**:两边分的是同一份连接额度,而抢不到的代价
+        // 不一样 —— 蹲价没有秒推就是"好价晚三分钟才看见",观察没有秒推
+        // 只是回到十分钟一次的兜底轮询(照样在跑,只是会漏掉秒卖掉的那些)。
+        for entry in &self.settings.observations {
+            let target = LiveTarget::Observation(entry.id.clone());
+            if !entry.enabled {
+                planned.insert(target, LiveRunState::Off);
+                continue;
+            }
+            let Some(session) = session.as_deref() else {
+                planned.insert(
+                    target,
+                    LiveRunState::Disabled(if self.session_ok {
+                        LiveOffReason::NoSession
+                    } else {
+                        LiveOffReason::SessionInvalid
+                    }),
+                );
+                continue;
+            };
+            if start.len() >= cap {
+                planned.insert(target, LiveRunState::Disabled(LiveOffReason::TooMany));
+                continue;
+            }
+            let search = SearchRef {
+                league: entry.league.clone(),
+                search_id: entry.search_id.clone(),
+            };
+            start.push((
+                target.clone(),
+                LiveConfig::new(&search, session, user_agent.clone()),
+            ));
+            planned.insert(target, LiveRunState::Connecting);
         }
 
         // 不该再跑的先停掉(包括设置里已经没有的那些)。
-        let stop: Vec<WatchId> = self
+        let stop: Vec<LiveTarget> = self
             .live_workers
             .keys()
             .filter(|id| !start.iter().any(|(started, _)| started == *id))
             .cloned()
             .collect();
-        for watch_id in stop {
-            self.stop_live_worker(&watch_id);
+        for target in stop {
+            self.stop_live_worker(&target);
         }
 
-        for (watch_id, config) in start {
-            if self.live_workers.contains_key(&watch_id) {
+        for (target, config) in start {
+            if self.live_workers.contains_key(&target) {
                 // 已经在跑:它自己报上来的状态才是准的,别用一个"Connecting"
                 // 把"已连上"盖掉。(搜索 id 或联赛改了的话,`apply_settings`
                 // 已经在那条 `query_stale` 分支里把它停掉了,这里就轮不到。)
-                planned.remove(&watch_id);
+                planned.remove(&target);
                 continue;
             }
             let handle = spawn_live_worker(
-                LiveWorkerConfig::new(watch_id.clone(), config),
+                LiveWorkerConfig::new(target.clone(), config),
                 Arc::clone(&self.connector),
                 self.live_events.clone(),
             );
-            self.live_workers.insert(watch_id, handle);
+            self.live_workers.insert(target, handle);
         }
 
         // 没有会话时说一句就够了,别每次 ApplySettings 都念一遍。
@@ -983,7 +1043,8 @@ impl RuntimeActor {
             .settings
             .watches
             .iter()
-            .any(|entry| entry.enabled && entry.live);
+            .any(|entry| entry.enabled && entry.live)
+            || self.settings.observations.iter().any(|entry| entry.enabled);
         // `session_ok == false` 说的是"会话被拒了" —— 那句话
         // `on_session_invalid` 已经说过了,别再补一句"你没有会话"。
         if wants_live && session.is_none() && self.session_ok && !self.no_session_reported {
@@ -993,48 +1054,64 @@ impl RuntimeActor {
             ));
         }
 
-        for (watch_id, state) in planned {
-            self.set_live_state(&watch_id, state, now);
+        for (target, state) in planned {
+            self.set_live_state(&target, state, now);
         }
     }
 
-    fn stop_live_worker(&mut self, watch_id: &WatchId) {
-        if let Some(worker) = self.live_workers.remove(watch_id) {
+    fn stop_live_worker(&mut self, target: &LiveTarget) {
+        if let Some(worker) = self.live_workers.remove(target) {
             // 只打招呼不等:它可能正卡在一次读超时里,而主循环一秒都不该停。
             worker.stop();
         }
     }
 
-    /// 全部停掉,并把每条搜索标上同一个原因(会话失效时用)。
+    /// 全部停掉,并把每条搜索和每条观察标上同一个原因(会话失效时用)。
     fn stop_all_live_workers(&mut self, reason: LiveOffReason, now: i64) {
-        let running: Vec<WatchId> = self.live_workers.keys().cloned().collect();
-        for watch_id in running {
-            self.stop_live_worker(&watch_id);
+        let running: Vec<LiveTarget> = self.live_workers.keys().cloned().collect();
+        for target in running {
+            self.stop_live_worker(&target);
         }
-        let live_watches: Vec<WatchId> = self
+        let mut targets: Vec<LiveTarget> = self
             .settings
             .watches
             .iter()
             .filter(|entry| entry.live)
-            .map(|entry| entry.id.clone())
+            .map(|entry| LiveTarget::Watch(entry.id.clone()))
             .collect();
-        for watch_id in live_watches {
-            self.set_live_state(&watch_id, LiveRunState::Disabled(reason), now);
+        targets.extend(
+            self.settings
+                .observations
+                .iter()
+                .map(|entry| LiveTarget::Observation(entry.id.clone())),
+        );
+        for target in targets {
+            self.set_live_state(&target, LiveRunState::Disabled(reason), now);
         }
     }
 
     fn handle_live_event(&mut self, event: LiveEvent) {
         let now = now_secs();
         match event {
-            LiveEvent::State { watch_id, state } => self.set_live_state(&watch_id, state, now),
-            LiveEvent::New { watch_id, ids } => self.on_live_push(&watch_id, ids, now),
+            LiveEvent::State { target, state } => self.set_live_state(&target, state, now),
+            LiveEvent::New { target, ids } => match target {
+                LiveTarget::Watch(watch_id) => self.on_live_push(&watch_id, ids, now),
+                LiveTarget::Observation(obs_id) => self.on_observation_push(&obs_id, ids),
+            },
             LiveEvent::SessionInvalid { .. } => self.on_session_invalid(now),
             LiveEvent::Log(message) => self.emit(RuntimeEvent::Log(message)),
         }
     }
 
+    fn set_live_state(&mut self, target: &LiveTarget, state: LiveRunState, now: i64) {
+        match target {
+            LiveTarget::Watch(watch_id) => self.set_watch_live_state(watch_id, state, now),
+            LiveTarget::Observation(obs_id) => self.set_observation_live_state(obs_id, state),
+        }
+    }
+
     /// 换一条搜索的 live 档位:落库、调轮询节奏、广播。
-    fn set_live_state(&mut self, watch_id: &WatchId, state: LiveRunState, now: i64) {
+    fn set_watch_live_state(&mut self, watch_id: &WatchId, state: LiveRunState, now: i64) {
         let Some(runtime) = self.watches.get_mut(watch_id) else {
             return;
         };
@@ -1062,6 +1139,31 @@ impl RuntimeActor {
             self.emit(RuntimeEvent::CloudflareBlocked { until });
         }
         self.emit_status(watch_id);
+    }
+
+    /// 换一条观察的 live 档位。
+    ///
+    /// 比蹲价那一版少两样:不落库(观察的 live 状态没有存的价值,它不像
+    /// 蹲价那样要在重启之后告诉你"上次秒推是什么时候"),也不调兜底轮询的
+    /// 节奏 —— 那一轮本来就是补"断线那几十秒"的漏的,连上了反而更不该放宽。
+    fn set_observation_live_state(&mut self, obs_id: &ObservationId, state: LiveRunState) {
+        let Some(runtime) = self.observations.get_mut(obs_id) else {
+            return;
+        };
+        if runtime.status.live == state {
+            return;
+        }
+        runtime.status.live = state;
+        let label = runtime.entry.label.clone();
+        // 被挤下来的那条要说清楚"是额度满了",不是"坏了"。只在状态**变成**
+        // TooMany 的那一次说 —— 每次保存设置都念一遍是骚扰。
+        if state == LiveRunState::Disabled(LiveOffReason::TooMany) {
+            self.emit(RuntimeEvent::Log(format!(
+                "observation {label}: no live connection left (max_live_connections) — \
+                 staying on the backstop discover poll"
+            )));
+        }
+        self.emit_observation_status(obs_id);
     }
 
     /// 秒推来了一批新挂单:按 10 个一批交给网关,优先级排在轮询前面。
@@ -1097,6 +1199,60 @@ impl RuntimeActor {
                 .set_live_state(watch_id, LiveState::Connected, now),
             "set_live_state",
         );
+    }
+
+    /// 秒推告诉一条观察:这些挂单刚上架。
+    ///
+    /// 这是观察知道新挂单的**主要**途径,不是补充:搜索只回还活着的挂单,
+    /// 所以一件挂上去一分钟就被买走的好价碑牌,十分钟一次的轮询永远看不见 ——
+    /// 而那恰恰是我们最想量的那一件。秒推是在它**出生**的那一刻就知道它。
+    ///
+    /// `sample_every` 在这里生效:每 N 条抓一条,抽剩下的直接丢掉(不排队
+    /// 等以后)。出生那一刻等距抽样是无偏的,而排队补抓会系统性地漏掉
+    /// 卖得最快的那些 —— 等轮到它,它早没了。
+    fn on_observation_push(&mut self, obs_id: &ObservationId, ids: Vec<String>) {
+        let (wanted, search_id) = {
+            let Some(runtime) = self.observations.get_mut(obs_id) else {
+                return;
+            };
+            if !runtime.entry.enabled {
+                return;
+            }
+            let every = u64::from(runtime.entry.sample_every.max(1));
+            let mut wanted: Vec<String> = Vec::new();
+            for id in ids {
+                runtime.pushed_seen += 1;
+                runtime.status.pushed_total += 1;
+                if runtime.pushed_seen % every == 0 {
+                    wanted.push(id);
+                } else {
+                    runtime.status.sampled_out_total += 1;
+                }
+            }
+            let search_id = if runtime.search_id.is_empty() {
+                runtime.entry.search_id.clone()
+            } else {
+                runtime.search_id.clone()
+            };
+            (wanted, search_id)
+        };
+
+        for chunk in wanted.chunks(self.fetch_batch()) {
+            self.gateway.submit(GatewayRequest {
+                // 按 id 对号的那一种:抓回来的那一格是 `null` 就说明这条挂单
+                // 在我们看它第一眼之前就没了 —— 那是要单独记一笔的事。
+                kind: RequestKind::FetchByIds {
+                    ids: chunk.to_vec(),
+                    search_id: search_id.clone(),
+                },
+                // 观察永远排在队列最后:攒数据的活晚十秒什么也不影响,
+                // 而蹲价晚十秒可能就错过一件好货。
+                priority: Priority::Background,
+                reply: self.replies.clone(),
+                tag: RequestTag::observation(obs_id.clone(), OBSERVE_LIVE_FETCH_LABEL),
+            });
+        }
+        self.emit_observation_status(obs_id);
     }
 
     /// 秒推抓回来的详情。和轮询走同一套判定去重,只是来源标成 `Live`,
@@ -1265,6 +1421,16 @@ impl RuntimeActor {
         // "去藏身处"那两步不属于任何一轮轮询,先认它。
         if let Some(alert_id) = tag.alert_id {
             self.on_hideout_reply(alert_id, kind, now);
+            return;
+        }
+        // 一批回查可能横跨好几条观察,所以它认的是批次号,不是某一条观察。
+        if let Some(sweep_id) = tag.sweep_id {
+            match kind {
+                ReplyKind::FetchByIds(Ok(pairs)) => self.on_sweep_fetch(sweep_id, pairs, now),
+                ReplyKind::FetchByIds(Err(error)) => self.on_sweep_failed(sweep_id, &error),
+                // 扫描只发 FetchByIds,别的回信不会挂着批次号。
+                _ => {}
+            }
             return;
         }
         // 市场观察也走自己那条路:它和蹲价共用网关,但两边的时间表、
@@ -1519,11 +1685,14 @@ impl RuntimeActor {
                 }
             };
             let query_body = if query_stale {
+                // 搜索 id 或联赛变了 = 这是另一条搜索。已经连着的那条 live
+                // 盯的是旧的,停掉它,后面的 `sync_live_workers` 会照新的重开。
+                self.stop_live_worker(&LiveTarget::Observation(entry.id.clone()));
                 match decode_search_id(&entry.search_id) {
                     Ok(query_json) => {
                         self.persist_observation(entry, &query_json, now);
-                        // 观察要的是"最新挂上来的 100 条",所以把排序换成上架
-                        // 时间倒序 —— 蹲价那个"最便宜的 100 条"永远看不到贵货,
+                        // 兜底那一轮要的是"最新挂上来的 100 条",所以把排序换成
+                        // 上架时间倒序 —— 蹲价那个"最便宜的 100 条"永远看不到贵货,
                         // 而观察要的正是完整的一批。
                         Some(with_sort(&query_json, "indexed", "desc"))
                     }
@@ -1542,7 +1711,6 @@ impl RuntimeActor {
             self.observe_scheduler.upsert(
                 entry.id.clone(),
                 entry.discover_interval_secs,
-                entry.recheck_interval_secs,
                 now,
                 stagger,
                 enabled,
@@ -1603,6 +1771,11 @@ impl RuntimeActor {
                 let status = ObservationStatus {
                     active: summary.active,
                     gone: summary.gone,
+                    // 刚认识这条观察,live 还没起来。真正的档位等
+                    // `sync_live_workers` 或者 worker 自己报上来。
+                    live: LiveRunState::Off,
+                    pushed_total: 0,
+                    sampled_out_total: 0,
                     last_discover_at: stored.as_ref().and_then(|run| run.last_discover_at),
                     last_recheck_at: stored.as_ref().and_then(|run| run.last_recheck_at),
                     next_discover_at,
@@ -1617,7 +1790,7 @@ impl RuntimeActor {
                         search_id: String::new(),
                         discover_in_flight: false,
                         discover_pending: 0,
-                        recheck_pending: 0,
+                        pushed_seen: 0,
                         status,
                     },
                 );
@@ -1647,14 +1820,10 @@ impl RuntimeActor {
         );
     }
 
-    fn start_observe(&mut self, obs_id: &ObservationId, kind: ObserveKind, now: i64) {
-        match kind {
-            ObserveKind::Discover => self.start_discover(obs_id, now),
-            ObserveKind::Recheck => self.start_recheck(obs_id, now),
-        }
-    }
-
-    /// discover 的第一步:一次 search,按上架时间倒序拿最新的一批 id。
+    /// 兜底那一轮的第一步:一次 search,按上架时间倒序拿最新的一批 id。
+    ///
+    /// 秒推连着的时候这一轮基本上什么都抓不到(该知道的早知道了),那正是
+    /// 它该有的样子 —— 它补的是 WebSocket 断线重连那几十秒里上架的挂单。
     fn start_discover(&mut self, obs_id: &ObservationId, now: i64) {
         let Some(runtime) = self.observations.get_mut(obs_id) else {
             return;
@@ -1672,8 +1841,7 @@ impl RuntimeActor {
 
         // 请求一发出去就把下一轮排上,理由同轮询:否则 `next_at` 停在过去,
         // 主循环会一直觉得"该跑了"而空转。
-        self.observe_scheduler
-            .defer(obs_id, ObserveKind::Discover, now);
+        self.observe_scheduler.defer(obs_id, now);
         self.refresh_observe_schedule(obs_id);
 
         self.gateway.submit(GatewayRequest {
@@ -1685,46 +1853,6 @@ impl RuntimeActor {
             tag: RequestTag::observation(obs_id.clone(), OBSERVE_SEARCH_LABEL),
         });
         self.emit_observation_status(obs_id);
-    }
-
-    /// recheck:把在册的挂单按 10 个一批查一遍,看谁没了。
-    fn start_recheck(&mut self, obs_id: &ObservationId, now: i64) {
-        let Some(runtime) = self.observations.get_mut(obs_id) else {
-            return;
-        };
-        if !runtime.entry.enabled || runtime.recheck_pending > 0 {
-            return;
-        }
-        let label = runtime.entry.label.clone();
-        let interval = runtime.entry.recheck_interval_secs;
-        // fetch 要一个 `?query=` 参数。上一次 discover 回的那个最准;
-        // 还没 discover 过就用用户粘进来的那个(两者通常一样)。
-        let search_id = if runtime.search_id.is_empty() {
-            runtime.entry.search_id.clone()
-        } else {
-            runtime.search_id.clone()
-        };
-        runtime.status.last_error = None;
-
-        self.observe_scheduler
-            .defer(obs_id, ObserveKind::Recheck, now);
-        self.refresh_observe_schedule(obs_id);
-
-        // 库给的顺序就是"最久没见到的排前面",所以砍掉尾巴留下的正是最可能
-        // 已经没了的那几条。
-        let mut ids = self
-            .note(self.store.active_listing_ids(obs_id), "active_listing_ids")
-            .unwrap_or_default();
-        let cap = self.observe_fetch_cap(interval);
-        if ids.len() > cap {
-            self.emit(RuntimeEvent::Log(format!(
-                "observation {label}: {} listings to recheck but this round can only afford \
-                 {cap} — the longest-unseen ones go first, the rest wait for the next round",
-                ids.len()
-            )));
-            ids.truncate(cap);
-        }
-        self.submit_observe_fetches(obs_id, ObserveKind::Recheck, &ids, &search_id, now);
     }
 
     /// discover 的 search 回来了:在册的那些只推 `last_seen`,没见过的才去抓详情。
@@ -1743,7 +1871,10 @@ impl RuntimeActor {
 
         // 搜索只给 id、不给价格 —— 所以在册的那些**不花一次 fetch**:
         // 它出现在"最新 100 条"里就是"还挂着",推一下 last_seen 就够了,
-        // 改没改价等下一轮回查真抓到它时再说。
+        // 改没改价等它自己的回查档到点时再说。
+        //
+        // 秒推刚记下的那些也在这一批里(record_seen 已经把它们记成在册),
+        // 于是"秒推抓过一次、十分钟后兜底轮询又看见它"不会再花第二次 fetch。
         let known: BTreeSet<String> = self
             .note(self.store.active_listing_ids(obs_id), "active_listing_ids")
             .unwrap_or_default()
@@ -1769,55 +1900,49 @@ impl RuntimeActor {
             fresh.truncate(cap);
         }
         let search_id = outcome.id;
-        self.submit_observe_fetches(obs_id, ObserveKind::Discover, &fresh, &search_id, now);
+        self.submit_discover_fetches(obs_id, &fresh, &search_id, now);
     }
 
-    /// 把一串 id 按 10 个一批交给网关。一条都没有就当这一轮当场跑完了。
-    fn submit_observe_fetches(
+    /// 把兜底那一轮找到的新面孔按 10 个一批交给网关。
+    /// 一条都没有就当这一轮当场跑完了(秒推正常工作时这是常态)。
+    fn submit_discover_fetches(
         &mut self,
         obs_id: &ObservationId,
-        kind: ObserveKind,
         ids: &[String],
         search_id: &str,
         now: i64,
     ) {
         if ids.is_empty() {
-            self.finish_observe(obs_id, kind, now);
+            self.finish_discover(obs_id, now);
             return;
         }
         let batch = self.fetch_batch();
-        let batches = ids.chunks(batch).count();
         if let Some(runtime) = self.observations.get_mut(obs_id) {
-            match kind {
-                ObserveKind::Discover => runtime.discover_pending = batches,
-                ObserveKind::Recheck => runtime.recheck_pending = batches,
-            }
+            runtime.discover_pending = ids.chunks(batch).count();
         }
-        let label = match kind {
-            ObserveKind::Discover => OBSERVE_DISCOVER_FETCH_LABEL,
-            ObserveKind::Recheck => OBSERVE_RECHECK_LABEL,
-        };
         for chunk in ids.chunks(batch) {
             self.gateway.submit(GatewayRequest {
-                // 按 id 对号的那一种:观察问的是"我问的这几条里哪几条没了",
-                // 而普通 fetch 的回信早把 `null` 那几格丢掉了。
+                // 按 id 对号的那一种:普通 fetch 的回信早把 `null` 那几格丢掉了,
+                // 而"我问的这一条已经没了"正是要记一笔的事。
                 kind: RequestKind::FetchByIds {
                     ids: chunk.to_vec(),
                     search_id: search_id.to_string(),
                 },
                 priority: Priority::Background,
                 reply: self.replies.clone(),
-                tag: RequestTag::observation(obs_id.clone(), label),
+                tag: RequestTag::observation(obs_id.clone(), OBSERVE_DISCOVER_FETCH_LABEL),
             });
         }
         self.emit_observation_status(obs_id);
     }
 
-    /// 一批 fetch 回来了。
-    fn on_observe_fetch(
+    /// **第一次**去抓一批 id 的详情回来了(秒推来的,或者兜底轮询捡到的)。
+    ///
+    /// 抓到了就整条记下来;那一格是 `null` 说明它在我们看第一眼之前就没了 ——
+    /// 记一行空壳,判定档写死 `gone_before_first_look`。
+    fn on_first_look_fetch(
         &mut self,
         obs_id: &ObservationId,
-        kind: ObserveKind,
         pairs: Vec<(String, Option<ListingSummary>)>,
         now: i64,
     ) {
@@ -1826,16 +1951,162 @@ impl RuntimeActor {
                 Some(listing) => {
                     self.note(self.store.record_seen(obs_id, &listing, now), "record_seen");
                 }
-                // 回查时那一格是 `None` = 这条挂单没了,该判定了。
-                None if kind == ObserveKind::Recheck => {
-                    self.on_listing_gone(obs_id, &listing_id, now);
+                None => {
+                    self.note(
+                        self.store
+                            .record_gone_before_first_look(obs_id, &listing_id, now),
+                        "record_gone_before_first_look",
+                    );
                 }
-                // discover 问的都是**没见过**的 id:它在这几秒里没了,
-                // 我们连它长什么样都不知道,没什么可记的。
-                None => {}
             }
         }
-        self.finish_observe_batch(obs_id, kind, now);
+    }
+
+    /// 到点该回头看的挂单:捞出来,凑成 10 个一批发出去。
+    ///
+    /// **跨观察一起凑批**:一次 fetch 最多带 10 个 id,两条观察各有三条到期的
+    /// 挂单,拼成一批就只花一次额度。回信按 id 对号(`parse_fetch_response_by_id`),
+    /// 而"这条 id 是替哪条观察问的"记在 `self.sweeps` 里。
+    fn sweep_due_listings(&mut self, now: i64) {
+        self.observe_scheduler.defer_sweep(now);
+        if self.observations.is_empty() {
+            return;
+        }
+        // 已经发出去还没回来的那些不能再问一遍:它们的 `next_check_at` 要等
+        // 回信才会往前挪,不挡一下就会每分钟重发一次同一批。
+        let in_flight: BTreeSet<(ObservationId, String)> = self
+            .sweeps
+            .values()
+            .flatten()
+            .map(|due| (due.obs_id.clone(), due.listing_id.clone()))
+            .collect();
+        let cap = self.observe_fetch_cap(SWEEP_INTERVAL_SECS);
+        let due: Vec<DueListing> = self
+            .note(self.store.due_listings(now, cap), "due_listings")
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|due| {
+                !in_flight.contains(&(due.obs_id.clone(), due.listing_id.clone()))
+                    && self
+                        .observations
+                        .get(&due.obs_id)
+                        .is_some_and(|runtime| runtime.entry.enabled)
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+
+        // 同一条挂单可能同时属于两条观察(两条搜索的范围重叠),那也只该问
+        // 一次:一个 id 在请求里出现两遍,白占一个格子还问不出新东西。
+        // 先按 id 归拢,顺序保持"最早该查的在前"。
+        let mut grouped: Vec<(String, Vec<DueListing>)> = Vec::new();
+        for entry in due {
+            match grouped.iter_mut().find(|(id, _)| *id == entry.listing_id) {
+                Some((_, asked)) => asked.push(entry),
+                None => grouped.push((entry.listing_id.clone(), vec![entry])),
+            }
+        }
+
+        for chunk in grouped.chunks(self.fetch_batch()) {
+            // `?query=` 只是这次 fetch 的上下文参数,认的是 id 本身;混批时
+            // 拿第一条观察的那个就行 —— 拆成"一条观察一批"反而会发出好几个
+            // 装不满的请求,那才是真正在浪费额度。
+            let search_id = self
+                .observations
+                .get(&chunk[0].1[0].obs_id)
+                .map(|runtime| {
+                    if runtime.search_id.is_empty() {
+                        runtime.entry.search_id.clone()
+                    } else {
+                        runtime.search_id.clone()
+                    }
+                })
+                .unwrap_or_default();
+            let sweep_id = self.next_sweep_id;
+            self.next_sweep_id += 1;
+            self.sweeps.insert(
+                sweep_id,
+                chunk.iter().flat_map(|(_, asked)| asked.clone()).collect(),
+            );
+            self.gateway.submit(GatewayRequest {
+                kind: RequestKind::FetchByIds {
+                    ids: chunk.iter().map(|(id, _)| id.clone()).collect(),
+                    search_id,
+                },
+                priority: Priority::Background,
+                reply: self.replies.clone(),
+                tag: RequestTag::sweep(sweep_id, OBSERVE_RECHECK_LABEL),
+            });
+        }
+    }
+
+    /// 一批回查回来了:还在的升一档,没了的判一下。
+    fn on_sweep_fetch(
+        &mut self,
+        sweep_id: u64,
+        pairs: Vec<(String, Option<ListingSummary>)>,
+        now: i64,
+    ) {
+        let Some(asked) = self.sweeps.remove(&sweep_id) else {
+            // 关机时的迟到回信,或者同一批被处理过两次。
+            return;
+        };
+        let mut touched: BTreeSet<ObservationId> = BTreeSet::new();
+        for (listing_id, listing) in pairs {
+            // 同一条挂单可能同时属于两条观察(两条搜索的范围重叠),
+            // 所以这里是"所有问过它的观察",不是"第一条"。
+            for due in asked.iter().filter(|due| due.listing_id == listing_id) {
+                touched.insert(due.obs_id.clone());
+                match &listing {
+                    Some(listing) => {
+                        self.note(
+                            self.store.record_seen(&due.obs_id, listing, now),
+                            "record_seen",
+                        );
+                        self.advance_check(due);
+                    }
+                    None => self.on_listing_gone(&due.obs_id, &listing_id, now),
+                }
+            }
+        }
+        for obs_id in touched {
+            self.note(self.store.touch_recheck(&obs_id, now), "touch_recheck");
+            self.observation_data_changed(&obs_id, Some(now));
+        }
+    }
+
+    /// 这条挂单还在:升一档,把下一次排上。阶梯走完(七天)就再也不查了。
+    fn advance_check(&self, due: &DueListing) {
+        let rung = due.check_rung.saturating_add(1);
+        let recheck = self
+            .observations
+            .get(&due.obs_id)
+            .map_or(0, |runtime| runtime.entry.recheck_interval_secs);
+        let next_check_at = next_check_after(due.first_seen_at, rung, recheck);
+        self.note(
+            self.store
+                .advance_rung(&due.obs_id, &due.listing_id, rung, next_check_at),
+            "advance_rung",
+        );
+    }
+
+    /// 一批回查砸了。挂单的 `next_check_at` 没往前挪,所以下一次扫描会再问
+    /// 一遍它们 —— 不用在这里补什么。
+    fn on_sweep_failed(&mut self, sweep_id: u64, error: &GatewayError) {
+        let Some(asked) = self.sweeps.remove(&sweep_id) else {
+            return;
+        };
+        for obs_id in asked
+            .iter()
+            .map(|due| due.obs_id.clone())
+            .collect::<BTreeSet<_>>()
+        {
+            if let Some(runtime) = self.observations.get_mut(&obs_id) {
+                runtime.status.last_error = Some(error.to_string());
+            }
+            self.emit_observation_status(&obs_id);
+        }
     }
 
     /// 回查查不到它了 —— 判一下是怎么没的,把结论写在行上。
@@ -1875,37 +2146,37 @@ impl RuntimeActor {
         );
     }
 
-    /// 少了一批在途的 fetch;一批都不剩就是这一轮跑完了。
-    fn finish_observe_batch(&mut self, obs_id: &ObservationId, kind: ObserveKind, now: i64) {
+    /// 少了一批在途的 discover fetch;一批都不剩就是这一轮跑完了。
+    fn finish_discover_batch(&mut self, obs_id: &ObservationId, now: i64) {
         let done = {
             let Some(runtime) = self.observations.get_mut(obs_id) else {
                 return;
             };
-            let pending = match kind {
-                ObserveKind::Discover => &mut runtime.discover_pending,
-                ObserveKind::Recheck => &mut runtime.recheck_pending,
-            };
-            *pending = pending.saturating_sub(1);
-            *pending == 0
+            runtime.discover_pending = runtime.discover_pending.saturating_sub(1);
+            runtime.discover_pending == 0
         };
         if done {
-            self.finish_observe(obs_id, kind, now);
+            self.finish_discover(obs_id, now);
         }
     }
 
-    /// 一轮跑完了:落时间戳、重算这条观察的账、告诉界面去库里重读。
+    /// 兜底那一轮跑完了:落时间戳、重算这条观察的账、告诉界面去库里重读。
     ///
     /// 中间有一批 fetch 砸了也照样算跑完:那一批的挂单下一轮还会被问到,
     /// 而这一轮确实发生过 —— 时间戳照实记,出了什么事另有 `last_error` 说。
-    fn finish_observe(&mut self, obs_id: &ObservationId, kind: ObserveKind, now: i64) {
-        match kind {
-            ObserveKind::Discover => {
-                self.note(self.store.touch_discover(obs_id, now), "touch_discover");
-            }
-            ObserveKind::Recheck => {
-                self.note(self.store.touch_recheck(obs_id, now), "touch_recheck");
-            }
+    fn finish_discover(&mut self, obs_id: &ObservationId, now: i64) {
+        self.note(self.store.touch_discover(obs_id, now), "touch_discover");
+        if let Some(runtime) = self.observations.get_mut(obs_id) {
+            runtime.status.last_discover_at = Some(now);
         }
+        self.observation_data_changed(obs_id, None);
+    }
+
+    /// 库里这条观察的数据动了:重算它的账,喊界面重读一遍。
+    ///
+    /// 事件里不带数据 —— 观察页要的那几张表动辄几百行,而且用户还在上面
+    /// 筛选。界面收到这一句自己去库里读,读到的一定是最新的。
+    fn observation_data_changed(&mut self, obs_id: &ObservationId, rechecked_at: Option<i64>) {
         let summary = self
             .note(
                 self.store.observation_summary(obs_id),
@@ -1918,9 +2189,8 @@ impl RuntimeActor {
             runtime.status.gone = summary.gone;
             runtime.status.next_discover_at = next_discover_at;
             runtime.status.next_recheck_at = next_recheck_at;
-            match kind {
-                ObserveKind::Discover => runtime.status.last_discover_at = Some(now),
-                ObserveKind::Recheck => runtime.status.last_recheck_at = Some(now),
+            if let Some(at) = rechecked_at {
+                runtime.status.last_recheck_at = Some(at);
             }
         }
         self.emit(RuntimeEvent::ObservationChanged {
@@ -1940,47 +2210,50 @@ impl RuntimeActor {
         self.emit_observation_status(obs_id);
     }
 
-    fn on_observe_fetch_failed(
-        &mut self,
-        obs_id: &ObservationId,
-        kind: ObserveKind,
-        error: &GatewayError,
-        now: i64,
-    ) {
-        if let Some(runtime) = self.observations.get_mut(obs_id) {
-            runtime.status.last_error = Some(error.to_string());
-        }
-        self.finish_observe_batch(obs_id, kind, now);
-    }
-
     fn on_observe_reply(&mut self, obs_id: &ObservationId, label: &str, kind: ReplyKind, now: i64) {
         if !self.observations.contains_key(obs_id) {
             // 这条观察在请求飞在路上的时候被删了,回信直接丢掉。
             return;
         }
-        let step = if label == OBSERVE_RECHECK_LABEL {
-            ObserveKind::Recheck
-        } else {
-            ObserveKind::Discover
-        };
+        // 秒推抓回来的那一批不属于任何一轮 discover:它没有"这一轮跑完了"
+        // 这回事,记完账当场喊一声界面就行。
+        let from_live = label == OBSERVE_LIVE_FETCH_LABEL;
         match kind {
             ReplyKind::Search(Ok(outcome)) => self.on_discover_search(obs_id, outcome, now),
             ReplyKind::Search(Err(error)) => self.on_discover_failed(obs_id, &error),
-            ReplyKind::FetchByIds(Ok(pairs)) => self.on_observe_fetch(obs_id, step, pairs, now),
+            ReplyKind::FetchByIds(Ok(pairs)) => {
+                self.on_first_look_fetch(obs_id, pairs, now);
+                if from_live {
+                    self.observation_data_changed(obs_id, None);
+                } else {
+                    self.finish_discover_batch(obs_id, now);
+                }
+            }
             ReplyKind::FetchByIds(Err(error)) => {
-                self.on_observe_fetch_failed(obs_id, step, &error, now);
+                if let Some(runtime) = self.observations.get_mut(obs_id) {
+                    runtime.status.last_error = Some(error.to_string());
+                }
+                if from_live {
+                    self.emit_observation_status(obs_id);
+                } else {
+                    self.finish_discover_batch(obs_id, now);
+                }
             }
             // 观察这条路上只发 search 和 FetchByIds,别的回信不会挂着 obs_id。
             ReplyKind::Fetch(_) | ReplyKind::Whisper(_) | ReplyKind::SessionCheck(_) => {}
         }
     }
 
-    /// 时间表上这条观察的(下一次 discover, 下一次 recheck)。
+    /// 界面要的两个时刻:(下一次兜底 discover, 下一条到点该回查的挂单)。
     fn observe_schedule_of(&self, obs_id: &ObservationId) -> (Option<i64>, Option<i64>) {
-        match self.observe_scheduler.entry(obs_id) {
-            Some(entry) => (Some(entry.next_discover_at), Some(entry.next_recheck_at)),
-            None => (None, None),
-        }
+        let next_discover_at = self
+            .observe_scheduler
+            .entry(obs_id)
+            .map(|entry| entry.next_discover_at);
+        let next_recheck_at = self
+            .note(self.store.next_check_due_at(obs_id), "next_check_due_at")
+            .flatten();
+        (next_discover_at, next_recheck_at)
     }
 
     fn refresh_observe_schedule(&mut self, obs_id: &ObservationId) {
@@ -4849,5 +5122,389 @@ mod actor_tests {
             "一条搜索 + 两条观察分同一份搜索额度"
         );
         assert_eq!(status.poll_every_secs, 217);
+    }
+
+    // ---- 观察的秒推 ----------------------------------------------------
+
+    /// 一份"观察也能开 live"的设置:有会话,一条观察,没有蹲价搜索。
+    fn observe_live_settings(label: &str) -> (AppSettings, ObservationId) {
+        let (mut settings, obs_id) = observe_settings(label);
+        settings.poesessid = "cookie".to_string();
+        (settings, obs_id)
+    }
+
+    /// 往库里塞一条"已经见过"的挂单,时间由调用方定。
+    ///
+    /// 回查阶梯的测试要的是"这条挂单是什么时候第一次见到的",而那必须能
+    /// 精确指定 —— 让 actor 自己跑出一条来,第一次见到的时刻就是"现在",
+    /// 十分钟之内不会到点,测试就没得看了。
+    fn seed_listing(store: &WatchStore, obs_id: &ObservationId, listing_id: &str, first_seen: i64) {
+        let listing = ListingSummary {
+            id: listing_id.to_string(),
+            item_name: "Choir of the Storm".to_string(),
+            type_line: "Lapis Amulet".to_string(),
+            price: Some(Price::new(18_000, Currency::Divine)),
+            account: "Seller".to_string(),
+            character: "Char".to_string(),
+            online: true,
+            afk: false,
+            indexed: "2026-09-06T10:00:00Z".to_string(),
+            whisper: "@Char hi".to_string(),
+            whisper_token: None,
+            hideout_token: None,
+            icon: String::new(),
+            item_json: r#"{"name":"Choir of the Storm","explicitMods":["+115 to maximum Life"]}"#
+                .to_string(),
+        };
+        store
+            .record_seen(obs_id, &listing, first_seen)
+            .expect("seed a listing");
+    }
+
+    /// 这一批 fetch 里,以某个前缀开头的 id 各分在了哪几批。
+    fn batches_with_prefix(log: &Arc<Mutex<TradeLog>>, prefix: &str) -> Vec<Vec<String>> {
+        log.lock()
+            .unwrap()
+            .fetches
+            .iter()
+            .filter(|batch| batch.iter().all(|id| id.starts_with(prefix)))
+            .cloned()
+            .collect()
+    }
+
+    /// 秒推是观察知道新挂单的**主要**途径:推来的 id 当场就去抓详情,
+    /// 抓到的整条入库,抓不到(那一格是 null)的记成"第一眼就没了"。
+    ///
+    /// 后者才是这一整步的理由:一件挂上去一分钟就被买走的好价碑牌,
+    /// 十分钟一次的搜索永远看不见 —— 搜索只回还活着的挂单。
+    #[test]
+    fn a_live_push_on_an_observation_is_fetched_and_stored() {
+        let (transport, log) = FakeTrade::new();
+        // 兜底那一轮什么都别找到:这个测试要看的是秒推那条路。
+        log.lock().unwrap().search_ids = Some(Vec::new());
+        // "live-2" 在我们去抓它的时候已经没了。
+        log.lock().unwrap().gone_ids.insert("live-2".to_string());
+        log.lock().unwrap().item_mods = vec!["+115 to maximum Life".to_string()];
+
+        let connector = Arc::new(ScriptedConnector::new());
+        connector.push(Step::New(vec!["live-1".to_string(), "live-2".to_string()]));
+        let (settings, obs_id) = observe_live_settings("Choir of the Storm");
+        let db = temp_db("live-push");
+        let handle = RuntimeHandle::start_offline_with_connector(
+            settings,
+            RuntimePaths::new(db.clone()),
+            transport,
+            shared(&connector),
+        )
+        .unwrap();
+
+        let mut seen = Vec::new();
+        wait_for_fetches(&handle, &mut seen, &log, 1);
+        drop(handle);
+
+        assert_eq!(
+            batches_with_prefix(&log, "live-"),
+            vec![vec!["live-1".to_string(), "live-2".to_string()]],
+            "推来的两个 id 要在同一次 fetch 里问掉"
+        );
+
+        let store = WatchStore::open(&db).expect("open");
+        // 抓到的那条整条入库,词缀也在。
+        let alive = store
+            .observed_listing(&obs_id, "live-1")
+            .unwrap()
+            .expect("live-1");
+        assert_eq!(alive.status, pnd_storage::ObservedStatus::Active);
+        assert_eq!(
+            alive.first_price,
+            Some(Price::new(18_000, Currency::Divine))
+        );
+        assert_eq!(store.observed_mods(&obs_id, "live-1").unwrap().len(), 1);
+
+        // 没抓到的那条:空壳一行,判定档写死"第一眼就没了"。
+        let quick = store
+            .observed_listing(&obs_id, "live-2")
+            .unwrap()
+            .expect("live-2");
+        assert_eq!(quick.status, pnd_storage::ObservedStatus::Gone);
+        assert_eq!(
+            quick.gone_class,
+            Some(pnd_domain::GoneClass::GoneBeforeFirstLook)
+        );
+        assert!(store.observed_mods(&obs_id, "live-2").unwrap().is_empty());
+
+        let summary = store.observation_summary(&obs_id).unwrap();
+        assert_eq!(summary.active, 1);
+        assert_eq!(summary.gone_before_first_look, 1);
+        assert_eq!(summary.unknown, 0);
+        // 没有词缀的那一行进不了聚合表:成交率的分母不该被它顶高。
+        let aggregate = store.mod_aggregate(&obs_id, 1).unwrap();
+        assert_eq!(aggregate.len(), 1);
+        assert_eq!(aggregate[0].seen, 1);
+        remove_db(&db);
+    }
+
+    /// `sample_every = 3`:推来六条只抓两条,剩下四条**直接丢掉**。
+    ///
+    /// 丢掉而不是排队补抓:在挂单出生那一刻等距抽样是无偏的,而排队补抓
+    /// 会系统性地漏掉卖得最快的那些(等轮到它,它早没了)——那正是要量的那批货。
+    #[test]
+    fn sampling_only_fetches_every_nth_pushed_listing() {
+        let (transport, log) = FakeTrade::new();
+        log.lock().unwrap().search_ids = Some(Vec::new());
+
+        let connector = Arc::new(ScriptedConnector::new());
+        let ids: Vec<String> = (1..=6).map(|index| format!("s-{index}")).collect();
+        connector.push(Step::New(ids));
+        let (mut settings, obs_id) = observe_live_settings("Choir of the Storm");
+        settings.observations[0].sample_every = 3;
+        let handle = RuntimeHandle::start_offline_with_connector(
+            settings,
+            RuntimePaths::in_memory(),
+            transport,
+            shared(&connector),
+        )
+        .unwrap();
+
+        let mut seen = Vec::new();
+        let status = wait_for(
+            &handle,
+            &mut seen,
+            |event| {
+                matches!(event, RuntimeEvent::ObservationStatus { obs_id: id, status }
+                    if *id == obs_id && status.pushed_total == 6)
+            },
+            "an observation status counting all six pushes",
+        );
+        let RuntimeEvent::ObservationStatus { status, .. } = status else {
+            unreachable!()
+        };
+        assert_eq!(status.sampled_out_total, 4, "六条里丢掉四条");
+        thread::sleep(Duration::from_millis(200));
+        drop(handle);
+
+        assert_eq!(
+            batches_with_prefix(&log, "s-"),
+            vec![vec!["s-3".to_string(), "s-6".to_string()]],
+            "每第三条抓一条"
+        );
+    }
+
+    /// 秒推记下的挂单,兜底那一轮再看见它时**不该**重抓一次。
+    ///
+    /// 它出现在搜索结果里本身就说明还挂着,推一下 last_seen 就够了 ——
+    /// 再抓一遍是把 fetch 额度花在"我已经知道的事"上。
+    #[test]
+    fn the_backstop_poll_does_not_refetch_what_live_already_stored() {
+        let (transport, log) = FakeTrade::new();
+        log.lock().unwrap().search_ids = Some(Vec::new());
+        let connector = Arc::new(ScriptedConnector::new());
+        connector.push(Step::New(vec!["live-1".to_string()]));
+        let (settings, obs_id) = observe_live_settings("Choir of the Storm");
+        let db = temp_db("live-then-poll");
+        let handle = RuntimeHandle::start_offline_with_connector(
+            settings,
+            RuntimePaths::new(db.clone()),
+            transport,
+            shared(&connector),
+        )
+        .unwrap();
+
+        let mut seen = Vec::new();
+        wait_for_fetches(&handle, &mut seen, &log, 1);
+        assert_eq!(log.lock().unwrap().fetches[0], ["live-1"]);
+
+        // 现在让兜底那一轮的搜索也报回同一条 id。
+        log.lock().unwrap().search_ids = Some(vec!["live-1".to_string()]);
+        let searches_before = log.lock().unwrap().searches;
+        handle
+            .try_send(RuntimeCommand::DiscoverNow {
+                obs_id: obs_id.clone(),
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while log.lock().unwrap().searches <= searches_before && Instant::now() < deadline {
+            match handle.try_next_event() {
+                Some(event) => seen.push(event),
+                None => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        thread::sleep(Duration::from_millis(300));
+        while let Some(event) = handle.try_next_event() {
+            seen.push(event);
+        }
+        drop(handle);
+
+        assert_eq!(
+            log.lock().unwrap().fetches.len(),
+            1,
+            "秒推抓过的 id 不该被兜底轮询再抓一次:{seen:#?}"
+        );
+        let store = WatchStore::open(&db).expect("open");
+        assert_eq!(store.active_listing_ids(&obs_id).unwrap(), ["live-1"]);
+        remove_db(&db);
+    }
+
+    /// 蹲价和观察分的是同一份 live 连接额度,而**蹲价优先**:
+    /// 挤不上的那条观察退回兜底轮询,并且在状态里说清楚为什么。
+    #[test]
+    fn watches_win_the_last_live_connection_and_the_observation_says_so() {
+        let (transport, _log) = FakeTrade::new();
+        let connector = Arc::new(ScriptedConnector::new());
+        let (mut settings, obs_id) = observe_live_settings("Choir of the Storm");
+        settings.watcher.max_live_connections = 1;
+        settings.watches = live_settings().watches;
+
+        let handle = RuntimeHandle::start_offline_with_connector(
+            settings,
+            RuntimePaths::in_memory(),
+            transport,
+            shared(&connector),
+        )
+        .unwrap();
+
+        let mut seen = Vec::new();
+        wait_for(
+            &handle,
+            &mut seen,
+            |event| {
+                matches!(event, RuntimeEvent::ObservationStatus { obs_id: id, status }
+                    if *id == obs_id
+                        && status.live == LiveRunState::Disabled(LiveOffReason::TooMany))
+            },
+            "the observation to be pushed out by the cap",
+        );
+        // 蹲价那条连上了,而且只开了这一条。
+        wait_for(
+            &handle,
+            &mut seen,
+            |event| {
+                matches!(event, RuntimeEvent::WatchStatus { status, .. }
+                    if status.live.is_connected())
+            },
+            "the watch to keep its live connection",
+        );
+        assert_eq!(connector.connects(), 1, "额度只够一条,蹲价拿走了");
+        assert!(
+            logged(&seen, &["observation", "no live connection left"]),
+            "被挤下来要说一句为什么:{seen:#?}"
+        );
+    }
+
+    // ---- 回查阶梯 ------------------------------------------------------
+
+    /// 到点查了一次、它还在:升一档,下一档排在 `first_seen + 1800`。
+    ///
+    /// 阶梯本身是纯函数(在 `pnd_domain` 里钉着),这一条钉的是 actor 真的
+    /// 把它接上了 —— 查完一次真的升档、真的把下一次排上,而不是原地打转。
+    #[test]
+    fn a_listing_that_is_still_there_climbs_one_rung() {
+        let (transport, log) = FakeTrade::new();
+        log.lock().unwrap().search_ids = Some(Vec::new());
+        let (settings, obs_id) = observe_settings("Choir of the Storm");
+        let db = temp_db("ladder");
+        // 一条老挂单:它的第一档(+600 秒)早就该查了。
+        let first_seen = 1_000_000i64;
+        {
+            let store = WatchStore::open(&db).expect("open");
+            seed_listing(&store, &obs_id, "old", first_seen);
+        }
+
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::new(db.clone()), transport)
+                .unwrap();
+        let mut seen = Vec::new();
+        wait_for_fetches(&handle, &mut seen, &log, 1);
+        drop(handle);
+
+        assert_eq!(log.lock().unwrap().fetches[0], ["old"], "到点的那条被查了");
+        let store = WatchStore::open(&db).expect("open");
+        let row = store
+            .observed_listing(&obs_id, "old")
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.check_rung, 1);
+        assert_eq!(row.next_check_at, first_seen + 1_800);
+        assert_eq!(row.status, pnd_storage::ObservedStatus::Active);
+        remove_db(&db);
+    }
+
+    /// 两条观察各有到期的挂单:拼进**同一次** fetch(一次最多 10 个 id),
+    /// 而回信按 id 对号,各记各的账。
+    ///
+    /// 不拼批的话,两条观察各发一个装着两个 id 的请求 —— 同样的信息花掉两次
+    /// 抓取额度,而那份额度是这条功能唯一真正稀缺的东西。
+    #[test]
+    fn one_sweep_serves_two_observations_and_attributes_each_answer() {
+        let (transport, log) = FakeTrade::new();
+        log.lock().unwrap().search_ids = Some(Vec::new());
+        // 观察二的 "b2" 卖掉了。
+        log.lock().unwrap().gone_ids.insert("b2".to_string());
+
+        let (first, one) = observe_settings("Tablets");
+        let (second, two) = observe_settings("Rings");
+        let mut settings = first;
+        settings.observations.extend(second.observations);
+        let db = temp_db("sweep-two");
+        let first_seen = 1_000_000i64;
+        {
+            let store = WatchStore::open(&db).expect("open");
+            for listing_id in ["a1", "a2"] {
+                seed_listing(&store, &one, listing_id, first_seen);
+            }
+            for listing_id in ["b1", "b2"] {
+                seed_listing(&store, &two, listing_id, first_seen);
+            }
+        }
+
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::new(db.clone()), transport)
+                .unwrap();
+        let mut seen = Vec::new();
+        wait_for_fetches(&handle, &mut seen, &log, 1);
+        drop(handle);
+
+        let batch = log.lock().unwrap().fetches[0].clone();
+        assert_eq!(batch.len(), 4, "四条挂单拼成一次 fetch:{batch:?}");
+        assert!(batch.len() <= 10, "一次最多 10 个 id");
+        assert_eq!(
+            batch.iter().collect::<BTreeSet<_>>(),
+            ["a1", "a2", "b1", "b2"]
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .iter()
+                .collect::<BTreeSet<_>>()
+        );
+
+        let store = WatchStore::open(&db).expect("open");
+        // 观察一的两条都还在:各升一档,一条都没被判成没了。
+        for listing_id in ["a1", "a2"] {
+            let row = store
+                .observed_listing(&one, listing_id)
+                .unwrap()
+                .expect("row");
+            assert_eq!(
+                row.status,
+                pnd_storage::ObservedStatus::Active,
+                "{listing_id}"
+            );
+            assert_eq!(row.check_rung, 1, "{listing_id}");
+        }
+        // 观察二:b1 还在,b2 没了 —— 而且这一笔只记在观察二头上。
+        assert_eq!(
+            store
+                .observed_listing(&two, "b1")
+                .unwrap()
+                .expect("row")
+                .status,
+            pnd_storage::ObservedStatus::Active
+        );
+        let gone = store.observed_listing(&two, "b2").unwrap().expect("row");
+        assert_eq!(gone.status, pnd_storage::ObservedStatus::Gone);
+        assert!(gone.gone_at.is_some());
+        assert_eq!(store.observation_summary(&one).unwrap().gone, 0);
+        assert_eq!(store.observation_summary(&two).unwrap().gone, 1);
+        remove_db(&db);
     }
 }

@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 
-use pnd_domain::{GoneClass, ListingSummary, ObservationId, Price};
+use pnd_domain::{GoneClass, ListingSummary, ObservationId, Price, next_check_after};
 use pnd_ninja::character::{line_numbers, mod_template};
 use rusqlite::{OptionalExtension, Row, params};
 
@@ -54,11 +54,16 @@ CREATE TABLE IF NOT EXISTS observed_listings (
     status TEXT NOT NULL,
     gone_at INTEGER,
     gone_class TEXT,
+    check_rung INTEGER NOT NULL DEFAULT 0,
+    next_check_at INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (obs_id, listing_id)
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS observed_listings_status
     ON observed_listings(obs_id, status, last_seen_at);
+
+CREATE INDEX IF NOT EXISTS observed_listings_due
+    ON observed_listings(status, next_check_at);
 
 CREATE TABLE IF NOT EXISTS observed_price_history (
     obs_id TEXT NOT NULL,
@@ -99,6 +104,26 @@ const MOD_ARRAYS: [(&str, &str); 7] = [
     ("desecratedMods", "desecrated"),
     ("fracturedMods", "fractured"),
 ];
+
+/// `next_check_at` 上的"别再查了"。
+///
+/// 用一个哨兵而不是把这一列改成可空:回查的取数条件是
+/// `next_check_at <= now`,哨兵天然过不了那一关,而可空列还要在每条查询里
+/// 多写一个 `IS NOT NULL`,漏写一处就会有一批七天前的老货被反复问。
+pub const NEVER_CHECK_AGAIN: i64 = i64::MAX;
+
+/// 一条到点该回查的挂单。
+///
+/// 带着 `first_seen_at` 和 `check_rung` 一起出来,是因为回信回来时要算
+/// "下一档排在什么时候"([`pnd_domain::next_check_after`]),而那两个数在
+/// 这一趟里不会变 —— 再回库读一次只是多一次查询。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueListing {
+    pub obs_id: ObservationId,
+    pub listing_id: String,
+    pub first_seen_at: i64,
+    pub check_rung: u32,
+}
 
 /// 一条挂单现在是还挂着还是没了。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -177,6 +202,10 @@ pub struct ObservedListingRow {
     pub status: ObservedStatus,
     pub gone_at: Option<i64>,
     pub gone_class: Option<GoneClass>,
+    /// 回查阶梯走到第几档了。见 [`pnd_domain::next_check_after`]。
+    pub check_rung: u32,
+    /// 下一次该回头看它的时刻;[`NEVER_CHECK_AGAIN`] = 不再看了。
+    pub next_check_at: i64,
 }
 
 impl ObservedListingRow {
@@ -203,6 +232,9 @@ pub struct ObservationSummary {
     pub sold_likely: u32,
     pub sold_after_cuts: u32,
     pub unknown: u32,
+    /// 第一次去抓详情时就已经没了的那些。也算在 `gone` 里,但必须能单独看见:
+    /// 它们是秒掉的那一批,占比本身就是"这条搜索里有多少好价"的答案。
+    pub gone_before_first_look: u32,
 }
 
 /// 聚合表里的一行:某条词缀模板的战绩。
@@ -343,8 +375,8 @@ impl WatchStore {
             tx.execute(
                 "INSERT INTO observed_listings (obs_id, listing_id, item_name, item_json, seller,
                      indexed_at, first_seen_at, last_seen_at, currency, first_price_milli,
-                     last_price_milli, price_changes, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?9, 0, 'active')",
+                     last_price_milli, price_changes, status, check_rung, next_check_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?9, 0, 'active', 0, ?10)",
                 params![
                     obs_id.as_str(),
                     listing.id,
@@ -355,6 +387,7 @@ impl WatchStore {
                     now,
                     currency,
                     price_milli,
+                    first_check_at(now),
                 ],
             )?;
             tx.execute(
@@ -467,6 +500,116 @@ impl WatchStore {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// 到点该回头看的挂单,**跨所有观察**一起捞,最早该查的排前面。
+    ///
+    /// 跨观察是有意的:一次 fetch 最多带 10 个 id,凑不满就白花一次额度。
+    /// 两条观察各有三条到期的挂单,拼成一批发出去就只花一次。
+    pub fn due_listings(&self, now: i64, limit: usize) -> Result<Vec<DueListing>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT obs_id, listing_id, first_seen_at, check_rung FROM observed_listings
+             WHERE status = 'active' AND next_check_at <= ?1
+             ORDER BY next_check_at ASC, obs_id ASC, listing_id ASC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![now, limit as i64], |row| {
+            let rung: i64 = row.get(3)?;
+            Ok(DueListing {
+                obs_id: ObservationId(row.get(0)?),
+                listing_id: row.get(1)?,
+                first_seen_at: row.get(2)?,
+                check_rung: to_u32(rung),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 看过一眼、它还在:升一档,把下一次排上。`None` = 阶梯走完了
+    /// (七天),从此不再回查。
+    pub fn advance_rung(
+        &self,
+        obs_id: &ObservationId,
+        listing_id: &str,
+        rung: u32,
+        next_check_at: Option<i64>,
+    ) -> Result<(), StorageError> {
+        self.conn.execute(
+            "UPDATE observed_listings SET check_rung = ?3, next_check_at = ?4
+             WHERE obs_id = ?1 AND listing_id = ?2",
+            params![
+                obs_id.as_str(),
+                listing_id,
+                i64::from(rung),
+                next_check_at.unwrap_or(NEVER_CHECK_AGAIN),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 界面上那个"立刻回查一次":把这条观察在册的挂单全部推到此刻到期。
+    ///
+    /// 不自己发请求 —— 推到期之后,下一次扫描会照常按额度分批把它们查完,
+    /// 于是"手动查一次"和"自动查一次"走的是同一条路,不会有第二套限速账。
+    /// 返回推了几条。
+    pub fn mark_all_due(&self, obs_id: &ObservationId, now: i64) -> Result<u32, StorageError> {
+        let changed = self.conn.execute(
+            "UPDATE observed_listings SET next_check_at = ?2
+             WHERE obs_id = ?1 AND status = 'active'",
+            params![obs_id.as_str(), now],
+        )?;
+        Ok(to_u32(changed as i64))
+    }
+
+    /// 这条观察下一次该回查的时刻(在册挂单里最早的那个)。
+    /// 界面上"下一次回查"那一行就是它;一条都没有(或者全都不再查了)是 `None`。
+    pub fn next_check_due_at(&self, obs_id: &ObservationId) -> Result<Option<i64>, StorageError> {
+        let at: Option<i64> = self.conn.query_row(
+            "SELECT MIN(next_check_at) FROM observed_listings
+             WHERE obs_id = ?1 AND status = 'active' AND next_check_at < ?2",
+            params![obs_id.as_str(), NEVER_CHECK_AGAIN],
+            |row| row.get(0),
+        )?;
+        Ok(at)
+    }
+
+    /// 第一次去抓它详情就已经没了。
+    ///
+    /// 记一行**空壳**:没有物品原文、没有词缀、没有价格 —— 那些我们从来
+    /// 没见过,编一个假的会毒化聚合表。留下的只有"这么一条挂单存在过,
+    /// 而且没等到我们看它第一眼" —— 那恰恰是最值钱的一条信息:秒掉的都是好价。
+    ///
+    /// 已经在册的 id 一个字都不动(返回 `false`):它可能正活得好好的,
+    /// 一次超时的 fetch 不该把它写成"没了"。
+    pub fn record_gone_before_first_look(
+        &self,
+        obs_id: &ObservationId,
+        listing_id: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        let (unpriced, no_currency) = encode_price(None);
+        let inserted = self.conn.execute(
+            "INSERT INTO observed_listings (obs_id, listing_id, item_name, item_json, seller,
+                 indexed_at, first_seen_at, last_seen_at, currency, first_price_milli,
+                 last_price_milli, price_changes, status, gone_at, gone_class,
+                 check_rung, next_check_at)
+             VALUES (?1, ?2, '', '', '', '', ?3, ?3, ?4, ?5, ?5, 0, 'gone', ?3, ?6, 0, ?7)
+             ON CONFLICT(obs_id, listing_id) DO NOTHING",
+            params![
+                obs_id.as_str(),
+                listing_id,
+                now,
+                no_currency,
+                unpriced,
+                GoneClass::GoneBeforeFirstLook.as_str(),
+                NEVER_CHECK_AGAIN,
+            ],
+        )?;
+        Ok(inserted > 0)
     }
 
     /// 这条挂单不见了,判定结果一起写上。
@@ -585,6 +728,7 @@ impl WatchStore {
                 GoneClass::SoldLikely => summary.sold_likely += count,
                 GoneClass::SoldAfterCuts => summary.sold_after_cuts += count,
                 GoneClass::Unknown => summary.unknown += count,
+                GoneClass::GoneBeforeFirstLook => summary.gone_before_first_look += count,
             }
         }
         Ok(summary)
@@ -733,8 +877,16 @@ impl WatchStore {
 /// 挂单行的列清单。三处查询共用,免得加一列漏改一处。
 const LISTING_COLUMNS: &str = "SELECT listing_id, item_name, item_json, seller, indexed_at,
         first_seen_at, last_seen_at, currency, first_price_milli, last_price_milli,
-        price_changes, status, gone_at, gone_class
+        price_changes, status, gone_at, gone_class, check_rung, next_check_at
  FROM observed_listings";
+
+/// 刚记下的挂单十分钟后第一次回头看(阶梯第 0 档)。
+///
+/// 第 0 档不看回查间隔,所以这里传什么都一样 —— 阶梯只有一份,在
+/// [`pnd_domain::next_check_after`] 里,存储层不自己抄一个 600。
+fn first_check_at(now: i64) -> i64 {
+    next_check_after(now, 0, 0).unwrap_or(now)
+}
 
 /// 聚合时从库里读出来的一行(一件货 × 一条词缀)。
 struct AggregateRow {
@@ -887,6 +1039,7 @@ fn observed_listing_from_row(row: &Row<'_>) -> rusqlite::Result<ObservedListingR
     let price_changes: i64 = row.get(10)?;
     let status: String = row.get(11)?;
     let gone_class: Option<String> = row.get(13)?;
+    let check_rung: i64 = row.get(14)?;
     Ok(ObservedListingRow {
         listing_id: row.get(0)?,
         item_name: row.get(1)?,
@@ -901,6 +1054,8 @@ fn observed_listing_from_row(row: &Row<'_>) -> rusqlite::Result<ObservedListingR
         status: ObservedStatus::parse(&status),
         gone_at: row.get(12)?,
         gone_class: gone_class.map(|raw| GoneClass::parse(&raw)),
+        check_rung: to_u32(check_rung),
+        next_check_at: row.get(15)?,
     })
 }
 
@@ -1273,6 +1428,7 @@ mod observe_tests {
                 sold_likely: 2,
                 sold_after_cuts: 1,
                 unknown: 1,
+                gone_before_first_look: 0,
             }
         );
         assert_eq!(
@@ -1481,6 +1637,220 @@ mod observe_tests {
         assert!(observed_mods_from_item_json("").is_empty());
         assert!(observed_mods_from_item_json("not json").is_empty());
         assert!(observed_mods_from_item_json("{}").is_empty());
+    }
+
+    // ---- 回查阶梯 ------------------------------------------------------
+
+    /// 刚记下的挂单站在阶梯第 0 档:十分钟后第一次回头看它。
+    #[test]
+    fn a_new_listing_starts_on_the_first_rung() {
+        let store = store();
+        let id = obs("o-1");
+        store
+            .record_seen(&id, &listing("aaa", divine(20_000), &[]), 1_000)
+            .expect("record");
+        let row = store
+            .observed_listing(&id, "aaa")
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.check_rung, 0);
+        assert_eq!(row.next_check_at, 1_000 + 600);
+    }
+
+    /// 到点该查的挂单是**跨观察一起**捞出来的:一次 fetch 带 10 个 id,
+    /// 凑不满就白花一次额度,所以两条观察的到期挂单要能拼进同一批。
+    #[test]
+    fn due_listings_come_from_every_observation_oldest_deadline_first() {
+        let store = store();
+        let one = obs("o-1");
+        let two = obs("o-2");
+        store
+            .record_seen(&one, &listing("a", divine(1_000), &[]), 1_000)
+            .expect("record");
+        store
+            .record_seen(&two, &listing("b", divine(1_000), &[]), 900)
+            .expect("record");
+        // 还没到点的那条不该被捞出来。
+        store
+            .record_seen(&one, &listing("c", divine(1_000), &[]), 5_000)
+            .expect("record");
+
+        let due = store.due_listings(1_600, 10).expect("due");
+        assert_eq!(
+            due.iter()
+                .map(|entry| (entry.obs_id.to_string(), entry.listing_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("o-2".to_string(), "b"), ("o-1".to_string(), "a")],
+            "最早该查的排前面"
+        );
+        assert_eq!(due[0].first_seen_at, 900);
+        assert_eq!(due[0].check_rung, 0);
+
+        // 上限砍掉尾巴,留下的是最该查的那条。
+        assert_eq!(store.due_listings(1_600, 1).expect("due").len(), 1);
+        // 已经没了的挂单不再花额度。
+        store
+            .mark_gone(&two, "b", 1_500, GoneClass::SoldLikely)
+            .expect("gone");
+        assert_eq!(
+            store
+                .due_listings(1_600, 10)
+                .expect("due")
+                .iter()
+                .map(|entry| entry.listing_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["a".to_string()]
+        );
+    }
+
+    /// 查过一次就升一档,并把下一次排上;阶梯走完(`None`)就再也不查了。
+    #[test]
+    fn advancing_a_rung_moves_the_deadline_and_none_stops_it_for_good() {
+        let store = store();
+        let id = obs("o-1");
+        store
+            .record_seen(&id, &listing("aaa", divine(1_000), &[]), 1_000)
+            .expect("record");
+
+        store
+            .advance_rung(&id, "aaa", 1, Some(1_000 + 1_800))
+            .expect("advance");
+        let row = store
+            .observed_listing(&id, "aaa")
+            .expect("read")
+            .expect("row");
+        assert_eq!((row.check_rung, row.next_check_at), (1, 2_800));
+        assert!(store.due_listings(2_000, 10).expect("due").is_empty());
+        assert_eq!(store.due_listings(2_800, 10).expect("due").len(), 1);
+
+        // 七天到了:`None` = 不再回查,哪怕过一年再问也不该冒出来。
+        store.advance_rung(&id, "aaa", 9, None).expect("advance");
+        assert_eq!(
+            store
+                .observed_listing(&id, "aaa")
+                .expect("read")
+                .expect("row")
+                .next_check_at,
+            NEVER_CHECK_AGAIN
+        );
+        assert!(
+            store
+                .due_listings(i64::MAX - 1, 10)
+                .expect("due")
+                .is_empty()
+        );
+    }
+
+    /// 界面上的"立刻回查一次":把这条观察在册的挂单全部推到此刻到期,
+    /// 别的观察一条都不动。
+    #[test]
+    fn marking_a_whole_observation_due_only_touches_that_observation() {
+        let store = store();
+        let one = obs("o-1");
+        let two = obs("o-2");
+        for (target, listing_id) in [(&one, "a"), (&one, "b"), (&two, "c")] {
+            store
+                .record_seen(target, &listing(listing_id, divine(1_000), &[]), 1_000)
+                .expect("record");
+        }
+        store.mark_gone(&one, "b", 1_100, GoneClass::Unknown).ok();
+
+        assert_eq!(store.mark_all_due(&one, 1_200).expect("due"), 1);
+        let due = store.due_listings(1_200, 10).expect("due");
+        assert_eq!(
+            due.iter()
+                .map(|entry| entry.listing_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["a".to_string()],
+            "另一条观察和已经没了的那条都不该被推到期"
+        );
+    }
+
+    /// 状态栏上那句"下一次回查":这条观察在册的挂单里最早的那个到期时刻。
+    #[test]
+    fn the_next_check_of_an_observation_is_the_earliest_deadline_on_file() {
+        let store = store();
+        let id = obs("o-1");
+        assert_eq!(store.next_check_due_at(&id).expect("next"), None);
+        store
+            .record_seen(&id, &listing("a", divine(1_000), &[]), 1_000)
+            .expect("record");
+        store
+            .record_seen(&id, &listing("b", divine(1_000), &[]), 2_000)
+            .expect("record");
+        assert_eq!(store.next_check_due_at(&id).expect("next"), Some(1_600));
+        // 不再回查的那条不算数。
+        store.advance_rung(&id, "a", 9, None).expect("advance");
+        assert_eq!(store.next_check_due_at(&id).expect("next"), Some(2_600));
+        store.advance_rung(&id, "b", 9, None).expect("advance");
+        assert_eq!(store.next_check_due_at(&id).expect("next"), None);
+    }
+
+    // ---- 第一眼就没了 --------------------------------------------------
+
+    /// 秒推说有这么一条挂单,几秒钟后去抓详情却已经是 null:记一行,
+    /// 判定档写死 `gone_before_first_look`,而且它没有词缀 ——
+    /// 所以聚合表一根毫毛都不会动。
+    #[test]
+    fn a_listing_gone_before_the_first_look_is_counted_but_never_aggregated() {
+        let store = store();
+        let id = obs("o-1");
+        store
+            .record_seen(
+                &id,
+                &listing("alive", divine(20_000), &["+115 to maximum Life"]),
+                1_000,
+            )
+            .expect("record");
+        let before = store.mod_aggregate(&id, 1).expect("aggregate");
+
+        assert!(
+            store
+                .record_gone_before_first_look(&id, "quick", 2_000)
+                .expect("record")
+        );
+        let row = store
+            .observed_listing(&id, "quick")
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.status, ObservedStatus::Gone);
+        assert_eq!(row.gone_class, Some(GoneClass::GoneBeforeFirstLook));
+        assert_eq!(row.first_seen_at, 2_000);
+        assert_eq!(row.last_seen_at, 2_000);
+        assert_eq!(row.gone_at, Some(2_000));
+        assert_eq!(row.first_price, None, "我们从没见过它的价");
+        assert!(row.item_json.is_empty(), "连它长什么样都没见过");
+        assert!(store.observed_mods(&id, "quick").expect("mods").is_empty());
+        assert_eq!(
+            row.next_check_at, NEVER_CHECK_AGAIN,
+            "已经没了的东西不该再排回查"
+        );
+
+        // 账上单独一栏,而"没了"的总数里也算它一条。
+        let summary = store.observation_summary(&id).expect("summary");
+        assert_eq!(summary.active, 1);
+        assert_eq!(summary.gone, 1);
+        assert_eq!(summary.gone_before_first_look, 1);
+        assert_eq!(summary.unknown, 0, "别混进'看不出来'那一档");
+
+        // 聚合表按词缀分组,而这一行没有词缀:一个数都不该变。
+        assert_eq!(store.mod_aggregate(&id, 1).expect("aggregate"), before);
+
+        // 已经记过的 id 不该被第二次覆盖(比如两条推送里都有它)。
+        assert!(
+            !store
+                .record_gone_before_first_look(&id, "alive", 3_000)
+                .expect("record"),
+            "还活着的那条不能被写成'第一眼就没了'"
+        );
+        assert_eq!(
+            store
+                .observed_listing(&id, "alive")
+                .expect("read")
+                .expect("row")
+                .status,
+            ObservedStatus::Active
+        );
     }
 
     #[test]

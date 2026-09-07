@@ -125,11 +125,16 @@ pub enum Priority {
 /// `alert_id` 是"去藏身处"那条链路用的:那次刷新 token 的 fetch 和随后的
 /// whisper 都不属于任何一轮轮询,回信要认的是提醒记录里的行号。
 /// `obs_id` 同理,认的是市场观察那一条。
+///
+/// `sweep_id` 是回查扫描用的:**一批回查里可以混着好几条观察的挂单**
+/// (凑满 10 个 id 才不浪费一次 fetch),所以它认的不是"哪一条观察",
+/// 而是"哪一批" —— actor 手里存着那一批的 (观察, 挂单) 清单,回信按 id 对号。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestTag {
     pub watch_id: Option<WatchId>,
     pub obs_id: Option<ObservationId>,
     pub alert_id: Option<i64>,
+    pub sweep_id: Option<u64>,
     pub label: &'static str,
 }
 
@@ -141,6 +146,7 @@ impl RequestTag {
             watch_id: Some(watch_id),
             obs_id: None,
             alert_id: None,
+            sweep_id: None,
             label,
         }
     }
@@ -152,6 +158,19 @@ impl RequestTag {
             watch_id: None,
             obs_id: Some(obs_id),
             alert_id: None,
+            sweep_id: None,
+            label,
+        }
+    }
+
+    /// 一批回查扫描。可能横跨好几条观察,所以只带批次号。
+    #[must_use]
+    pub fn sweep(sweep_id: u64, label: &'static str) -> RequestTag {
+        RequestTag {
+            watch_id: None,
+            obs_id: None,
+            alert_id: None,
+            sweep_id: Some(sweep_id),
             label,
         }
     }
@@ -163,6 +182,7 @@ impl RequestTag {
             watch_id: None,
             obs_id: None,
             alert_id: Some(alert_id),
+            sweep_id: None,
             label,
         }
     }
@@ -174,6 +194,7 @@ impl RequestTag {
             watch_id: None,
             obs_id: None,
             alert_id: None,
+            sweep_id: None,
             label,
         }
     }

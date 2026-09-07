@@ -27,8 +27,14 @@ pub const STALE_AFTER_SECS: i64 = 7 * 24 * 3600;
 
 /// 一条消失的挂单最可能的去向。
 ///
-/// 故意只有三档:再细分下去(比如"卖家整批撤单")需要回头查那个卖家的
-/// 其它挂单,那是第二版的事(见计划里的 `delisted_likely`)。
+/// 前三档是 [`classify_gone`] 判出来的,故意只有三档:再细分下去(比如
+/// "卖家整批撤单")需要回头查那个卖家的其它挂单,那是第二版的事
+/// (见计划里的 `delisted_likely`)。
+///
+/// 第四档 [`GoneClass::GoneBeforeFirstLook`] 不经过判定:秒推告诉我们有这么
+/// 一条挂单、几秒钟后去抓详情却已经没了 —— 那种情况我们连它标价多少都不知道,
+/// 没有任何可判的东西,由运行时直接写上这一档。它偏偏是最有意思的一批货
+/// (秒掉的都是好价),所以必须单独数,不能混进"看不出来"里。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoneClass {
@@ -38,6 +44,8 @@ pub enum GoneClass {
     SoldAfterCuts,
     /// 存活太短,看不出来 —— 多半是挂错了撤掉的。
     Unknown,
+    /// 第一次去抓它详情的时候就已经没了。
+    GoneBeforeFirstLook,
 }
 
 impl GoneClass {
@@ -48,6 +56,7 @@ impl GoneClass {
             GoneClass::SoldLikely => "sold_likely",
             GoneClass::SoldAfterCuts => "sold_after_cuts",
             GoneClass::Unknown => "unknown",
+            GoneClass::GoneBeforeFirstLook => "gone_before_first_look",
         }
     }
 
@@ -57,6 +66,7 @@ impl GoneClass {
         match raw {
             "sold_likely" => GoneClass::SoldLikely,
             "sold_after_cuts" => GoneClass::SoldAfterCuts,
+            "gone_before_first_look" => GoneClass::GoneBeforeFirstLook,
             _ => GoneClass::Unknown,
         }
     }
@@ -109,6 +119,39 @@ pub fn classify_gone(
 #[must_use]
 pub fn is_stale(first_seen: i64, now: i64) -> bool {
     now - first_seen >= STALE_AFTER_SECS
+}
+
+/// 一条挂单记下来之后,第几次回头看它该等多久(秒,从 `first_seen` 算起)。
+///
+/// 阶梯而不是固定间隔,是因为"卖得快的"和"卖不掉的"值钱程度不一样:
+/// 一件好价碑牌一分钟内就没了,而那正是我们最想量的事,所以头两档密;
+/// 一件挂了三天还在的货,再精确到小时也不会改变结论("没人要"),
+/// 所以往后越拉越松,直到 [`STALE_AFTER_SECS`] 干脆不看了。
+pub const CHECK_RUNGS: [i64; 6] = [600, 1_800, 7_200, 21_600, 86_400, 259_200];
+
+/// 第 `rung` 档回查该落在哪一刻(unix 秒);`None` = 这条挂单已经到了
+/// [`STALE_AFTER_SECS`],不再看了。
+///
+/// `rung` 是**下一档的编号**:一条刚记下的挂单是第 0 档(`first_seen + 600`),
+/// 在第 0 档看过一眼还活着就升到第 1 档(`first_seen + 1800`)。走完
+/// [`CHECK_RUNGS`] 之后每 `recheck_interval_secs` 一档 —— 那时它只回答
+/// "这件挂了三天的货今天还在不在",一天问一次绰绰有余。
+///
+/// 时刻一律从 `first_seen` 算,不从"上一次查的时刻"累加:回查排队晚了几分钟
+/// 不该把后面每一档都往后推,那会让"它活了多久"越查越不准。
+#[must_use]
+pub fn next_check_after(first_seen: i64, rung: u32, recheck_interval_secs: u64) -> Option<i64> {
+    let offset = match CHECK_RUNGS.get(rung as usize) {
+        Some(secs) => *secs,
+        None => {
+            // 阶梯之外的第几次。间隔为 0 会让它原地踏步,兜一下。
+            let beyond = i64::from(rung) - CHECK_RUNGS.len() as i64 + 1;
+            let every = recheck_interval_secs.max(1) as i64;
+            CHECK_RUNGS[CHECK_RUNGS.len() - 1].saturating_add(beyond.saturating_mul(every))
+        }
+    };
+    let at = first_seen.saturating_add(offset);
+    (!is_stale(first_seen, at)).then_some(at)
 }
 
 /// 消失之前有没有降过价。
@@ -258,6 +301,7 @@ mod observe_tests {
             GoneClass::SoldLikely,
             GoneClass::SoldAfterCuts,
             GoneClass::Unknown,
+            GoneClass::GoneBeforeFirstLook,
         ] {
             assert_eq!(GoneClass::parse(class.as_str()), class);
         }
@@ -266,5 +310,56 @@ mod observe_tests {
         assert!(GoneClass::SoldLikely.looks_sold());
         assert!(GoneClass::SoldAfterCuts.looks_sold());
         assert!(!GoneClass::Unknown.looks_sold());
+        // 一眼都没看清就没了的那种不算成交:我们连它标价多少都不知道。
+        assert!(!GoneClass::GoneBeforeFirstLook.looks_sold());
+    }
+
+    /// 判定永远不会自己判出"第一眼就没了" —— 那一档是运行时直接写上去的
+    /// (第一次 fetch 就回 null),不是从存活时间推出来的。
+    #[test]
+    fn classify_never_returns_gone_before_first_look() {
+        let first = 1_000;
+        for (last, gone) in [
+            (first, first),
+            (first + 10, first + 20),
+            (first + 10 * HOUR, first + 11 * HOUR),
+        ] {
+            assert_ne!(
+                classify_gone(first, last, gone, &[(first, 20_000)]),
+                GoneClass::GoneBeforeFirstLook
+            );
+        }
+    }
+
+    /// 阶梯的全程:10 分钟、30 分钟、2 小时、6 小时、1 天、3 天,
+    /// 之后每 `recheck_interval_secs` 一次,七天到了就不再看了。
+    #[test]
+    fn the_check_ladder_walks_from_ten_minutes_to_seven_days() {
+        let first = 1_000;
+        let day: i64 = 86_400;
+        let every_day = day as u64;
+        let ladder: Vec<i64> = (0..6)
+            .map(|rung| {
+                next_check_after(first, rung, every_day).expect("still on the ladder") - first
+            })
+            .collect();
+        assert_eq!(ladder, vec![600, 1_800, 7_200, 21_600, 86_400, 259_200]);
+
+        // 最后一档之后就是"每 recheck_interval_secs 看一眼",从第 3 天起算。
+        assert_eq!(next_check_after(first, 6, every_day), Some(first + 4 * day));
+        assert_eq!(next_check_after(first, 7, every_day), Some(first + 5 * day));
+        assert_eq!(next_check_after(first, 8, every_day), Some(first + 6 * day));
+        // 第 7 天正好是"没人要"的分界线:到这里就不再花额度了。
+        assert_eq!(next_check_after(first, 9, every_day), None);
+        assert_eq!(next_check_after(first, 99, every_day), None);
+
+        // 换一个更勤的回查间隔,只影响最后一档之后的那几次。
+        assert_eq!(next_check_after(first, 5, 3_600), Some(first + 259_200));
+        assert_eq!(
+            next_check_after(first, 6, 3_600),
+            Some(first + 259_200 + 3_600)
+        );
+        // 0 秒的间隔不能让它原地踏步(设置里兜着下限,这里再兜一次)。
+        assert_eq!(next_check_after(first, 6, 0), Some(first + 259_201));
     }
 }

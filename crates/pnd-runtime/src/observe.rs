@@ -1,17 +1,24 @@
-//! 观察调度:每条市场观察下一次该 discover、下一次该 recheck。
+//! 观察调度:每条市场观察下一次该 discover,以及下一次该扫一遍到期的挂单。
 //!
 //! 和 [`crate::poll`] 并排的一层,纪律一样 —— 纯逻辑,不碰时钟也不碰网络,
-//! `now` 一律由调用方传进来,于是"两小时回查一次"这种事可以在测试里
+//! `now` 一律由调用方传进来,于是"三天后再看一眼"这种事可以在测试里
 //! 一微秒跑完。
 //!
-//! 两条时间线,一条观察各走各的:
+//! 两件事,节奏完全不同:
 //!
 //! - **discover**(默认 10 分钟)= 一次 search,拉"最新 100 条"找新面孔。
-//!   它花的是**搜索**额度,所以和蹲价共用同一条地板
-//!   ([`crate::poll::budget_floor_interval`],把观察条数一起数进去)。
-//! - **recheck**(默认 2 小时)= 把在册的挂单按 10 个一批 fetch,查谁没了。
-//!   它花的是**抓取**额度,那一份额度宽得多(6 小时 1000 次的一半),
-//!   但也不是无限的 —— [`fetch_listing_cap`] 算的就是"一轮最多查多少条"。
+//!   它现在只是**兜底**:新挂单主要靠 live 秒推知道(那条路一条搜索额度都不花),
+//!   这一轮是给"WebSocket 断线的那几十秒"补漏的。它花的是搜索额度,所以和
+//!   蹲价共用同一条地板([`crate::poll::budget_floor_interval`],把观察条数
+//!   一起数进去)。
+//! - **sweep**(最快一分钟一次)= 把**到点该回头看**的挂单捞出来 fetch。
+//!   哪条挂单什么时候到点,是 [`pnd_domain::next_check_after`] 那条阶梯说了算,
+//!   不在这里 —— 这里只管"多久去库里问一次谁到点了"。
+//!
+//! 为什么不再是"每条观察每两小时把在册的全查一遍":那种查法里,一条挂上去
+//! 三分钟就被买走的碑牌和一条挂了六天的护符花掉的额度一模一样,而前者才是
+//! 我们要量的东西。阶梯把额度花在挂单**刚出生**的那几个小时里,老货一天问
+//! 一次,七天以后干脆不问 —— 同一份 fetch 额度能盯住的挂单多得多。
 //!
 //! 观察失败不退避:一轮 discover 砸了(网断了、被 429 了)就等下一轮,
 //! 因为它本来就是十分钟一次的慢节奏,而真正需要退避的那几种情况
@@ -21,55 +28,17 @@ use std::collections::BTreeMap;
 
 use pnd_domain::ObservationId;
 
-/// 观察的两件事。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ObserveKind {
-    /// 拉最新 100 条,找没见过的。
-    Discover,
-    /// 回头查在册的还在不在。
-    Recheck,
-}
+/// 最快多久扫一次"谁到点该回查了"。
+///
+/// 一分钟不是回查的精度,是**问库的**精度:阶梯上最密的一档是 10 分钟,
+/// 晚一分钟去问它无所谓;而扫得再勤也只是空跑一条 SQL。
+pub const SWEEP_INTERVAL_SECS: u64 = 60;
 
-impl ObserveKind {
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            ObserveKind::Discover => "discover",
-            ObserveKind::Recheck => "recheck",
-        }
-    }
-}
-
-/// 一条观察的两条时间线。
+/// 一条观察的兜底 discover 时间线。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObserveEntry {
     pub next_discover_at: i64,
-    pub next_recheck_at: i64,
     pub discover_interval: u64,
-    pub recheck_interval: u64,
-}
-
-impl ObserveEntry {
-    fn next_at(&self, kind: ObserveKind) -> i64 {
-        match kind {
-            ObserveKind::Discover => self.next_discover_at,
-            ObserveKind::Recheck => self.next_recheck_at,
-        }
-    }
-
-    fn interval(&self, kind: ObserveKind) -> u64 {
-        match kind {
-            ObserveKind::Discover => self.discover_interval,
-            ObserveKind::Recheck => self.recheck_interval,
-        }
-    }
-
-    fn set_next_at(&mut self, kind: ObserveKind, at: i64) {
-        match kind {
-            ObserveKind::Discover => self.next_discover_at = at,
-            ObserveKind::Recheck => self.next_recheck_at = at,
-        }
-    }
 }
 
 /// 所有观察的时间表。
@@ -81,6 +50,8 @@ pub struct ObserveScheduler {
     entries: BTreeMap<ObservationId, ObserveEntry>,
     /// discover 最快能多久一次(秒)。0 = 还没算过,不设限。
     discover_floor: u64,
+    /// 下一次扫描到期挂单的时刻。0 = 现在就该扫一次。
+    next_sweep_at: i64,
 }
 
 impl ObserveScheduler {
@@ -89,20 +60,17 @@ impl ObserveScheduler {
         ObserveScheduler::default()
     }
 
-    /// 加一条观察,或者更新一条已有观察的两个间隔。
+    /// 加一条观察,或者更新一条已有观察的 discover 间隔。
     ///
     /// **新加的**那条按 `stagger_index / count` 把第一次 discover 往后推
     /// (理由同轮询:三条观察同一秒醒来,网关会连着发三次 search)。
-    /// **第一次 recheck 排在一个完整的 recheck 间隔之后** —— 一条刚加上的
-    /// 观察手里一条在册挂单都没有,立刻回查是查一个空表。
     ///
-    /// 已有的那条只换间隔,不动两个 `next_at`:用户在设置页改个备注名,
+    /// 已有的那条只换间隔,不动 `next_discover_at`:用户在设置页改个备注名,
     /// 不该让所有观察重新排队。
     pub fn upsert(
         &mut self,
         obs_id: ObservationId,
         discover_interval: u64,
-        recheck_interval: u64,
         now: i64,
         stagger_index: usize,
         count: usize,
@@ -110,7 +78,6 @@ impl ObserveScheduler {
         let discover_interval = discover_interval.max(self.discover_floor);
         if let Some(entry) = self.entries.get_mut(&obs_id) {
             entry.discover_interval = discover_interval;
-            entry.recheck_interval = recheck_interval;
             return;
         }
         let count = count.max(1);
@@ -120,9 +87,7 @@ impl ObserveScheduler {
             obs_id,
             ObserveEntry {
                 next_discover_at: now + offset as i64,
-                next_recheck_at: now + recheck_interval as i64,
                 discover_interval,
-                recheck_interval,
             },
         );
     }
@@ -147,52 +112,66 @@ impl ObserveScheduler {
     }
 
     /// 最早的那件事在什么时候。主循环拿它算"该睡多久"。
+    ///
+    /// 一条观察都没有的时候连扫描都不用排:库里不可能有到期的挂单。
     #[must_use]
     pub fn next_deadline(&self) -> Option<i64> {
-        self.entries
+        let discover = self
+            .entries
             .values()
-            .map(|entry| entry.next_discover_at.min(entry.next_recheck_at))
-            .min()
+            .map(|entry| entry.next_discover_at)
+            .min()?;
+        Some(discover.min(self.next_sweep_at))
     }
 
-    /// 现在该做的事,早该做的排在前面。
+    /// 现在该 discover 的观察,早该做的排在前面。
     #[must_use]
-    pub fn due(&self, now: i64) -> Vec<(ObservationId, ObserveKind)> {
-        let mut due: Vec<(i64, ObserveKind, ObservationId)> = Vec::new();
-        for (obs_id, entry) in &self.entries {
-            for kind in [ObserveKind::Discover, ObserveKind::Recheck] {
-                let at = entry.next_at(kind);
-                if at <= now {
-                    due.push((at, kind, obs_id.clone()));
-                }
-            }
-        }
+    pub fn due(&self, now: i64) -> Vec<ObservationId> {
+        let mut due: Vec<(i64, ObservationId)> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.next_discover_at <= now)
+            .map(|(obs_id, entry)| (entry.next_discover_at, obs_id.clone()))
+            .collect();
         due.sort();
-        due.into_iter()
-            .map(|(_, kind, obs_id)| (obs_id, kind))
-            .collect()
+        due.into_iter().map(|(_, obs_id)| obs_id).collect()
     }
 
-    /// 一件事**刚发出去**就把下一次排上,理由同 [`crate::poll::PollScheduler::defer`]:
-    /// 不然 `next_at` 停在过去,主循环会一直觉得"该跑了"而空转。
-    pub fn defer(&mut self, obs_id: &ObservationId, kind: ObserveKind, now: i64) {
+    /// 一轮 discover **刚发出去**就把下一轮排上,理由同
+    /// [`crate::poll::PollScheduler::defer`]:不然 `next_at` 停在过去,
+    /// 主循环会一直觉得"该跑了"而空转。
+    pub fn defer(&mut self, obs_id: &ObservationId, now: i64) {
         if let Some(entry) = self.entries.get_mut(obs_id) {
-            let interval = entry.interval(kind);
-            entry.set_next_at(kind, now + interval as i64);
+            entry.next_discover_at = now + entry.discover_interval as i64;
         }
     }
 
-    /// 一轮跑完了,排下一轮。观察不退避(理由见本文件顶部),所以成功失败
-    /// 都是同一个间隔 —— 有它只是为了让"这一轮到此为止"有个明确的落点。
-    pub fn reschedule(&mut self, obs_id: &ObservationId, kind: ObserveKind, now: i64) {
-        self.defer(obs_id, kind, now);
+    /// 用户点了"立刻找一次新的"。
+    pub fn run_now(&mut self, obs_id: &ObservationId, now: i64) {
+        if let Some(entry) = self.entries.get_mut(obs_id) {
+            entry.next_discover_at = now;
+        }
     }
 
-    /// 用户点了"立刻找一次新的" / "立刻回查一次"。
-    pub fn run_now(&mut self, obs_id: &ObservationId, kind: ObserveKind, now: i64) {
-        if let Some(entry) = self.entries.get_mut(obs_id) {
-            entry.set_next_at(kind, now);
-        }
+    /// 该去问一遍"谁到点了"没有。
+    #[must_use]
+    pub fn sweep_due(&self, now: i64) -> bool {
+        now >= self.next_sweep_at
+    }
+
+    #[must_use]
+    pub fn next_sweep_at(&self) -> i64 {
+        self.next_sweep_at
+    }
+
+    /// 扫完了(哪怕一条到期的都没有),把下一次排上。
+    pub fn defer_sweep(&mut self, now: i64) {
+        self.next_sweep_at = now + SWEEP_INTERVAL_SECS as i64;
+    }
+
+    /// 用户点了"立刻回查一次":下一圈主循环就扫。
+    pub fn sweep_now(&mut self, now: i64) {
+        self.next_sweep_at = now;
     }
 
     /// 换一条 discover 地板。观察或搜索的条数一变就重算一次。
@@ -217,12 +196,12 @@ impl ObserveScheduler {
 /// 要跑 `窗口 / 间隔` 轮。所以一轮能花的次数是
 /// `预算 ÷ 观察条数 ÷ 2 ÷ 轮数`,再乘上"一次 fetch 带几个 id"就是挂单条数。
 ///
-/// **÷2 是给 discover 和 recheck 各留一半**:两边花的是同一份抓取额度,谁也
-/// 不能把对方饿死 —— discover 抓新面孔、recheck 查谁没了,少了哪一边这条
-/// 观察都不成立。
+/// **÷2 是给"抓新面孔"和"回查在册的"各留一半**:两边花的是同一份抓取额度,
+/// 谁也不能把对方饿死 —— 一边记下新货、一边看它们最后怎么样了,少了哪一边
+/// 这条观察都不成立。
 ///
-/// 默认那份配置下这条上限基本碰不到(recheck:一轮 830 条;discover:一轮
-/// 60 条),它是给"加了十条观察 + 每条几百件在册"那天兜底的。
+/// 默认那份配置下这条上限基本碰不到,它是给"加了十条观察 + 每条几百件在册"
+/// 那天兜底的。
 #[must_use]
 pub fn fetch_listing_cap(
     observations: usize,
@@ -251,31 +230,18 @@ mod observe_tests {
 
     fn scheduler() -> ObserveScheduler {
         let mut scheduler = ObserveScheduler::new();
-        scheduler.upsert(obs("a"), 600, 7_200, 1_000, 0, 1);
+        scheduler.upsert(obs("a"), 600, 1_000, 0, 1);
         scheduler
     }
 
-    /// 刚加的观察:discover 立刻,recheck 等一个完整间隔 —— 手里一条在册的
-    /// 挂单都没有,立刻回查是查一个空表。
+    /// 刚加的观察立刻 discover 一次:秒推还没连上之前,那是它唯一的入口。
     #[test]
-    fn a_new_observation_discovers_now_and_rechecks_one_interval_later() {
+    fn a_new_observation_discovers_now() {
         let scheduler = scheduler();
         let entry = scheduler.entry(&obs("a")).unwrap();
         assert_eq!(entry.next_discover_at, 1_000);
-        assert_eq!(entry.next_recheck_at, 1_000 + 7_200);
-        assert_eq!(scheduler.next_deadline(), Some(1_000));
-        assert_eq!(
-            scheduler.due(1_000),
-            vec![(obs("a"), ObserveKind::Discover)]
-        );
-        assert_eq!(
-            scheduler.due(8_200),
-            vec![
-                (obs("a"), ObserveKind::Discover),
-                (obs("a"), ObserveKind::Recheck)
-            ],
-            "早该做的排前面"
-        );
+        assert_eq!(scheduler.due(1_000), vec![obs("a")]);
+        assert!(scheduler.due(999).is_empty());
     }
 
     /// 多条观察错开起跑,理由同轮询:三条同一秒醒来,网关会连着发三次 search。
@@ -283,48 +249,67 @@ mod observe_tests {
     fn several_observations_stagger_their_first_discover() {
         let mut scheduler = ObserveScheduler::new();
         for (index, id) in ["a", "b", "c"].iter().enumerate() {
-            scheduler.upsert(obs(id), 600, 7_200, 1_000, index, 3);
+            scheduler.upsert(obs(id), 600, 1_000, index, 3);
         }
         assert_eq!(scheduler.entry(&obs("a")).unwrap().next_discover_at, 1_000);
         assert_eq!(scheduler.entry(&obs("b")).unwrap().next_discover_at, 1_200);
         assert_eq!(scheduler.entry(&obs("c")).unwrap().next_discover_at, 1_400);
         assert_eq!(scheduler.len(), 3);
+        // 早该做的排前面。
+        assert_eq!(scheduler.due(1_400), vec![obs("a"), obs("b"), obs("c")]);
     }
 
-    /// 两条时间线各走各的:发了 discover 不该把 recheck 往后推。
+    /// 兜底轮询和回查扫描是两条独立的线:发了 discover 不该把扫描往后推,
+    /// 反过来也一样。
     #[test]
-    fn the_two_timelines_move_independently() {
+    fn the_backstop_poll_and_the_sweep_move_independently() {
         let mut scheduler = scheduler();
-        scheduler.defer(&obs("a"), ObserveKind::Discover, 1_000);
-        let entry = scheduler.entry(&obs("a")).unwrap();
-        assert_eq!(entry.next_discover_at, 1_600);
-        assert_eq!(entry.next_recheck_at, 8_200, "recheck 没被碰");
+        assert!(scheduler.sweep_due(1_000), "开机第一圈就该扫一次");
 
-        scheduler.reschedule(&obs("a"), ObserveKind::Recheck, 9_000);
-        let entry = scheduler.entry(&obs("a")).unwrap();
-        assert_eq!(entry.next_discover_at, 1_600);
-        assert_eq!(entry.next_recheck_at, 9_000 + 7_200);
-
-        // 用户点"立刻查一次"只动那一条线。
-        scheduler.run_now(&obs("a"), ObserveKind::Recheck, 9_500);
+        scheduler.defer_sweep(1_000);
+        assert!(!scheduler.sweep_due(1_059));
+        assert!(scheduler.sweep_due(1_060), "一分钟一次");
         assert_eq!(
-            scheduler.due(9_500),
-            vec![
-                (obs("a"), ObserveKind::Discover),
-                (obs("a"), ObserveKind::Recheck)
-            ]
+            scheduler.entry(&obs("a")).unwrap().next_discover_at,
+            1_000,
+            "扫描没碰 discover"
         );
+
+        scheduler.defer(&obs("a"), 1_000);
+        assert_eq!(scheduler.entry(&obs("a")).unwrap().next_discover_at, 1_600);
+        assert_eq!(scheduler.next_sweep_at(), 1_060, "discover 没碰扫描");
+
+        // 用户点"立刻回查一次":下一圈就扫。
+        scheduler.sweep_now(1_010);
+        assert!(scheduler.sweep_due(1_010));
+        // 而"立刻找一次新的"只动 discover 那条线。
+        scheduler.defer_sweep(1_010);
+        scheduler.run_now(&obs("a"), 1_020);
+        assert_eq!(scheduler.due(1_020), vec![obs("a")]);
+        assert!(!scheduler.sweep_due(1_020));
+    }
+
+    /// 主循环该睡到哪一刻:两条线里早的那个。
+    #[test]
+    fn the_deadline_is_the_earlier_of_the_two_lines() {
+        let mut scheduler = ObserveScheduler::new();
+        assert_eq!(scheduler.next_deadline(), None, "没有观察就没有事要做");
+
+        scheduler.upsert(obs("a"), 600, 1_000, 0, 1);
+        scheduler.defer_sweep(1_000);
+        assert_eq!(scheduler.next_deadline(), Some(1_000), "discover 更早");
+        scheduler.defer(&obs("a"), 1_000);
+        assert_eq!(scheduler.next_deadline(), Some(1_060), "现在是扫描更早");
     }
 
     /// 已经在表上的观察只换间隔,不重排 —— 改个备注名不该让所有观察重新排队。
     #[test]
-    fn upserting_again_only_changes_the_intervals() {
+    fn upserting_again_only_changes_the_interval() {
         let mut scheduler = scheduler();
-        scheduler.defer(&obs("a"), ObserveKind::Discover, 1_000);
-        scheduler.upsert(obs("a"), 900, 10_800, 5_000, 0, 1);
+        scheduler.defer(&obs("a"), 1_000);
+        scheduler.upsert(obs("a"), 900, 5_000, 0, 1);
         let entry = scheduler.entry(&obs("a")).unwrap();
         assert_eq!(entry.discover_interval, 900);
-        assert_eq!(entry.recheck_interval, 10_800);
         assert_eq!(entry.next_discover_at, 1_600, "已经排好的这一轮不该被挪动");
     }
 
@@ -336,17 +321,17 @@ mod observe_tests {
         // 三条搜索 + 两条观察一起分 6 小时 299 次:地板 362 秒。
         scheduler.set_discover_floor(crate::poll::budget_floor_interval(5, 299, 21_600));
         assert_eq!(scheduler.discover_floor(), 362);
-        scheduler.upsert(obs("a"), 300, 7_200, 0, 0, 1);
+        scheduler.upsert(obs("a"), 300, 0, 0, 1);
         assert_eq!(scheduler.entry(&obs("a")).unwrap().discover_interval, 362);
 
         // 后来又加了一条观察,地板抬高:已经在表上的那条也跟着抬。
         scheduler.set_discover_floor(600);
         assert_eq!(scheduler.entry(&obs("a")).unwrap().discover_interval, 600);
-        scheduler.defer(&obs("a"), ObserveKind::Discover, 1_000);
+        scheduler.defer(&obs("a"), 1_000);
         assert_eq!(scheduler.entry(&obs("a")).unwrap().next_discover_at, 1_600);
 
         // 填得比地板还慢就听用户的。
-        scheduler.upsert(obs("b"), 3_600, 7_200, 0, 0, 1);
+        scheduler.upsert(obs("b"), 3_600, 0, 0, 1);
         assert_eq!(scheduler.entry(&obs("b")).unwrap().discover_interval, 3_600);
     }
 
@@ -358,17 +343,19 @@ mod observe_tests {
         assert_eq!(scheduler.next_deadline(), None);
         assert!(scheduler.due(9_999).is_empty());
         // 不在表上的观察做什么都不该 panic。
-        scheduler.defer(&obs("a"), ObserveKind::Discover, 0);
-        scheduler.reschedule(&obs("a"), ObserveKind::Recheck, 0);
-        scheduler.run_now(&obs("a"), ObserveKind::Discover, 0);
+        scheduler.defer(&obs("a"), 0);
+        scheduler.run_now(&obs("a"), 0);
     }
 
     /// 抓取额度的分账。默认配置下这条上限碰不到,它是给"十条观察"那天兜底的。
     #[test]
     fn the_fetch_cap_splits_the_budget_between_discover_and_recheck() {
-        // 一条观察、6 小时 499 次的一半给 recheck、两小时一轮(3 轮):
-        // 499/1/2 = 249,249/3 = 83 次 fetch,一次 10 条 = 830 条。
-        assert_eq!(fetch_listing_cap(1, 7_200, 499, 21_600, 10), 830);
+        // 一条观察、6 小时 499 次的一半给回查、一分钟扫一次(360 轮):
+        // 499/1/2 = 249,249/360 除不出一次,兜成一次 fetch = 10 条。
+        assert_eq!(
+            fetch_listing_cap(1, SWEEP_INTERVAL_SECS, 499, 21_600, 10),
+            10
+        );
         // 同一份额度给 discover:10 分钟一轮(36 轮)→ 249/36 = 6 次 = 60 条。
         assert_eq!(fetch_listing_cap(1, 600, 499, 21_600, 10), 60);
         // 十条观察分同一份额度,一轮就只剩 10 条。

@@ -28,11 +28,40 @@ use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use pnd_domain::WatchId;
+use pnd_domain::{ObservationId, WatchId};
 use pnd_storage::LiveState;
 use pnd_trade::live::{LiveConfig, LiveError, LiveMessage, LiveSession, reconnect_delay};
 
 use crate::now_secs;
+
+/// 一条 live 连接是替谁连的。
+///
+/// 蹲价和市场观察用的是**同一条** WebSocket 链路(同一个协议、同样的重连
+/// 阶梯、同一份"最多几条"的额度),区别只在推来的 id 交给谁:蹲价拿去判价
+/// 报警,观察拿去记账。所以 worker 只认这一个标识,不认它背后是哪一种东西。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LiveTarget {
+    Watch(WatchId),
+    Observation(ObservationId),
+}
+
+impl LiveTarget {
+    /// 退避抖动和线程名要的那个字符串。同一条搜索每次算出来一样,
+    /// 所以这里必须是 id 本身,不能带上"watch/obs"之类的前缀。
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            LiveTarget::Watch(watch_id) => watch_id.as_str(),
+            LiveTarget::Observation(obs_id) => obs_id.as_str(),
+        }
+    }
+}
+
+impl std::fmt::Display for LiveTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// 连上超过这么久,才算"这条连接是好的",下次断线从第一档重新开始退避。
 pub const LIVE_STABLE_SECS: i64 = 60;
@@ -155,13 +184,16 @@ impl LiveRunState {
 pub enum LiveEvent {
     /// 档位变了。
     State {
-        watch_id: WatchId,
+        target: LiveTarget,
         state: LiveRunState,
     },
     /// 服务端推来了新挂单 id。actor 负责按 10 个一批交给网关去 fetch。
-    New { watch_id: WatchId, ids: Vec<String> },
+    New {
+        target: LiveTarget,
+        ids: Vec<String>,
+    },
     /// 带着 cookie 却被拒了 —— 这个 POESESSID 已经不能用了。
-    SessionInvalid { watch_id: WatchId },
+    SessionInvalid { target: LiveTarget },
     /// 一行给用户看的日志(握手失败原因之类)。
     Log(String),
 }
@@ -174,14 +206,14 @@ pub enum LiveEvent {
 ///
 /// 生产用 [`backoff_delay`];测试塞一个"等 5 毫秒"的版本进来,这样"第几次
 /// 重连、退到什么时候"照样验得了,而测试不用真的坐等 5 秒。
-pub type BackoffFn = fn(watch_id: &str, attempt: u32, retry_after: Option<u64>) -> Duration;
+pub type BackoffFn = fn(target: &str, attempt: u32, retry_after: Option<u64>) -> Duration;
 
 /// 第 `attempt` 次重连等多久:5/10/20/40/80/160/300 秒的阶梯(见
 /// [`reconnect_delay`])加上这条搜索自己的抖动;服务端要是明说了
 /// `Retry-After`,取两者的大者 —— 它说的话优先,但也不能比阶梯还急。
 #[must_use]
-pub fn backoff_delay(watch_id: &str, attempt: u32, retry_after: Option<u64>) -> Duration {
-    let ladder = reconnect_delay(attempt, jitter_for(watch_id, attempt));
+pub fn backoff_delay(target: &str, attempt: u32, retry_after: Option<u64>) -> Duration {
+    let ladder = reconnect_delay(attempt, jitter_for(target, attempt));
     match retry_after {
         Some(secs) => ladder.max(Duration::from_secs(secs)),
         None => ladder,
@@ -193,9 +225,9 @@ pub fn backoff_delay(watch_id: &str, attempt: u32, retry_after: Option<u64>) -> 
 /// 用 FNV-1a 哈希而不是随机数:同一条搜索每次算出来一样(测试能钉死一个数),
 /// 不同搜索算出来不一样(五条一起断线不会在同一秒一起扑上去)。
 #[must_use]
-pub fn jitter_for(watch_id: &str, attempt: u32) -> f64 {
+pub fn jitter_for(target: &str, attempt: u32) -> f64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in watch_id
+    for byte in target
         .as_bytes()
         .iter()
         .copied()
@@ -230,16 +262,16 @@ pub fn next_attempt(attempt: u32, connected_secs: i64) -> u32 {
 /// `backoff` 是给测试留的后门(生产值就是 [`backoff_delay`]):测试想验
 /// "第几次重连、退到什么时候",但不想真的坐等 5 秒。
 pub struct LiveWorkerConfig {
-    pub watch_id: WatchId,
+    pub target: LiveTarget,
     pub live: LiveConfig,
     pub backoff: BackoffFn,
 }
 
 impl LiveWorkerConfig {
     #[must_use]
-    pub fn new(watch_id: WatchId, live: LiveConfig) -> LiveWorkerConfig {
+    pub fn new(target: LiveTarget, live: LiveConfig) -> LiveWorkerConfig {
         LiveWorkerConfig {
-            watch_id,
+            target,
             live,
             backoff: backoff_delay,
         }
@@ -248,7 +280,7 @@ impl LiveWorkerConfig {
 
 /// 一条 worker 线程的遥控器。
 pub struct LiveWorkerHandle {
-    watch_id: WatchId,
+    target: LiveTarget,
     cancel: Arc<AtomicBool>,
     /// 线程自己走完之后翻成 true。用来实现"最多等这么久"的 join。
     finished: Arc<AtomicBool>,
@@ -257,8 +289,8 @@ pub struct LiveWorkerHandle {
 
 impl LiveWorkerHandle {
     #[must_use]
-    pub fn watch_id(&self) -> &WatchId {
-        &self.watch_id
+    pub fn target(&self) -> &LiveTarget {
+        &self.target
     }
 
     /// 打个招呼让它收摊。**不等** —— 线程可能正卡在一次读超时里(最多 30 秒),
@@ -298,13 +330,13 @@ pub fn spawn_live_worker(
     connector: Arc<dyn LiveConnector>,
     events: Sender<LiveEvent>,
 ) -> LiveWorkerHandle {
-    let watch_id = config.watch_id.clone();
+    let target = config.target.clone();
     let cancel = Arc::new(AtomicBool::new(false));
     let finished = Arc::new(AtomicBool::new(false));
     let thread_cancel = Arc::clone(&cancel);
     let thread_finished = Arc::clone(&finished);
     let join = thread::Builder::new()
-        .name(format!("pnd-live-{}", short_id(watch_id.as_str())))
+        .name(format!("pnd-live-{}", short_id(target.as_str())))
         .spawn(move || {
             // 哨兵先建:worker panic 了也要把"我走了"翻上去,
             // 否则 `stop_and_join` 会白等一个超时。
@@ -313,7 +345,7 @@ pub fn spawn_live_worker(
         })
         .ok();
     LiveWorkerHandle {
-        watch_id,
+        target,
         cancel,
         finished,
         join,
@@ -410,7 +442,7 @@ fn pump(
                     continue;
                 }
                 let sent = events.send(LiveEvent::New {
-                    watch_id: config.watch_id.clone(),
+                    target: config.target.clone(),
                     ids,
                 });
                 if sent.is_err() {
@@ -426,7 +458,7 @@ fn pump(
             Ok(LiveMessage::Subscribed { token }) => {
                 let line = format!(
                     "live {}: server message keys=[\"result\"] result_len={}",
-                    config.watch_id,
+                    config.target,
                     token.chars().count()
                 );
                 if events.send(LiveEvent::Log(line)).is_err() {
@@ -437,7 +469,7 @@ fn pump(
             // `description` 已经是"键名 + 值长度",不是原文(见
             // `pnd_trade::live::describe_live_message`)。
             Ok(LiveMessage::Other(description)) => {
-                let line = format!("live {}: server message {description}", config.watch_id);
+                let line = format!("live {}: server message {description}", config.target);
                 if events.send(LiveEvent::Log(line)).is_err() {
                     stream.close();
                     return PumpEnd::Cancelled;
@@ -465,7 +497,7 @@ fn hold(
             Duration::from_secs(CLOUDFLARE_HOLD_SECS as u64),
         )
     } else {
-        let wait = (config.backoff)(config.watch_id.as_str(), attempt, error.retry_after());
+        let wait = (config.backoff)(config.target.as_str(), attempt, error.retry_after());
         (
             LiveRunState::Backoff {
                 until: now + wait.as_secs() as i64,
@@ -476,7 +508,7 @@ fn hold(
     };
 
     if events
-        .send(LiveEvent::Log(format!("live {}: {error}", config.watch_id)))
+        .send(LiveEvent::Log(format!("live {}: {error}", config.target)))
         .is_err()
     {
         return false;
@@ -497,17 +529,17 @@ fn report_session_problem(
     if config.live.has_session() {
         let _ = events.send(LiveEvent::Log(format!(
             "live {}: the trade site refused the session ({error})",
-            config.watch_id
+            config.target
         )));
         let _ = events.send(LiveEvent::SessionInvalid {
-            watch_id: config.watch_id.clone(),
+            target: config.target.clone(),
         });
         return;
     }
     // 匿名重试多少次都是同一个 401,退避阶梯在这里只是空转。
     let _ = events.send(LiveEvent::Log(format!(
         "live {}: live search needs a POESESSID — polling continues anonymously",
-        config.watch_id
+        config.target
     )));
     let _ = emit(
         events,
@@ -519,7 +551,7 @@ fn report_session_problem(
 fn emit(events: &Sender<LiveEvent>, config: &LiveWorkerConfig, state: LiveRunState) -> bool {
     events
         .send(LiveEvent::State {
-            watch_id: config.watch_id.clone(),
+            target: config.target.clone(),
             state,
         })
         .is_ok()
@@ -637,7 +669,7 @@ pub(crate) mod live_worker_tests {
     }
 
     /// 测试里的退避:阶梯的账照记(状态里那个 `attempt` 还是真的),但只等 5 毫秒。
-    fn fast_backoff(_watch_id: &str, _attempt: u32, _retry_after: Option<u64>) -> Duration {
+    fn fast_backoff(_target: &str, _attempt: u32, _retry_after: Option<u64>) -> Duration {
         Duration::from_millis(5)
     }
 
@@ -651,7 +683,7 @@ pub(crate) mod live_worker_tests {
 
     fn worker_config(watch: &str, session: &str) -> LiveWorkerConfig {
         LiveWorkerConfig {
-            watch_id: WatchId(watch.to_string()),
+            target: LiveTarget::Watch(WatchId(watch.to_string())),
             live: live_config(session),
             backoff: fast_backoff,
         }
