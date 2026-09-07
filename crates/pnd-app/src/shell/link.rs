@@ -229,16 +229,18 @@ impl AppShell {
                 // 命中会往 alerts 表里写行,但写的是 actor 线程,等它落盘再读。
                 self.refresh_alerts_soon();
             }
-            // 市场观察页还没做(Phase 3 step 3):先只记一笔日志,把事件
-            // 从通道里抽干净。做页面的那一步会把这两条接到表格上。
+            // 状态整份存下来,观察表下一拍自己重建。这条事件只带"跑到哪一步",
+            // 不带统计结果 —— 那几张表在库里,见下一条。
             RuntimeEvent::ObservationStatus { obs_id, status } => {
-                self.push_log(format!(
-                    "observation {obs_id}: {} active / {} gone",
-                    status.active, status.gone
-                ));
+                self.observation_status.insert(obs_id, status);
+                self.observations_dirty = true;
             }
+            // 库里的数据变了。只有画在屏幕上的那一条值得重读:别的观察改了什么,
+            // 用户选到它的时候自然会读一次。
             RuntimeEvent::ObservationChanged { obs_id } => {
-                self.push_log(format!("observation {obs_id}: data changed"));
+                if self.observe.selected.as_ref() == Some(&obs_id) {
+                    self.refresh_observation_soon();
+                }
             }
             RuntimeEvent::SessionInvalid => {
                 self.push_log("runtime: POESESSID rejected, now anonymous".to_owned());
@@ -660,6 +662,29 @@ impl AppShell {
             .is_some_and(|at| Instant::now() >= at)
         {
             self.refresh_alerts();
+            return true;
+        }
+        false
+    }
+
+    // ---- 市场观察 ----------------------------------------------------
+
+    /// 过一会儿再重读选中那条观察。
+    ///
+    /// 理由同提醒历史:写库的是 actor 线程,`ObservationChanged` 到手的那一刻
+    /// 它多半刚提交完,但一轮 discover 会连着发好几条 —— 延迟一点顺便把它们
+    /// 合成一次读。
+    pub(crate) fn refresh_observation_soon(&mut self) {
+        self.observe_refresh_at = Some(Instant::now() + WRITE_SETTLE);
+    }
+
+    pub(crate) fn refresh_observation_if_due(&mut self) -> bool {
+        if self
+            .observe_refresh_at
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            self.observe_refresh_at = None;
+            self.reload_observation();
             return true;
         }
         false

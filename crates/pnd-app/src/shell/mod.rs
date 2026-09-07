@@ -27,9 +27,11 @@ use gpui_component::select::{SearchableVec, SelectEvent, SelectItem, SelectState
 use gpui_component::table::{TableEvent, TableState};
 use gpui_component::{IndexPath, Selectable as _, Sizable as _, Size, StyledExt as _};
 
-use pnd_domain::{CurrencyRates, WatchId};
+use pnd_domain::{CurrencyRates, ObservationId, WatchId};
 use pnd_platform_win::{AlertCardService, LoginService};
-use pnd_runtime::{MatchedListing, RuntimeHandle, SamplerHandle, WatchStatus, now_secs};
+use pnd_runtime::{
+    MatchedListing, ObservationStatus, RuntimeHandle, SamplerHandle, WatchStatus, now_secs,
+};
 use pnd_storage::{AlertRow, NinjaStore, WatchStore};
 use pnd_trade::BucketUsage;
 
@@ -46,21 +48,24 @@ const W_NAV: f32 = 136.0;
 /// 一句话通知("已保存")挂多久。够看清,又不会一直杵在那儿。
 const NOTICE_LIFETIME: Duration = Duration::from_secs(4);
 
-/// 五个页面。顺序就是导航顺序:每天先看蹲价,再看它响过什么,
-/// 然后才是 ninja 那两张榜,设置沉底。
+/// 六个页面。顺序就是导航顺序:每天先看蹲价,再看它响过什么,接着是
+/// 市场观察(它和前两页同属"交易站那一半"),然后才是 ninja 那两张榜,
+/// 设置沉底。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Watches,
     Alerts,
+    Observations,
     NinjaUniques,
     NinjaMods,
     Settings,
 }
 
 impl Page {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Watches,
         Self::Alerts,
+        Self::Observations,
         Self::NinjaUniques,
         Self::NinjaMods,
         Self::Settings,
@@ -70,6 +75,7 @@ impl Page {
         match self {
             Self::Watches => text.nav_watches,
             Self::Alerts => text.nav_alerts,
+            Self::Observations => text.nav_observations,
             Self::NinjaUniques => text.nav_ninja_uniques,
             Self::NinjaMods => text.nav_ninja_mods,
             Self::Settings => text.nav_settings,
@@ -82,6 +88,7 @@ impl Page {
         match self {
             Self::Watches => "nav-watches",
             Self::Alerts => "nav-alerts",
+            Self::Observations => "nav-observations",
             Self::NinjaUniques => "nav-ninja-uniques",
             Self::NinjaMods => "nav-ninja-mods",
             Self::Settings => "nav-settings",
@@ -234,7 +241,8 @@ pub struct AppShell {
     pub(crate) login_phase: LoginPhase,
     /// 登录那一行上的状态字。
     pub(crate) login_line: String,
-    /// 提醒记录页自己的一条库连接(actor 那条在别的线程上,不能共用)。
+    /// 界面这一侧的 `watch.sqlite` 连接(actor 那条在别的线程上,不能共用)。
+    /// 提醒记录页和市场观察页共用它 —— 两页读的是同一个库文件。
     pub(crate) alerts_store: Option<WatchStore>,
     /// ninja 两页自己的一条库连接。采样线程另开一条,WAL 让两边互不打断。
     pub(crate) ninja_store: Option<NinjaStore>,
@@ -249,6 +257,11 @@ pub struct AppShell {
 
     /// 每条搜索现在跑到哪一步。actor 每次状态有变就整份广播,这里只管存最新的。
     pub(crate) watch_status: BTreeMap<WatchId, WatchStatus>,
+    /// 每条市场观察现在跑到哪一步。同上,只管存最新的。
+    ///
+    /// 统计结果**不在**这里面:那几张表动辄几百行,广播一份既大又立刻过时。
+    /// actor 只发一句"这条观察的数据变了",界面自己回库里读(见 `observe`)。
+    pub(crate) observation_status: BTreeMap<ObservationId, ObservationStatus>,
     /// 每条限速策略的用量。键是策略名(`trade-search-request-limit` 这些)。
     pub(crate) budget: BTreeMap<String, Vec<BucketUsage>>,
     /// 每条策略还要等几秒才放行下一封请求。没有这一项 = 现在就能发。
@@ -265,19 +278,37 @@ pub struct AppShell {
     pub(crate) alert_rows: Vec<AlertRow>,
     /// ninja 缓存在界面这边的那份副本。
     pub(crate) ninja: NinjaData,
+    /// 选中那条观察在库里攒到的东西,同样是一份内存副本。
+    pub(crate) observe: pages::observations::ObservationData,
     /// 新增搜索表单下面那行红字。空串 = 没有错。
     pub(crate) watch_error: String,
+    /// 新增观察表单下面那行红字。
+    pub(crate) obs_error: String,
+    /// 词缀战绩表现在要求至少见过几件。
+    pub(crate) obs_min_samples: u32,
+    /// 挂单流现在看的是哪一栏。
+    pub(crate) obs_stream_tab: pages::observations::StreamTab,
+    /// 删除观察的按钮已经按过第一下了。删掉的东西找不回来,所以要按两下。
+    pub(crate) obs_remove_armed: bool,
+    /// 挂单流那块滚动区。
+    pub(crate) obs_stream_scroll: ScrollHandle,
     /// 表格里刚被选中的那一行,等着填进蹲价表单。
     ///
     /// 单独一个标志的理由和 `ninja_filters_dirty` 一样:写输入框要
     /// `&mut Window`,而发出"选中了第几行"那条事件的订阅回调手上没有窗口。
     pub(crate) watches_form_load: Option<usize>,
+    /// 同上,观察表那一份。选中一行同时是"改这一条"和"下面两块画这一条"。
+    pub(crate) observations_form_load: Option<usize>,
 
-    /// 表格内容要重建了。行是每次整份换掉的,没有这四个标志就得每拍重建。
+    /// 表格内容要重建了。行是每次整份换掉的,没有这几个标志就得每拍重建。
     pub(crate) watches_dirty: bool,
     pub(crate) alerts_dirty: bool,
     pub(crate) uniques_dirty: bool,
     pub(crate) mods_dirty: bool,
+    pub(crate) observations_dirty: bool,
+    pub(crate) obs_mods_dirty: bool,
+    /// 观察页那个词缀类型下拉的选项要重造了(读了新数据,或者换了语言)。
+    pub(crate) obs_filters_dirty: bool,
     /// ninja 那几个下拉的选项要重造了(数据换了或者语言换了)。
     ///
     /// 单独一个标志是因为重造下拉要 `&mut Window`,而 tick 手上没有窗口;
@@ -294,17 +325,23 @@ pub struct AppShell {
     pub(crate) mods_show_all: bool,
     /// 到这个时刻重读一次提醒历史(等 actor 把命令写进库)。
     pub(crate) alerts_refresh_at: Option<Instant>,
+    /// 同上,观察数据那一份:actor 每跑完一轮发一句"变了",这里延迟一点再读。
+    pub(crate) observe_refresh_at: Option<Instant>,
     /// 上一次重建蹲价表时的秒数。倒计时每秒动一次,不必每拍动。
     last_second: i64,
 
     pub(crate) settings_form: pages::settings::SettingsForm,
     pub(crate) watches_form: pages::watches::WatchesForm,
+    pub(crate) observations_form: pages::observations::ObservationsForm,
 
     pub(crate) watches_table: Entity<TableState<SimpleTable>>,
     pub(crate) alerts_table: Entity<TableState<SimpleTable>>,
     pub(crate) uniques_table: Entity<TableState<SimpleTable>>,
     pub(crate) mods_table: Entity<TableState<SimpleTable>>,
+    pub(crate) observations_table: Entity<TableState<SimpleTable>>,
+    pub(crate) obs_mods_table: Entity<TableState<SimpleTable>>,
 
+    pub(crate) obs_kind_select: ChoiceSelect,
     pub(crate) uniques_partition_select: ChoiceSelect,
     pub(crate) mods_class_select: ChoiceSelect,
     pub(crate) mods_slot_select: ChoiceSelect,
@@ -409,6 +446,7 @@ impl AppShell {
 
         let settings_form = pages::settings::SettingsForm::new(&settings, text, window, cx);
         let watches_form = pages::watches::WatchesForm::new(&settings, text, window, cx);
+        let observations_form = pages::observations::ObservationsForm::new(text, window, cx);
 
         let watches_table = new_table(pages::watches::table_content(text), window, cx);
         // 选中一行 = "我要改这一条"。真正把值填进表单要 `&mut Window`,
@@ -423,6 +461,17 @@ impl AppShell {
         let alerts_table = new_table(pages::alerts::table_content(text), window, cx);
         let uniques_table = new_table(pages::ninja_uniques::table_content(text), window, cx);
         let mods_table = new_table(pages::ninja_mods::table_content(text), window, cx);
+        let observations_table = new_table(pages::observations::table_content(text), window, cx);
+        // 选中一行 = "我要看这一条"(顺带把它装进表单)。理由同蹲价那张表:
+        // 真正去填框要 `&mut Window`,这里只记下是第几行。
+        cx.subscribe(&observations_table, |this: &mut AppShell, _, event, cx| {
+            if let TableEvent::SelectRow(row) = event {
+                this.observations_form_load = Some(*row);
+                cx.notify();
+            }
+        })
+        .detach();
+        let obs_mods_table = new_table(pages::observations::mods_table_content(text), window, cx);
 
         // 五个下拉先按空数据造出来:库还没读呢。第一次 render 时
         // `sync_ninja_filters` 会拿真数据把它们重造一遍。
@@ -447,6 +496,16 @@ impl AppShell {
         );
         let mods_kind_select =
             choice_select(pages::ninja_mods::kind_choices(&[], text), "", window, cx);
+        // 观察页那个词缀类型下拉同样从库里长出来,第一次读完数据才有真选项。
+        let obs_kind_select =
+            choice_select(pages::observations::kind_choices(&[], text), "", window, cx);
+        cx.subscribe(&obs_kind_select, |this: &mut AppShell, _, event, cx| {
+            if matches!(event, SelectEvent::Confirm(_)) {
+                this.obs_mods_dirty = true;
+                cx.notify();
+            }
+        })
+        .detach();
 
         // 换一次筛选器 = 换一份要画的行。分区那个还要回库里重查一次:
         // 每个分区的暗金榜和分母都不一样。
@@ -516,6 +575,7 @@ impl AppShell {
             sampler_busy: false,
             sampler_line: String::new(),
             watch_status: BTreeMap::new(),
+            observation_status: BTreeMap::new(),
             budget: BTreeMap::new(),
             budget_next_allowed: BTreeMap::new(),
             session_check_busy: false,
@@ -524,25 +584,40 @@ impl AppShell {
             shown_cards: BTreeMap::new(),
             alert_rows: Vec::new(),
             ninja,
+            observe: pages::observations::ObservationData::default(),
             watch_error: String::new(),
+            obs_error: String::new(),
+            obs_min_samples: pages::observations::DEFAULT_MIN_SAMPLES,
+            obs_stream_tab: pages::observations::StreamTab::default(),
+            obs_remove_armed: false,
+            obs_stream_scroll: ScrollHandle::new(),
             watches_form_load: None,
-            // 四张表现在还是空的(列已经有了):第一拍就会填上真数据。
+            observations_form_load: None,
+            // 六张表现在还是空的(列已经有了):第一拍就会填上真数据。
             watches_dirty: true,
             alerts_dirty: true,
             uniques_dirty: true,
             mods_dirty: true,
+            observations_dirty: true,
+            obs_mods_dirty: true,
+            obs_filters_dirty: true,
             ninja_filters_dirty: true,
             poesessid_dirty: false,
             uniques_show_all: false,
             mods_show_all: false,
             alerts_refresh_at: None,
+            observe_refresh_at: None,
             last_second: 0,
             settings_form,
             watches_form,
+            observations_form,
             watches_table,
             alerts_table,
             uniques_table,
             mods_table,
+            observations_table,
+            obs_mods_table,
+            obs_kind_select,
             uniques_partition_select,
             mods_class_select,
             mods_slot_select,
@@ -554,6 +629,7 @@ impl AppShell {
         }
         shell.refresh_alerts();
         shell.reload_ninja();
+        shell.reload_observation();
         shell
     }
 
@@ -613,6 +689,7 @@ impl AppShell {
     fn tick(&mut self, cx: &mut Context<Self>) {
         let mut changed = self.drain_events(cx);
         changed |= self.refresh_alerts_if_due();
+        changed |= self.refresh_observation_if_due();
 
         // 倒计时("42 秒后再轮询")每秒动一次,不必每拍动。
         let now = now_secs();
@@ -620,6 +697,10 @@ impl AppShell {
             self.last_second = now;
             if self.page == Page::Watches {
                 self.watches_dirty = true;
+            }
+            // 观察页那两条倒计时精确到秒,更需要每秒重画一次。
+            if self.page == Page::Observations {
+                self.observations_dirty = true;
             }
         }
 
@@ -637,6 +718,14 @@ impl AppShell {
         }
         if self.mods_dirty {
             self.rebuild_mods_table(cx);
+            changed = true;
+        }
+        if self.observations_dirty {
+            self.rebuild_observations_table(cx);
+            changed = true;
+        }
+        if self.obs_mods_dirty {
+            self.rebuild_obs_mods_table(cx);
             changed = true;
         }
 
@@ -658,6 +747,10 @@ impl AppShell {
         // 翻到提醒记录页就重读一次:上一次读可能是几分钟前的事了。
         if page == Page::Alerts {
             self.refresh_alerts();
+        }
+        // 观察页同理:离开这一页期间 actor 照样在往库里写。
+        if page == Page::Observations {
+            self.reload_observation();
         }
     }
 
@@ -714,6 +807,37 @@ impl AppShell {
             self.text(),
         );
         self.mods_table.update(cx, |state, cx| {
+            state.delegate_mut().set_content(content);
+            state.refresh(cx);
+        });
+    }
+
+    /// 观察表 = 设置里的观察列表 × actor 广播的运行状态。
+    fn rebuild_observations_table(&mut self, cx: &mut Context<Self>) {
+        self.observations_dirty = false;
+        let content = pages::observations::table_content_for(
+            &self.settings,
+            &self.observation_status,
+            self.text(),
+            now_secs(),
+        );
+        self.observations_table.update(cx, |state, cx| {
+            state.delegate_mut().set_content(content);
+            state.refresh(cx);
+        });
+    }
+
+    /// 词缀战绩表 = 选中那条观察的聚合结果,按类型和样本数筛一遍。
+    fn rebuild_obs_mods_table(&mut self, cx: &mut Context<Self>) {
+        self.obs_mods_dirty = false;
+        let kind = selected_value(&self.obs_kind_select, cx);
+        let content = pages::observations::mods_table_content_for(
+            &self.observe.mods,
+            &kind,
+            self.obs_min_samples,
+            self.text(),
+        );
+        self.obs_mods_table.update(cx, |state, cx| {
             state.delegate_mut().set_content(content);
             state.refresh(cx);
         });
@@ -794,15 +918,20 @@ impl AppShell {
         self.language = self.settings.ui_language.clone();
         let text = self.text();
 
-        // 四张表连行带列一起重建(表头和格子里的状态词都跟着语言走),
-        // 走各自的 rebuild;ninja 那几个下拉交给 `sync_ninja_filters`。
+        // 六张表连行带列一起重建(表头和格子里的状态词都跟着语言走),
+        // 走各自的 rebuild;那几个下拉交给 `sync_ninja_filters` 和
+        // `sync_observation_form`。
         self.watches_dirty = true;
         self.alerts_dirty = true;
         self.uniques_dirty = true;
         self.mods_dirty = true;
+        self.observations_dirty = true;
+        self.obs_mods_dirty = true;
+        self.obs_filters_dirty = true;
         self.ninja_filters_dirty = true;
 
         self.watches_form.relabel(&self.settings, text, window, cx);
+        self.observations_form.relabel(text, window, cx);
         self.settings_form.relabel(&self.settings, text, window, cx);
     }
 
@@ -963,11 +1092,13 @@ impl Render for AppShell {
         self.sync_ninja_filters(window, cx);
         self.sync_poesessid_field(window, cx);
         self.sync_watch_form(window, cx);
+        self.sync_observation_form(window, cx);
         let text = self.text();
 
         let body = match self.page {
             Page::Watches => self.render_watches(cx),
             Page::Alerts => self.render_alerts(cx),
+            Page::Observations => self.render_observations(cx),
             Page::NinjaUniques => self.render_ninja_uniques(cx),
             Page::NinjaMods => self.render_ninja_mods(cx),
             Page::Settings => self.render_settings(cx),

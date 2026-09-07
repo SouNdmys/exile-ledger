@@ -12,6 +12,7 @@
 pub mod alerts;
 pub mod ninja_mods;
 pub mod ninja_uniques;
+pub mod observations;
 pub mod settings;
 pub mod watches;
 
@@ -318,6 +319,45 @@ mod pages_tests {
         ninja_mods::table_content_for(&stats, "BodyArmour", "", "", false, text)
     }
 
+    /// 一条观察 + 它的运行状态,拿来量观察表。
+    fn observation_content(text: &'static i18n::Text) -> TableContent {
+        let settings = AppSettings {
+            observations: vec![pnd_settings::ObservationEntry {
+                id: pnd_domain::ObservationId("o-1".to_string()),
+                label: "Precursor Tablets".to_string(),
+                league: "Forbidden Rites".to_string(),
+                ..pnd_settings::ObservationEntry::default()
+            }],
+            ..AppSettings::default()
+        };
+        let status = BTreeMap::from([(
+            pnd_domain::ObservationId("o-1".to_string()),
+            pnd_runtime::ObservationStatus {
+                active: 42,
+                gone: 17,
+                next_recheck_at: Some(1_000_090),
+                ..pnd_runtime::ObservationStatus::default()
+            },
+        )]);
+        observations::table_content_for(&settings, &status, text, 1_000_000)
+    }
+
+    /// 一条词缀战绩,拿来量观察页那张聚合表。
+    fn observation_mod_content(text: &'static i18n::Text) -> TableContent {
+        let outcomes = vec![pnd_storage::ModOutcome {
+            template: "+# to maximum Life".to_string(),
+            mod_kind: "explicit".to_string(),
+            seen: 30,
+            gone: 22,
+            sold_likely: 20,
+            currency: "exalted".to_string(),
+            median_gone_price_milli: Some(12_500),
+            median_active_price_milli: Some(20_000),
+            median_hours_alive: Some(3.5),
+        }];
+        observations::mods_table_content_for(&outcomes, "", 1, text)
+    }
+
     /// 一条提醒历史,拿来量提醒表。
     fn alert_content(text: &'static i18n::Text) -> TableContent {
         let rows = vec![AlertRow {
@@ -350,6 +390,8 @@ mod pages_tests {
             for (name, content) in [
                 ("watches", watch_content(text)),
                 ("alerts", alert_content(text)),
+                ("observations", observation_content(text)),
+                ("observation mods", observation_mod_content(text)),
                 ("uniques", unique_content(text)),
                 ("mods", mod_content(text)),
             ] {
@@ -406,6 +448,8 @@ mod pages_tests {
             let text = i18n::text(language);
             assert_eq!(watch_content(text).rows.len(), 1);
             assert_eq!(alert_content(text).rows.len(), 1);
+            assert_eq!(observation_content(text).rows.len(), 1);
+            assert_eq!(observation_mod_content(text).rows.len(), 1);
             assert_eq!(unique_content(text).rows.len(), 1);
             assert_eq!(mod_content(text).rows.len(), 1);
         }
