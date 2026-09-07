@@ -1537,7 +1537,8 @@ impl RuntimeActor {
                 // 认成 `CloudflareHold` 了,换新 token 也照样被拦。)
                 let refreshed = self.hideout.get(&alert_id).is_some_and(|f| f.refreshed);
                 if refreshed {
-                    let outcome = hideout_retry_exhausted(status, &listing_id, &excerpt);
+                    let outcome =
+                        hideout_retry_exhausted(status, &listing_id, &excerpt, self.session_ok);
                     self.finish_hideout(alert_id, outcome);
                 } else {
                     self.refresh_hideout_token(alert_id);
@@ -1991,21 +1992,39 @@ fn looks_like_a_stale_token(status: u16) -> bool {
 
 /// 换过 token 还是被拒:这是最后一句话,所以必须说清下一步能做什么。
 ///
-/// 503 和 401/403 给的建议不一样,因为它们说的根本不是一件事:503 是
-/// "服务端这会儿不接这一单"(多半是你自己的游戏客户端不在城里),
-/// 401/403 是"它不认你这个人"。
-fn hideout_retry_exhausted(status: u16, listing_id: &str, excerpt: &str) -> HideoutOutcome {
+/// 三条路,因为它们说的根本不是一件事:
+///
+/// - **503** = "服务端这会儿不接这一单",多半是你自己的游戏客户端不在城里。
+/// - **401/403 而会话确实已经被拒过**(`session_ok = false`)= 它真的不认你了,
+///   换一个新的 cookie。
+/// - **401/403 可会话还好好的** = 别再让人去换 cookie。2026-09-07 那次真跑
+///   就是这一种:测试会话过了、live 连着、轮询正常,同一个 cookie 上的
+///   search 和 fetch 都好好的,唯独这个 POST 回 403。换 cookie 一次也修不好,
+///   因为坏的根本不是 cookie —— 当前的猜想是这封请求没被当成"从网站发出的"
+///   (见 `pnd-trade` 里 `TradeClient::whisper` 的注释)。
+///
+/// 早先这里不分会话死活,一律说"POESESSID 多半失效了"。那句话会把人送进
+/// 一个换不完的循环:换一个新 cookie、还是 403、再换一个。
+fn hideout_retry_exhausted(
+    status: u16,
+    listing_id: &str,
+    excerpt: &str,
+    session_ok: bool,
+) -> HideoutOutcome {
     let advice = if status == 503 {
-        "check that your own game client is logged in and standing in a town or hideout"
+        ", so check that your own game client is logged in and standing in a town or hideout"
+    } else if session_ok {
+        ", and the session itself still works — the trade site is rejecting the travel request \
+         as not coming from the website (see the whisper doc comment in pnd-trade)"
     } else {
-        "the POESESSID is probably no longer valid — paste a fresh one into settings"
+        ", so the POESESSID is probably no longer valid — paste a fresh one into settings"
     };
     let (reason, detail) = excerpt_parts(excerpt);
     HideoutOutcome::Failed {
         status,
         message: format!(
             "{reason}the trade site answered {status} to both travel requests for listing \
-             {listing_id} — a fresh token did not help, so {advice}{detail}"
+             {listing_id} — a fresh token did not help{advice}{detail}"
         ),
     }
 }
@@ -3083,8 +3102,9 @@ mod actor_tests {
         }
     }
 
-    /// 换过 token 还是 403:停手。而且那句话要说"会话可能不认你了",
-    /// 不是让人去看自己站在哪儿 —— 403 和 503 的下一步完全不同。
+    /// 换过 token 还是 403:停手。而且那句话不能让人去看自己站在哪儿
+    /// (那是 503 的事),也不能在会话明明还好好的时候甩锅给 cookie ——
+    /// 这一路上没有任何一个响应说过会话不好,所以 `session_ok` 还是 true。
     #[test]
     fn two_403s_give_up_and_never_post_a_third_time() {
         let (transport, log) = FakeTrade::new();
@@ -3110,7 +3130,17 @@ mod actor_tests {
         // 服务端说的那句话排在最前面:后面的模板被裁掉也没关系,它不能。
         assert!(message.starts_with("GGG error 6: Forbidden"), "{message}");
         assert!(message.contains("both travel requests"), "{message}");
-        assert!(message.contains("POESESSID"), "{message}");
+        // 会话是好的,所以这句话要指向"这封请求被当成不是从网站发的",
+        // 而不是让人一遍遍去换 POESESSID —— 换多少个都没用。
+        assert!(
+            message.contains("the session itself still works"),
+            "{message}"
+        );
+        assert!(message.contains("not coming from the website"), "{message}");
+        assert!(
+            !message.contains("no longer valid"),
+            "会话没坏就别说它坏了:{message}"
+        );
         assert!(
             !message.contains("town or hideout"),
             "403 不是'你不在城里':{message}"
@@ -3162,6 +3192,50 @@ mod actor_tests {
             unreachable!()
         };
         assert!(message.ends_with(": upstream exploded"), "{message}");
+    }
+
+    /// 最后那句建议要看会话的死活。三条路各说各的:
+    /// 会话还好好的 403 说"这封请求被当成不是从网站发的",会话确实被拒过的
+    /// 403 才说"换个 cookie",503 谁都不提、只让人看自己的游戏客户端。
+    #[test]
+    fn the_last_word_on_a_403_depends_on_whether_the_session_still_works() {
+        let message = |status, session_ok| {
+            let HideoutOutcome::Failed { message, .. } =
+                hideout_retry_exhausted(status, "listing-9", "", session_ok)
+            else {
+                unreachable!()
+            };
+            message
+        };
+
+        // 会话是好的:别让人去换一个换了也没用的 cookie。
+        let healthy = message(403, true);
+        assert!(
+            healthy.contains("the session itself still works"),
+            "{healthy}"
+        );
+        assert!(healthy.contains("not coming from the website"), "{healthy}");
+        assert!(!healthy.contains("no longer valid"), "{healthy}");
+
+        // 会话真的被拒过了:那句老建议还是对的。
+        let dead = message(403, false);
+        assert!(
+            dead.ends_with(
+                "a fresh token did not help, so the POESESSID is probably \
+                 no longer valid — paste a fresh one into settings"
+            ),
+            "{dead}"
+        );
+        assert_eq!(message(401, false), dead.replace("403", "401"));
+
+        // 503 和会话没关系,两种状态下说的都是同一句。
+        let offline = message(503, true);
+        assert!(
+            offline.contains("standing in a town or hideout"),
+            "{offline}"
+        );
+        assert!(!offline.contains("POESESSID"), "{offline}");
+        assert_eq!(message(503, false), offline);
     }
 
     /// 事件流里的每一句日志。失败的原因走这条路 —— 卡片脚注只放得下
@@ -3331,7 +3405,9 @@ mod actor_tests {
             panic!("expected a Failed, got {outcomes:#?}");
         };
         assert_eq!(*status, 403, "状态码不能被抹成 0");
-        assert!(message.contains("POESESSID"), "{message}");
+        // 这一路上会话一次都没被拒过,所以最后那句建议说的是请求本身,
+        // 不是 cookie(见 `the_last_word_on_a_403_...`)。
+        assert!(message.contains("not coming from the website"), "{message}");
         assert!(message.contains("Forbidden"), "body 那句话要带上:{message}");
         assert!(
             !message.contains("secret-jwt-value"),

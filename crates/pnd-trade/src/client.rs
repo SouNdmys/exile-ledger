@@ -22,6 +22,9 @@ use crate::rate_limit::{RateHeaders, parse_rate_headers};
 /// 交易站 API 的根路径。poe2 的接口在 `trade2` 下,和 poe1 的 `trade` 是两套。
 const API_BASE: &str = "https://www.pathofexile.com/api/trade2";
 
+/// 浏览器在同源请求上会带的 `Origin`。只有 whisper 用得着(见 [`TradeClient::whisper`])。
+const ORIGIN: &str = "https://www.pathofexile.com";
+
 /// 一次请求的总时限(连接 + 传输)。挂在一个假死的连接上没有意义,
 /// 而且网关是单线程串行的,一条卡住就是整条队列卡住。
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -249,16 +252,25 @@ impl TradeClient {
     ///
     /// # 这几个头是猜的吗
     ///
-    /// 不是猜的,但也**没有和官网逐字比对过**。计划里核实过的只有地址和
+    /// 一半是,而且**没有和官网逐字比对过**。计划里核实过的只有地址和
     /// 请求体(`{"token":…,"continue":true}`)以及"要带 Cookie";
     /// `Content-Type`/`Accept`/`User-Agent`/`Referer` 是照着 search 和 fetch
     /// 那两个已经跑通的接口来的,同一套服务端、同一套 Cloudflare 规则。
     ///
-    /// 2026-09-07 试着匿名去拿官网那份 JS 来对一遍,拿不到:
-    /// `https://www.pathofexile.com/trade2/search/poe2/Standard` 回 403
+    /// `Origin` 和 `X-Requested-With` 这两个是 2026-09-07 之后加的,**它们是
+    /// 一个猜想,不是已核实的事实**。那天一次真跑:会话是好的(测试会话过了,
+    /// 限速规则里有 `Account`,live 连着,轮询也正常),同一个 cookie 上的
+    /// search 和 fetch 都好好的,唯独这个 POST 回了
+    /// `403 {"error":{"code":6,"message":"Forbidden"}}`。cookie 既然没问题,
+    /// 剩下最像的解释就是这个"会改变状态"的接口上有 CSRF 防护:浏览器发这种
+    /// POST 时一定会带 `Origin`,而我们以前一个都不带。`X-Requested-With`
+    /// 是同一套 XHR 身份里的另一半。
+    ///
+    /// 为什么还是猜:官网那份 JS 拿不到来对照 ——
+    /// `https://www.pathofexile.com/trade2/search/poe2/Standard` 匿名去读回 403
     /// (Cloudflare),而 CDN 上的 bundle 名字要先读到那张 HTML 才知道。
-    /// 所以**没有**照猜测加过任何头(比如 `X-Requested-With`);哪天真要动
-    /// 这里的头,先想办法拿到官网那份 JS,别照感觉加。
+    /// 主人以后会在浏览器 DevTools 里把官网真实的那一封请求抄下来;在那之前
+    /// 别再照感觉往这里加头,以那份抄件为准。
     pub fn whisper(
         &self,
         token: &str,
@@ -266,15 +278,31 @@ impl TradeClient {
         referer: &str,
     ) -> Result<TradeResponse, TransportError> {
         let body = json!({ "token": token, "continue": true }).to_string();
-        let request = self
-            .agent
+        collect(self.whisper_request(session, referer).send(body.as_str()))
+    }
+
+    /// 把 whisper 的请求拼好但不发。
+    ///
+    /// 分出来只为一件事:让"到底带了哪些头"在测试里看得见。不然那几个头
+    /// 只有真发一次请求才验证得了,而这个接口恰恰是全程序唯一一个我们不能
+    /// 随便试的 —— 它会在游戏里给别人发传送邀请。
+    ///
+    /// 故意不公开:builder 的 `Debug` 会把 Cookie 原样印出来,让它只活在
+    /// 这个文件里,POESESSID 就没有漏出去的路径。
+    fn whisper_request(
+        &self,
+        session: &str,
+        referer: &str,
+    ) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
+        self.agent
             .post(whisper_url())
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header("User-Agent", &self.user_agent)
+            .header("Origin", ORIGIN)
+            .header("X-Requested-With", "XMLHttpRequest")
             .header("Referer", referer)
-            .header("Cookie", cookie(session));
-        collect(request.send(body.as_str()))
+            .header("Cookie", cookie(session))
     }
 }
 
@@ -510,6 +538,27 @@ mod client_tests {
         assert_eq!(ggg_error(""), None);
         // 裁短过的 JSON 解不开 —— 那也该回 None,而不是拼一句半截话。
         assert_eq!(ggg_error(r#"{"error":{"code":6,"messa"#), None);
+    }
+
+    /// whisper 是这个程序唯一一个"会改变状态"的请求,而 2026-09-07 那次真跑里
+    /// 它回了 403(同一个 cookie 上的 search 和 fetch 都好好的)。`Origin` 和
+    /// `X-Requested-With` 是那次 403 的当前猜想(见 [`TradeClient::whisper`]),
+    /// 所以它们必须真的发出去:少一个,下次再 403 就分不清是"头没带"还是
+    /// "这个猜想本来就不对"。原来那几个头一个也不能因此丢掉。
+    #[test]
+    fn a_whisper_request_carries_the_browser_headers() {
+        let client = TradeClient::new("PoeNinjaData/0.1.0".to_string());
+        let referer = "https://www.pathofexile.com/trade2/search/poe2/Standard/abcd1234";
+        let request = client.whisper_request("not-a-real-session", referer);
+        let headers = request.headers_ref().expect("builder has no error");
+
+        assert_eq!(headers["Origin"], "https://www.pathofexile.com");
+        assert_eq!(headers["X-Requested-With"], "XMLHttpRequest");
+        assert_eq!(headers["Content-Type"], "application/json");
+        assert_eq!(headers["Accept"], "application/json");
+        assert_eq!(headers["User-Agent"], "PoeNinjaData/0.1.0");
+        assert_eq!(headers["Referer"], referer);
+        assert_eq!(headers["Cookie"], "POESESSID=not-a-real-session");
     }
 
     #[test]
