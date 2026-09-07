@@ -37,6 +37,7 @@ pub struct SettingsForm {
     pub auto_hide_minutes: Entity<InputState>,
     pub corner: ChoiceSelect,
     pub opacity: Entity<InputState>,
+    pub dismiss_hotkey: Entity<InputState>,
     pub ninja_sample_target: Entity<InputState>,
     pub ninja_refresh_hours: Entity<InputState>,
     pub ninja_request_gap: Entity<InputState>,
@@ -136,6 +137,11 @@ impl SettingsForm {
         );
         let auto_hide_minutes = input(settings.alert.auto_hide_minutes.to_string(), "5", false);
         let opacity = input(settings.alert.opacity.to_string(), "235", false);
+        let dismiss_hotkey = input(
+            settings.alert.dismiss_hotkey.clone(),
+            text.settings_dismiss_hotkey_placeholder,
+            false,
+        );
         let ninja_sample_target = input(settings.ninja.sample_target.to_string(), "2000", false);
         let ninja_refresh_hours = input(settings.ninja.refresh_hours.to_string(), "24", false);
         let ninja_request_gap = input(settings.ninja.min_request_gap_ms.to_string(), "1000", false);
@@ -188,6 +194,7 @@ impl SettingsForm {
             auto_hide_minutes,
             corner,
             opacity,
+            dismiss_hotkey,
             ninja_sample_target,
             ninja_refresh_hours,
             ninja_request_gap,
@@ -209,6 +216,10 @@ impl SettingsForm {
             (
                 &self.custom_sound_path,
                 text.settings_custom_sound_placeholder,
+            ),
+            (
+                &self.dismiss_hotkey,
+                text.settings_dismiss_hotkey_placeholder,
             ),
         ] {
             input.update(cx, |state, cx| {
@@ -279,6 +290,7 @@ impl SettingsForm {
                 settings.alert.auto_hide_minutes.to_string(),
             ),
             (&self.opacity, settings.alert.opacity.to_string()),
+            (&self.dismiss_hotkey, settings.alert.dismiss_hotkey.clone()),
             (
                 &self.ninja_sample_target,
                 settings.ninja.sample_target.to_string(),
@@ -471,6 +483,24 @@ impl AppShell {
                     .child(field_label(text.settings_corner))
                     .child(picker("", &form.corner, 160.)),
                 unit_row(text.settings_opacity, &form.opacity, "", read_only),
+                field_row()
+                    .child(field_label(text.settings_dismiss_hotkey))
+                    .child(input_box(160., &form.dismiss_hotkey, read_only)),
+                field_row()
+                    .child(field_label(""))
+                    .child(hint(text.settings_dismiss_hotkey_hint)),
+                // 开关是灰的,而且旁边就写着为什么。留一个永远关着的开关而不是
+                // 干脆不画:计划里有这一条,不画的话每隔几个月就要重新想一次
+                // "toast 到底做没做"。
+                field_row().child(field_label(text.settings_toast)).child(
+                    Switch::new("settings-toast")
+                        .checked(false)
+                        .disabled(true)
+                        .label(SharedString::from(text.common_off)),
+                ),
+                field_row()
+                    .child(field_label(""))
+                    .child(hint(text.settings_toast_unavailable)),
             ],
         );
 
@@ -643,6 +673,7 @@ impl AppShell {
             cx,
         );
         let opacity = number_of(&form.opacity, self.settings.alert.opacity, cx);
+        let dismiss_hotkey = text_of(&form.dismiss_hotkey, cx);
         let sample_target = number_of(
             &form.ninja_sample_target,
             self.settings.ninja.sample_target,
@@ -671,6 +702,7 @@ impl AppShell {
         self.settings.alert.custom_sound_path = custom_sound_path;
         self.settings.alert.auto_hide_minutes = auto_hide_minutes;
         self.settings.alert.opacity = opacity;
+        self.settings.alert.dismiss_hotkey = dismiss_hotkey;
         self.settings.ninja.sample_target = sample_target;
         self.settings.ninja.refresh_hours = refresh_hours;
         self.settings.ninja.min_request_gap_ms = request_gap;

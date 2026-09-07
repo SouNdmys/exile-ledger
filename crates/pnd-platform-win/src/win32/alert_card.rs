@@ -24,7 +24,10 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetThreadDpiAwarenessContext,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    UnregisterHotKey,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, GWL_EXSTYLE, GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW,
@@ -33,9 +36,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASSEXW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER,
+    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -49,6 +52,7 @@ use crate::alert_card::{
     CardButton, CardCommand, CardConfig, CardError, CardEvent, CardOwnership, CardShared,
     CardStyle, CardText, RectI, button_rects, card_geometry_for_corner, hit_button, scale_for_dpi,
 };
+use crate::hotkey::Hotkey;
 use crate::wave::LoopingWavePlayer;
 
 const CARD_CLASS: PCWSTR = w!("PndAlertCard");
@@ -58,6 +62,12 @@ const CARD_TITLE: PCWSTR = w!("POE Ninja Data alert");
 const WM_CARD_COMMANDS: u32 = WM_APP + 0x2A1;
 /// 自动收起计时器 id("PNDC")。
 const AUTO_HIDE_TIMER_ID: usize = 0x504E_4443;
+/// 收起卡片那条全局热键的 id。
+///
+/// 挂在**线程消息队列**上(`RegisterHotKey` 的第一个参数传 `None`),而线程
+/// 那一路的 id 必须落在 0x0000–0xBFFF 里,所以不能像计时器那样拿四个字母当
+/// 魔数。0x4E44 就是 `"ND"`。
+const DISMISS_HOTKEY_ID: i32 = 0x4E44;
 /// `WM_MOUSELEAVE`。它在 commctrl.h 里,windows-rs 因此把它放进了
 /// `Win32_UI_Controls` feature;为一个常量拉进一整套控件绑定不值得。
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -131,6 +141,17 @@ fn worker_thread(
             return;
         }
     };
+    // 热键要和卡片同一条线程:`RegisterHotKey` 挂在谁的消息队列上,
+    // `UnregisterHotKey` 就得由谁来调,`WM_HOTKEY` 也只会进那一条队列。
+    // 注册不成(键被别的程序占了)只丢一条警告:卡片本身照常工作,
+    // 鼠标点"忽略"一直都在。
+    let (hotkey, hotkey_warning) = match config.dismiss_hotkey {
+        Some(hotkey) => match DismissHotkey::register(hotkey) {
+            Ok(registration) => (Some(registration), None),
+            Err(detail) => (None, Some(detail)),
+        },
+        None => (None, None),
+    };
     let mut worker = CardWorker {
         window,
         player: config.sound.map(LoopingWavePlayer::new),
@@ -140,6 +161,9 @@ fn worker_thread(
         active: None,
     };
     let _ = ready.send(Ok(()));
+    if let Some(detail) = hotkey_warning {
+        worker.warn(detail);
+    }
 
     let mut message = MSG::default();
     loop {
@@ -152,6 +176,13 @@ fn worker_thread(
             if worker.drain_commands() {
                 break;
             }
+        } else if message.message == WM_HOTKEY
+            && hotkey.is_some()
+            && message.wParam.0 == DISMISS_HOTKEY_ID as usize
+        {
+            // 线程队列收到的消息 hwnd 是空的,`DispatchMessageW` 会把它丢掉,
+            // 所以热键必须在这里自己接住。
+            worker.hotkey_dismiss();
         } else {
             // SAFETY: message 刚由 GetMessageW 填好。
             unsafe {
@@ -162,6 +193,34 @@ fn worker_thread(
         worker.poll_window_signals();
     }
     worker.shutdown();
+    // 注销要发生在这条线程还活着的时候,所以显式 drop 一次,不指望作用域末尾。
+    drop(hotkey);
+}
+
+/// 活着就代表那条热键还登记在本线程的消息队列上,drop 时归还。
+struct DismissHotkey;
+
+impl DismissHotkey {
+    /// 注册失败时返回一句可以直接给用户看的话。
+    fn register(hotkey: Hotkey) -> Result<Self, String> {
+        // 补上 MOD_NOREPEAT:按住不放不该刷出几十条"忽略"。
+        let modifiers = HOT_KEY_MODIFIERS(hotkey.modifiers) | MOD_NOREPEAT;
+        // SAFETY: hwnd 传 None = 登记在当前线程的消息队列上,无指针参数。
+        unsafe { RegisterHotKey(None, DISMISS_HOTKEY_ID, modifiers, hotkey.vk) }.map_err(
+            |error| {
+                let error = error_from_windows("RegisterHotKey(dismiss)", error);
+                format!("the dismiss hotkey ({hotkey}) is not available — {error}")
+            },
+        )?;
+        Ok(Self)
+    }
+}
+
+impl Drop for DismissHotkey {
+    fn drop(&mut self) {
+        // SAFETY: 只在注册成功之后才存在这个值,而且和注册在同一条线程上。
+        let _ = unsafe { UnregisterHotKey(None, DISMISS_HOTKEY_ID) };
+    }
 }
 
 struct CardWorker {
@@ -220,6 +279,19 @@ impl CardWorker {
             self.start_sound();
         }
         self.window.repaint();
+    }
+
+    /// 全局热键按下了。
+    ///
+    /// 屏幕上没有卡片时**什么都不做** —— 这条热键的全部权限就是收起我们自己
+    /// 那张卡片,它不往游戏里发任何东西。有卡片时走的路和点"忽略"一模一样:
+    /// 停声、报一条事件,真正的收起由上层发 `Hide` 命令回来。
+    fn hotkey_dismiss(&mut self) {
+        let Some(alert_id) = self.active else {
+            return;
+        };
+        self.stop_sound();
+        self.send(CardEvent::HotkeyDismiss { alert_id });
     }
 
     fn dismiss(&mut self) {

@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 use gpui::{ClipboardItem, Context};
 use pnd_domain::{ListingSummary, SearchRef, search_page_url};
 use pnd_platform_win::{
-    AlertCardService, CardButton, CardConfig, CardError, CardEvent, CardText, Corner, LoginConfig,
-    LoginEvent, LoginFailure, LoginService, ValidatedWave, built_in_alert_wave, open_url,
+    AlertCardService, CardButton, CardConfig, CardError, CardEvent, CardText, Corner, Hotkey,
+    LoginConfig, LoginEvent, LoginFailure, LoginService, ValidatedWave, built_in_alert_wave,
+    open_url, parse_hotkey,
 };
 use pnd_runtime::{
     HideoutOutcome, MatchedListing, RuntimeCommand, RuntimeEvent, RuntimeHandle, RuntimePaths,
@@ -101,7 +102,27 @@ fn card_config(settings: &AppSettings, log: &mut Vec<String>) -> CardConfig {
         opacity: settings.alert.opacity,
         auto_hide: Duration::from_secs(u64::from(settings.alert.auto_hide_minutes) * 60),
         sound: card_sound(settings, log),
+        dismiss_hotkey: card_hotkey(settings, log),
     }
+}
+
+/// 收起卡片那条全局热键:空串 = 不要,认不出来的写法也 = 不要,但要说一声。
+///
+/// 为什么打错了不猜:热键是全局的,按下去的时候前台多半是游戏。把
+/// `ctr+alt+d` 猜成 `alt+d` 等于在游戏里埋一个会吞按键的陷阱,不如不注册,
+/// 鼠标点"忽略"永远都在。
+fn card_hotkey(settings: &AppSettings, log: &mut Vec<String>) -> Option<Hotkey> {
+    let spec = settings.alert.dismiss_hotkey.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let hotkey = parse_hotkey(spec);
+    if hotkey.is_none() {
+        log.push(format!(
+            "dismiss hotkey {spec:?} is not a hotkey this program understands — no hotkey registered"
+        ));
+    }
+    hotkey
 }
 
 /// 报警音:关了就是 `None`,自定义文件读不动就退回内置合成音并说一声。
@@ -399,6 +420,12 @@ impl AppShell {
     fn on_card_event(&mut self, event: CardEvent, cx: &mut Context<Self>) {
         match event {
             CardEvent::Clicked { alert_id, button } => self.on_card_button(alert_id, button, cx),
+            // 热键和"忽略"按钮走同一条路。卡片线程只在屏幕上真的有卡片时才发
+            // 这个事件,所以这里不用再判断一次"现在有没有卡片"。
+            CardEvent::HotkeyDismiss { alert_id } => {
+                self.push_log(format!("alert card: hotkey dismissed alert {alert_id}"));
+                self.dismiss_visible_card(alert_id);
+            }
             CardEvent::AutoHidden { alert_id } => {
                 // 自己收起来的卡片也算"看过了":不记的话下一轮同样的挂单
                 // 会被当成没处理过。窗口已经不在屏幕上,不用再 hide 一次。
@@ -414,7 +441,6 @@ impl AppShell {
 
     /// 卡片上的四个按钮。含义在这里定,平台层只认下标。
     fn on_card_button(&mut self, alert_id: i64, button: CardButton, cx: &mut Context<Self>) {
-        let text = self.text();
         let Some(matched) = self.shown_cards.get(&alert_id).cloned() else {
             self.push_log(format!("alert card: unknown alert {alert_id}"));
             return;
@@ -440,16 +466,23 @@ impl AppShell {
                 // 说"不行"由 runtime 决定,它答得起也答得准。
                 self.travel_to_hideout(alert_id);
             }
-            CardButton::Dismiss => {
-                self.dismiss_card_batch(alert_id);
-                if let Some(card) = &self.alert_card
-                    && let Err(error) = card.hide()
-                {
-                    self.push_log(format!("alert card hide failed: {error}"));
-                }
-                self.set_notice(text.notice_dismissed.to_owned());
-            }
+            CardButton::Dismiss => self.dismiss_visible_card(alert_id),
         }
+    }
+
+    /// 忽略屏幕上那张卡片:这一批命中全部记为已看过,窗口收起,状态行说一声。
+    ///
+    /// 卡片上的"忽略"按钮和那条全局热键都走这里 —— 两条路做的事必须一模一样,
+    /// 否则用热键忽略掉的提醒下一轮又会弹出来。
+    fn dismiss_visible_card(&mut self, alert_id: i64) {
+        let text = self.text();
+        self.dismiss_card_batch(alert_id);
+        if let Some(card) = &self.alert_card
+            && let Err(error) = card.hide()
+        {
+            self.push_log(format!("alert card hide failed: {error}"));
+        }
+        self.set_notice(text.notice_dismissed.to_owned());
     }
 
     /// 请后台给这条提醒的卖家发一次传送请求。
@@ -1135,6 +1168,29 @@ mod link_tests {
         let footer = hideout_text(&HideoutOutcome::TokenMissing, text);
         let card = card_text_for(&matched(0), text, &footer);
         assert_eq!(card.footer, "hideout: no token");
+    }
+
+    /// 设置里那一行字 → 真正会去注册的热键。
+    ///
+    /// 三条路都要走对:默认值能注册、留空就是关掉、打错了当成关掉**并且**
+    /// 在日志里留下一句 —— 静悄悄地不注册,用户只会以为热键坏了。
+    #[test]
+    fn the_dismiss_hotkey_setting_turns_into_a_binding_or_into_nothing() {
+        let mut settings = AppSettings::default();
+        let mut log = Vec::new();
+        assert_eq!(card_hotkey(&settings, &mut log), parse_hotkey("ctrl+alt+d"));
+        assert!(card_hotkey(&settings, &mut log).is_some());
+        assert!(log.is_empty(), "{log:?}");
+
+        settings.alert.dismiss_hotkey = "   ".to_string();
+        assert_eq!(card_hotkey(&settings, &mut log), None);
+        assert!(log.is_empty(), "留空是有意关掉,不该报错:{log:?}");
+
+        // 打错一个字母不该被猜成 `alt+d` —— 那等于在游戏里埋一个吞按键的陷阱。
+        settings.alert.dismiss_hotkey = "ctr+alt+d".to_string();
+        assert_eq!(card_hotkey(&settings, &mut log), None);
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert!(log[0].contains("ctr+alt+d"), "{}", log[0]);
     }
 
     #[test]

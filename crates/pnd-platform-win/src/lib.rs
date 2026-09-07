@@ -9,7 +9,8 @@
 //!
 //! - [`ValidatedWave`] / [`LoopingWavePlayer`] / [`built_in_alert_wave`] —— 报警音,
 //!   整段搬自 POE-Alarm;
-//! - [`AlertCardService`] —— 屏幕角落那张不抢焦点的提醒卡片;
+//! - [`AlertCardService`] —— 屏幕角落那张不抢焦点的提醒卡片,连同那条只用来
+//!   收起它自己的全局热键([`parse_hotkey`]);
 //! - [`LoginService`] —— 装着 Edge 内核(WebView2)的登录窗,用来取 `POESESSID`;
 //! - [`open_url`] —— 用默认浏览器打开官方交易页。
 
@@ -18,6 +19,7 @@
 mod alert_card;
 mod alert_cue;
 mod error;
+mod hotkey;
 mod login;
 #[cfg(not(windows))]
 mod non_windows;
@@ -32,6 +34,7 @@ pub use alert_card::{
 };
 pub use alert_cue::built_in_alert_wave;
 pub use error::PlatformError;
+pub use hotkey::{Hotkey, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, parse_hotkey};
 pub use login::{
     ACCOUNT_URL, AfterNavigation, COOKIE_ORIGIN, LOGIN_LOGICAL_HEIGHT, LOGIN_LOGICAL_WIDTH,
     LOGIN_URL, LoginConfig, LoginEvent, LoginFailure, LoginService, MAX_AUTO_NAVIGATIONS,

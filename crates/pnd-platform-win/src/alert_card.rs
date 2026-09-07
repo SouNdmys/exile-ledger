@@ -17,6 +17,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::PlatformError;
+use crate::hotkey::Hotkey;
 use crate::wave::ValidatedWave;
 
 /// 卡片线程启动握手的上限。超过就当线程没起来,和 POE-Alarm 同一个数。
@@ -259,6 +260,12 @@ pub struct CardConfig {
     pub auto_hide: Duration,
     /// `None` = 静音。声音归卡片线程所有:显示即响,任何按钮/收起即停。
     pub sound: Option<ValidatedWave>,
+    /// `None` = 不注册热键。注册也归卡片线程所有:它本来就有一条消息泵,
+    /// 而 `RegisterHotKey` 的登记和注销必须在同一条线程上。
+    ///
+    /// 这条热键**只会收起我们自己那张卡片**:它不往游戏里发任何按键,
+    /// 收到 `WM_HOTKEY` 之后做的事和点一下"忽略"一模一样。
+    pub dismiss_hotkey: Option<Hotkey>,
 }
 
 impl Default for CardConfig {
@@ -270,7 +277,7 @@ impl Default for CardConfig {
 }
 
 impl CardConfig {
-    /// 默认配置(右下角、alpha 235、5 分钟自动收起、静音)。
+    /// 默认配置(右下角、alpha 235、5 分钟自动收起、静音、无热键)。
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -278,12 +285,19 @@ impl CardConfig {
             opacity: DEFAULT_CARD_OPACITY,
             auto_hide: DEFAULT_AUTO_HIDE,
             sound: None,
+            dismiss_hotkey: None,
         }
     }
 
     #[must_use]
     pub fn with_sound(mut self, wave: ValidatedWave) -> Self {
         self.sound = Some(wave);
+        self
+    }
+
+    #[must_use]
+    pub fn with_dismiss_hotkey(mut self, hotkey: Hotkey) -> Self {
+        self.dismiss_hotkey = Some(hotkey);
         self
     }
 
@@ -314,6 +328,11 @@ pub enum CardEvent {
     Clicked { alert_id: i64, button: CardButton },
     /// 到点自动收起(没有点任何按钮)。
     AutoHidden { alert_id: i64 },
+    /// 用户按了那条全局热键,而且当时屏幕上确实有一张卡片。
+    ///
+    /// 语义和点"忽略"完全一样,分成两个事件只是为了日志上看得出来是键盘
+    /// 还是鼠标。没有卡片时**不会**有这个事件:热键在没提醒的时候什么都不做。
+    HotkeyDismiss { alert_id: i64 },
     /// 用户拖动标题条后的新位置(屏幕坐标)。
     Moved { x: i32, y: i32 },
     /// 非致命的兼容性问题(比如置顶样式被别的程序改掉了)。卡片仍在工作。

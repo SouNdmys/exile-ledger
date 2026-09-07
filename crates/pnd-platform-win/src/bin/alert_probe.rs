@@ -9,8 +9,10 @@
 //! cargo run -p pnd-platform-win --bin alert_probe -- --seconds 8 --no-sound
 //! ```
 //!
-//! 要看的四件事:游戏窗口化全屏时卡片出现而游戏**不失焦**(键盘还在游戏里)、
-//! 声音循环、四个按钮各打印一条事件、到点自动收起,标题条能拖。
+//! 要看的五件事:游戏窗口化全屏时卡片出现而游戏**不失焦**(键盘还在游戏里)、
+//! 声音循环、四个按钮各打印一条事件、到点自动收起,标题条能拖;带
+//! `--hotkey ctrl+alt+d` 时,游戏在前台按那一下会打印 `HotkeyDismiss`
+//! 并把卡片收起来 —— 而游戏里什么都没发生。
 
 use std::process::ExitCode;
 use std::thread;
@@ -18,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use pnd_platform_win::{
     AlertCardService, CardButton, CardConfig, CardEvent, CardText, Corner, DEFAULT_CARD_OPACITY,
-    built_in_alert_wave, open_url,
+    Hotkey, built_in_alert_wave, open_url, parse_hotkey,
 };
 
 /// 点"打开交易页"时开的地址,和计划里的第一版"去藏身处"流程一致。
@@ -33,6 +35,7 @@ struct Options {
     auto_hide: Duration,
     run_for: Duration,
     sound: bool,
+    hotkey: Option<Hotkey>,
 }
 
 impl Default for Options {
@@ -43,6 +46,7 @@ impl Default for Options {
             auto_hide: Duration::from_secs(60),
             run_for: Duration::from_secs(20),
             sound: true,
+            hotkey: None,
         }
     }
 }
@@ -54,7 +58,7 @@ fn main() -> ExitCode {
             eprintln!("{message}");
             eprintln!(
                 "usage: alert_probe [--corner top_left|top_right|bottom_left|bottom_right] \
-                 [--opacity 0-255] [--auto-hide-seconds N] [--seconds N] [--no-sound]"
+                 [--opacity 0-255] [--auto-hide-seconds N] [--seconds N] [--no-sound]                  [--hotkey ctrl+alt+d]"
             );
             return ExitCode::FAILURE;
         }
@@ -64,6 +68,7 @@ fn main() -> ExitCode {
     config.corner = options.corner;
     config.opacity = options.opacity;
     config.auto_hide = options.auto_hide;
+    config.dismiss_hotkey = options.hotkey;
     if options.sound {
         match built_in_alert_wave() {
             Ok(wave) => config.sound = Some(wave),
@@ -75,12 +80,15 @@ fn main() -> ExitCode {
     }
 
     println!(
-        "corner={} opacity={} auto_hide={}s run_for={}s sound={}",
+        "corner={} opacity={} auto_hide={}s run_for={}s sound={} hotkey={}",
         options.corner.as_str(),
         options.opacity,
         options.auto_hide.as_secs(),
         options.run_for.as_secs(),
         options.sound,
+        options
+            .hotkey
+            .map_or_else(|| "off".to_owned(), |hotkey| hotkey.to_string()),
     );
 
     let service = match AlertCardService::start(config) {
@@ -117,10 +125,12 @@ fn main() -> ExitCode {
                     Ok(()) => println!("  opened {SAMPLE_TRADE_URL}"),
                     Err(error) => eprintln!("  could not open the trade page: {error}"),
                 },
+                // 热键和"忽略"按钮做同一件事:收起卡片,别的什么都不做。
                 CardEvent::Clicked {
                     button: CardButton::Dismiss,
                     ..
-                } => {
+                }
+                | CardEvent::HotkeyDismiss { .. } => {
                     if let Err(error) = service.hide() {
                         eprintln!("  could not hide the card: {error}");
                     } else {
@@ -171,6 +181,12 @@ fn parse_args() -> Result<Options, String> {
             }
             "--seconds" => {
                 options.run_for = Duration::from_secs(parse_seconds(&mut args, flag.as_str())?);
+            }
+            "--hotkey" => {
+                let value = args.next().ok_or("--hotkey needs a value")?;
+                options.hotkey = Some(parse_hotkey(&value).ok_or(format!(
+                    "{value:?} is not a hotkey this program understands"
+                ))?);
             }
             "--no-sound" => options.sound = false,
             other => return Err(format!("unknown argument {other:?}")),

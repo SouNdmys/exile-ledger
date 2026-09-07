@@ -132,6 +132,17 @@ pub struct AlertTuning {
     pub corner: String,
     /// `LWA_ALPHA` 的 0–255 值。低于 60 卡片上的小字就糊了,`normalize` 会兜住。
     pub opacity: u8,
+    /// 收起卡片的全局热键,`ctrl+alt+d` 这种写法。空串 = 不注册。
+    ///
+    /// 它只收起我们自己那张卡片,不向游戏发任何按键。认不出来的写法等同于空串
+    /// (界面上会说一声),绝不"猜一个差不多的键"注册上去。
+    pub dismiss_hotkey: String,
+    /// 命中时顺便弹一条 Windows 系统通知。
+    ///
+    /// 现在恒为 `false`:未打包的程序要弹 toast,得先在开始菜单里放一个带
+    /// AppUserModelID 的快捷方式,那是安装器的活。键先留着,设置页上那个开关
+    /// 是灰的。
+    pub toast: bool,
 }
 
 impl Default for AlertTuning {
@@ -142,6 +153,8 @@ impl Default for AlertTuning {
             auto_hide_minutes: 5,
             corner: "bottom_right".to_string(),
             opacity: 235,
+            dismiss_hotkey: "ctrl+alt+d".to_string(),
+            toast: false,
         }
     }
 }
@@ -535,8 +548,33 @@ mod settings_tests {
         assert_eq!(settings.watcher.poll_interval_seconds, 180);
         assert_eq!(settings.watcher.poll_interval_when_live_seconds, 300);
         assert_eq!(settings.alert.opacity, 235);
+        assert_eq!(settings.alert.dismiss_hotkey, "ctrl+alt+d");
+        assert!(!settings.alert.toast);
         assert_eq!(settings.ninja.sample_target, 2000);
         assert_eq!(settings.user_agent_mode, UserAgentMode::Identified);
+    }
+
+    /// 已经在盘上的那份 schema 1 文件没有热键和 toast 这两个键。
+    ///
+    /// 它必须照常读出来:老的值原样留着,两个新键补默认值,版本号还是 1 ——
+    /// 加一个字段不该逼用户重设一遍整页设置。
+    #[test]
+    fn an_older_schema_one_file_gains_the_new_alert_keys() {
+        let store = temp_store("older-alert-block");
+        write_file(
+            &store,
+            r#"{"schema_version": 1,
+                "alert": {"sound": false, "corner": "top_left", "opacity": 200}}"#,
+        );
+        let loaded = store.load();
+        assert_eq!(loaded.status, LoadStatus::Loaded);
+        assert_eq!(loaded.settings.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(!loaded.settings.alert.sound);
+        assert_eq!(loaded.settings.alert.corner, "top_left");
+        assert_eq!(loaded.settings.alert.opacity, 200);
+        assert_eq!(loaded.settings.alert.dismiss_hotkey, "ctrl+alt+d");
+        assert!(!loaded.settings.alert.toast);
+        assert!(!store.is_read_only());
     }
 
     /// 以后加的键、或者手工写错的键,都不该让整份设置读不出来。
