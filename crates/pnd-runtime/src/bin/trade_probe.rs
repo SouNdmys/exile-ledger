@@ -19,6 +19,10 @@
 //!     --watch --minutes 3 --poll-seconds 60 \
 //!     --search <搜索URL或id> [--search <第二条>] [--cap 20 --currency divine] \
 //!     [--hideout <alert_id>]
+//!
+//! # 观察模式:市场观察(Phase 3)开工前要核实的三条接口事实,一趟跑完
+//! cargo run -p pnd-runtime --bin trade_probe -- \
+//!     --observe --league "Forbidden Rites" --search <搜索URL或id>
 //! ```
 //!
 //! 蹲价模式每条状态行里都带着 live 那一头的档位(`live off` / `live connecting` /
@@ -43,7 +47,8 @@ use std::time::{Duration, Instant};
 
 use pnd_domain::{
     Currency, CurrencyRates, ListingSummary, Price, PriceCap, SearchRef, Verdict, decode_search_id,
-    judge, parse_search_reference, search_page_url, search_request_body,
+    judge, parse_search_reference, search_page_url, search_request_body, with_seller_filter,
+    with_sort,
 };
 use pnd_ninja::client::NinjaClient;
 use pnd_runtime::actor::{
@@ -52,8 +57,10 @@ use pnd_runtime::actor::{
 use pnd_runtime::live_worker::{LiveOffReason, LiveRunState};
 use pnd_runtime::{describe_token, now_secs};
 use pnd_settings::{AppSettings, WatchEntry};
-use pnd_trade::client::{MAX_FETCH_IDS, TradeClient, parse_search_response};
-use pnd_trade::listing::parse_fetch_response;
+use pnd_trade::client::{
+    MAX_FETCH_IDS, SearchResponse, TradeClient, TradeResponse, ggg_error, parse_search_response,
+};
+use pnd_trade::listing::{parse_fetch_response, parse_fetch_response_by_id};
 use pnd_trade::rate_limit::{
     Bucket, BucketUsage, FETCH_POLICY, RateHeaders, RateLimiter, SEARCH_POLICY,
 };
@@ -74,7 +81,8 @@ const USAGE: &str = "usage: trade_probe --search <url|id> [--league \"Forbidden 
 [--cap 20] [--currency divine] [--rounds 1] [--session <POESESSID>] \
 [--rates chaos=25.21,exalted=83.42]\n       \
 trade_probe --watch --minutes 3 [--poll-seconds 60] --search <url|id> [--search <url|id>] \
-[--cap 20] [--currency divine] [--session <POESESSID>] [--hideout <alert_id>]";
+[--cap 20] [--currency divine] [--session <POESESSID>] [--hideout <alert_id>]\n       \
+trade_probe --observe --search <url|id> [--league \"Forbidden Rites\"]";
 
 /// 蹲价模式里多久抽一次事件。事件通道是无界的,抽得慢只是屏幕上晚一点看到,
 /// 不会丢。
@@ -99,6 +107,9 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> Result<(), String> {
+    if args.observe {
+        return run_observe(args);
+    }
     if args.watch {
         return run_watch(args);
     }
@@ -171,6 +182,347 @@ fn run(args: &Args) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// 观察模式:市场观察开工前要核实的三条接口事实
+// ---------------------------------------------------------------------
+
+/// 观察模式一趟最多花掉的请求数。
+///
+/// 主人的程序常年在同一个 IP 上跑着,和它共用服务端那份预算 —— 探针捅一次
+/// 就是从他的额度里拿一次。正常一趟只花 2 次 search + 2 次 fetch,这两个上限
+/// 是给"排序被拒了要换个方向再试"之类的岔路留的余量,超了就停,不硬跑。
+const OBSERVE_MAX_SEARCHES: u32 = 4;
+const OBSERVE_MAX_FETCHES: u32 = 4;
+
+/// 花出去的请求数。带着它到处走,是为了让"还剩几次"这件事在屏幕上一直看得见。
+struct Spend {
+    searches: u32,
+    fetches: u32,
+}
+
+/// `--observe`:一趟跑完 Phase 3 step 0 的三个问题,每个都把原始形状印出来。
+///
+/// 1. 服务端认不认 `sort: {"indexed": "desc"}`(观察要的是"最新 100 条",
+///    不是"最便宜 100 条")
+/// 2. 已经没了的挂单 id 去 fetch,回来长什么样(`null`?少一条?还是整个 404?)
+/// 3. 按卖家账号筛选能不能用(将来用它区分"卖掉了"和"整批撤了")
+///
+/// 一行判断逻辑都不在这里:排序体、卖家筛选体、按 id 对号的解析全是
+/// `pnd-domain` / `pnd-trade` 里的生产函数,探针只负责印。
+fn run_observe(args: &Args) -> Result<(), String> {
+    let raw = &args.searches[0];
+    let search_ref = parse_search_reference(raw, &args.league)
+        .ok_or_else(|| format!("could not read a search reference out of {raw:?}"))?;
+    let query_json = decode_search_id(&search_ref.search_id).map_err(|e| e.to_string())?;
+
+    println!("league        {}", search_ref.league);
+    println!("search id     {}", search_ref.search_id);
+    println!("search page   {}", search_page_url(&search_ref));
+    println!(
+        "session       {}",
+        if args.session.is_some() {
+            "yes (POESESSID sent, never printed)"
+        } else {
+            "no (anonymous)"
+        }
+    );
+    println!(
+        "budget        at most {OBSERVE_MAX_SEARCHES} searches + {OBSERVE_MAX_FETCHES} fetches"
+    );
+    println!("decoded query {query_json}");
+
+    let client = TradeClient::new(USER_AGENT.to_string());
+    let mut limiter = RateLimiter::default();
+    let mut spend = Spend {
+        searches: 0,
+        fetches: 0,
+    };
+
+    // ---- 事实 1:排序键 -------------------------------------------------
+    println!("\n=========== fact 1 — does the server take sort by `indexed`? ===========");
+    let (direction, search) = observe_sort(
+        &client,
+        &mut limiter,
+        &mut spend,
+        args,
+        &search_ref,
+        &query_json,
+    )?;
+    println!(
+        "\naccepted sort  {{\"indexed\": \"{direction}\"}}   total {}   returned {} ids",
+        search.total,
+        search.result.len()
+    );
+    let head: Vec<String> = search.result.iter().take(MAX_FETCH_IDS).cloned().collect();
+    if head.is_empty() {
+        return Err("the search returned no ids — nothing to observe".to_string());
+    }
+    for (index, id) in head.iter().enumerate() {
+        println!("  [{}] {id}", index + 1);
+    }
+
+    // 排序到底生效没有,只有把这 10 条的上架时间拉出来才算数。
+    println!(
+        "\nfetching those {} ids to read their `indexed` stamps",
+        head.len()
+    );
+    let response = observe_fetch(&client, &mut limiter, &mut spend, args, &head, &search.id)?;
+    if !response.is_success() {
+        return Err(format!(
+            "fetch failed with status {}: {}",
+            response.status,
+            response.body_excerpt()
+        ));
+    }
+    let pairs = parse_fetch_response_by_id(&head, &response.body).map_err(|e| e.to_string())?;
+    let mut stamps: Vec<String> = Vec::new();
+    for (index, (id, listing)) in pairs.iter().enumerate() {
+        match listing {
+            Some(listing) => {
+                println!(
+                    "  [{}] {}  {}  {}",
+                    index + 1,
+                    listing.indexed,
+                    short_id(id),
+                    listing.item_name
+                );
+                stamps.push(listing.indexed.clone());
+            }
+            None => println!("  [{}] (not in the answer)  {}", index + 1, short_id(id)),
+        }
+    }
+    // RFC 3339 的 Z 时间戳按字典序比就是按时间比,所以直接比字符串。
+    let newest_first = stamps.windows(2).all(|pair| pair[0] >= pair[1]);
+    println!(
+        "\nverdict: the stamps are {}",
+        if newest_first {
+            "newest-first (non-increasing) — the sort took effect"
+        } else {
+            "NOT in newest-first order — the server ignored the sort"
+        }
+    );
+
+    // ---- 事实 2:已经没了的 id ------------------------------------------
+    println!("\n=========== fact 2 — what does a gone listing id look like? ===========");
+    let real = head[0].clone();
+    let fake = fake_listing_id(&real);
+    println!("real id  {real}");
+    println!("fake id  {fake}   (same shape, last 4 characters bumped — cannot exist)");
+    let response = observe_fetch(
+        &client,
+        &mut limiter,
+        &mut spend,
+        args,
+        &[real.clone(), fake.clone()],
+        &search.id,
+    )?;
+    print_fetch_shape(&response);
+    if response.is_success() {
+        let pairs = parse_fetch_response_by_id(&[real.clone(), fake.clone()], &response.body)
+            .map_err(|e| e.to_string())?;
+        println!("\nparse_fetch_response_by_id says:");
+        for (id, listing) in &pairs {
+            println!(
+                "  {} -> {}",
+                short_id(id),
+                match listing {
+                    Some(listing) => format!("Some({})", listing.short_label()),
+                    None => "None (gone)".to_string(),
+                }
+            );
+        }
+    }
+
+    // ---- 事实 3:卖家筛选 -----------------------------------------------
+    println!("\n=========== fact 3 — is the seller filter accepted? ===========");
+    let seller = pairs
+        .iter()
+        .find_map(|(_, listing)| listing.as_ref())
+        .map(|listing| listing.account.clone())
+        .filter(|account| !account.is_empty())
+        .ok_or_else(|| "no seller name in the fetch answer — cannot test the filter".to_string())?;
+    println!("seller        {seller}");
+    let body = with_seller_filter(&query_json, &seller);
+    println!("request body  {body}");
+    let response = observe_search(&client, &mut limiter, &mut spend, args, &search_ref, &body)?;
+    if response.is_success() {
+        let filtered = parse_search_response(&response.body).map_err(|e| e.to_string())?;
+        println!(
+            "\nverdict: accepted — total {} (unfiltered total was {})",
+            filtered.total, search.total
+        );
+    } else {
+        // 说好了失败就不重试:这一格是可选的,不值得再花一次预算。
+        println!("\nverdict: rejected — body: {}", response.body_excerpt());
+        if let Some(message) = ggg_error(&response.body_text()) {
+            println!("         {message}");
+        }
+    }
+
+    println!(
+        "\nspent {} searches + {} fetches",
+        spend.searches, spend.fetches
+    );
+    Ok(())
+}
+
+/// 事实 1 的那次(或那两次)search。
+///
+/// 先试 `desc` —— 观察真正想要的就是它。被拒了才补一次 `asc`,只为一个目的:
+/// 分清"这个排序键不认"和"这个方向不认"。
+fn observe_sort(
+    client: &TradeClient,
+    limiter: &mut RateLimiter,
+    spend: &mut Spend,
+    args: &Args,
+    search_ref: &SearchRef,
+    query_json: &str,
+) -> Result<(&'static str, SearchResponse), String> {
+    for direction in ["desc", "asc"] {
+        let body = with_sort(query_json, "indexed", direction);
+        println!("\nrequest body  {body}");
+        let response = observe_search(client, limiter, spend, args, search_ref, &body)?;
+        if response.is_success() {
+            return Ok((
+                direction,
+                parse_search_response(&response.body).map_err(|e| e.to_string())?,
+            ));
+        }
+        println!("rejected — body: {}", response.body_excerpt());
+        if let Some(message) = ggg_error(&response.body_text()) {
+            println!("           {message}");
+        }
+        if response.status == 429 || response.looks_like_html {
+            return Err(format!(
+                "stopping: status {} looks like a block, not a bad sort key",
+                response.status
+            ));
+        }
+    }
+    Err("the server refused both `indexed` directions".to_string())
+}
+
+/// 一次 search,带预算闸门和原样打印。
+fn observe_search(
+    client: &TradeClient,
+    limiter: &mut RateLimiter,
+    spend: &mut Spend,
+    args: &Args,
+    search_ref: &SearchRef,
+    body: &str,
+) -> Result<TradeResponse, String> {
+    if spend.searches >= OBSERVE_MAX_SEARCHES {
+        return Err(format!(
+            "out of search budget ({OBSERVE_MAX_SEARCHES} used) — stopping instead of spending more"
+        ));
+    }
+    wait_for_budget(limiter, SEARCH_POLICY, "search");
+    let ticket = limiter.insert_request(SEARCH_POLICY, now_secs());
+    let response = client
+        .search(&search_ref.league, body, args.session.as_deref())
+        .map_err(|e| e.to_string())?;
+    spend.searches += 1;
+    limiter.finish_request(ticket, response.rate.as_ref(), now_secs());
+    println!(
+        "POST search -> status {}   (search {}/{OBSERVE_MAX_SEARCHES})",
+        response.status, spend.searches
+    );
+    print_rate_headers(response.rate.as_ref());
+    print_budget(limiter, SEARCH_POLICY, "search");
+    Ok(response)
+}
+
+/// 一次 fetch,带预算闸门和原样打印。
+fn observe_fetch(
+    client: &TradeClient,
+    limiter: &mut RateLimiter,
+    spend: &mut Spend,
+    args: &Args,
+    ids: &[String],
+    search_id: &str,
+) -> Result<TradeResponse, String> {
+    if spend.fetches >= OBSERVE_MAX_FETCHES {
+        return Err(format!(
+            "out of fetch budget ({OBSERVE_MAX_FETCHES} used) — stopping instead of spending more"
+        ));
+    }
+    wait_for_budget(limiter, FETCH_POLICY, "fetch");
+    let ticket = limiter.insert_request(FETCH_POLICY, now_secs());
+    let response = client
+        .fetch(ids, search_id, args.session.as_deref())
+        .map_err(|e| e.to_string())?;
+    spend.fetches += 1;
+    limiter.finish_request(ticket, response.rate.as_ref(), now_secs());
+    println!(
+        "GET fetch -> status {}   (fetch {}/{OBSERVE_MAX_FETCHES})",
+        response.status, spend.fetches
+    );
+    print_rate_headers(response.rate.as_ref());
+    print_budget(limiter, FETCH_POLICY, "fetch");
+    Ok(response)
+}
+
+/// 把 fetch 回来的 `result` 数组按原样描述一遍:几条、每一格是 null 还是对象、
+/// 对象上有哪些键。事实 2 要的就是这个形状本身,不是我们对它的理解。
+fn print_fetch_shape(response: &TradeResponse) {
+    let root: serde_json::Value = match serde_json::from_slice(&response.body) {
+        Ok(root) => root,
+        Err(error) => {
+            println!("body is not JSON ({error}): {}", response.body_excerpt());
+            return;
+        }
+    };
+    let Some(entries) = root.get("result").and_then(serde_json::Value::as_array) else {
+        println!("no `result` array — raw body: {}", response.body_excerpt());
+        return;
+    };
+    println!("raw `result` array has {} entries:", entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        match entry {
+            serde_json::Value::Null => println!("  [{index}] null"),
+            serde_json::Value::Object(map) => {
+                let id = map
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("(no id)");
+                let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+                println!("  [{index}] object id={} keys={:?}", short_id(id), keys);
+            }
+            other => println!("  [{index}] {other}"),
+        }
+    }
+}
+
+/// 挂单 id 有 64 个字符,屏幕上摆一列全长的没法看,留头尾就够认。
+fn short_id(id: &str) -> String {
+    let count = id.chars().count();
+    if count <= 20 {
+        return id.to_string();
+    }
+    let head: String = id.chars().take(8).collect();
+    let tail: String = id.chars().skip(count - 8).collect();
+    format!("{head}…{tail}")
+}
+
+/// 造一个"形状对但不存在"的挂单 id:把最后 4 个十六进制字符各挪一位。
+///
+/// 为什么要自己造而不是拿一条真的等它消失:那得等上几小时,而这里要问的
+/// 只是"服务端拿一个查不到的 id 怎么回话"。改动限制在最后 4 位,是为了让
+/// 长度和字母表和真 id 完全一样 —— 不然可能只是撞上"id 格式不对"的报错。
+fn fake_listing_id(id: &str) -> String {
+    let mut chars: Vec<char> = id.chars().collect();
+    let start = chars.len().saturating_sub(4);
+    for ch in &mut chars[start..] {
+        *ch = match ch.to_digit(16) {
+            Some(value) => char::from_digit((value + 1) % 16, 16).expect("0..16 is a hex digit"),
+            // 不是十六进制的字符(万一 id 换成 base64url 了)也得变一下,
+            // 换成 '0' 一定和原字符不同 —— '0' 本身是十六进制字符。
+            None => '0',
+        };
+    }
+    chars.into_iter().collect()
 }
 
 // ---------------------------------------------------------------------
@@ -751,6 +1103,8 @@ struct Args {
     session: Option<String>,
     rates: Option<CurrencyRates>,
     watch: bool,
+    /// `--observe`:市场观察那三条接口事实的一次性取证,见 [`run_observe`]。
+    observe: bool,
     minutes: u64,
     poll_seconds: u64,
     /// `--hideout <alert_id>`:蹲价模式下发一条 `TravelToHideout` 命令。
@@ -774,6 +1128,7 @@ impl Args {
         let mut session: Option<String> = None;
         let mut rates: Option<CurrencyRates> = None;
         let mut watch = false;
+        let mut observe = false;
         let mut minutes: u64 = 3;
         let mut poll_seconds: u64 = 300;
         let mut hideout: Option<i64> = None;
@@ -785,6 +1140,7 @@ impl Args {
                 "--league" => league = value()?,
                 "--search" => searches.push(value()?),
                 "--watch" => watch = true,
+                "--observe" => observe = true,
                 "--minutes" => {
                     let raw = value()?;
                     minutes = raw
@@ -843,6 +1199,7 @@ impl Args {
             session,
             rates,
             watch,
+            observe,
             minutes,
             // 低于 60 秒对交易站不礼貌;`AppSettings::normalize` 也会兜这一下,
             // 这里先兜是为了打印出来的数就是真正会用的数。
@@ -873,4 +1230,31 @@ fn parse_rates(raw: &str) -> Result<CurrencyRates, String> {
         }
     }
     Ok(rates)
+}
+
+#[cfg(test)]
+mod trade_probe_tests {
+    use super::*;
+
+    /// 假 id 必须和真 id **一样长、一样是十六进制**,只有最后 4 位不同 ——
+    /// 否则服务端可能是在抱怨格式,而不是在回答"这条挂单没了"。
+    #[test]
+    fn a_fake_listing_id_only_differs_in_its_last_four_characters() {
+        let real = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let fake = fake_listing_id(real);
+        assert_eq!(fake.len(), real.len());
+        assert!(fake.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(&fake[..60], &real[..60]);
+        assert_eq!(&fake[60..], "def0", "cdef 每位加一,f 回到 0");
+        assert_ne!(fake, real);
+    }
+
+    #[test]
+    fn short_ids_keep_both_ends() {
+        assert_eq!(short_id("abcd1234"), "abcd1234");
+        assert_eq!(
+            short_id("0123456789abcdef0123456789abcdef"),
+            "01234567…89abcdef"
+        );
+    }
 }

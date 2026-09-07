@@ -14,7 +14,7 @@ pub use client::{
     ggg_error, parse_search_response, search_url, whisper_body, whisper_url,
 };
 pub use jwt::{jwt_claims, jwt_expiry, jwt_header};
-pub use listing::parse_fetch_response;
+pub use listing::{parse_fetch_response, parse_fetch_response_by_id};
 pub use live::{
     DEFAULT_READ_TIMEOUT, LiveConfig, LiveError, LiveMessage, LiveSession,
     MAX_LIVE_CONNECTIONS_PER_ACCOUNT, ProtocolError, live_ws_url, parse_live_message,

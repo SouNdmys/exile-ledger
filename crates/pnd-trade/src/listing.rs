@@ -29,6 +29,28 @@ pub fn parse_fetch_response(body: &[u8]) -> Result<Vec<ListingSummary>, ParseErr
     Ok(entries.iter().filter_map(summarize).collect())
 }
 
+/// 同一次 fetch,但按**请求时的 id 顺序**回话:每个 id 要么有摘要,要么是 `None`。
+///
+/// 市场观察问的问题和蹲价不一样:蹲价只想要"现在有哪些便宜货",少一条无所谓;
+/// 观察要的是"我问的这 10 条里,哪几条没了" —— 没了才是那条挂单卖掉/撤掉的
+/// 时刻。[`parse_fetch_response`] 把 `null` 直接丢掉,丢完就分不清是哪个 id 没了。
+///
+/// 按 id 对上号而不是按位置对:服务端到底是补一个 `null` 还是干脆少给一条,
+/// 我们不替它保证 —— 两种形状这里都能对上。
+pub fn parse_fetch_response_by_id(
+    requested_ids: &[String],
+    body: &[u8],
+) -> Result<Vec<(String, Option<ListingSummary>)>, ParseError> {
+    let found = parse_fetch_response(body)?;
+    Ok(requested_ids
+        .iter()
+        .map(|id| {
+            let listing = found.iter().find(|listing| listing.id == *id).cloned();
+            (id.clone(), listing)
+        })
+        .collect())
+}
+
 /// 一条挂单 → 一份摘要。返回 `None` 就是"这条不要了"(null、或者连 id 都没有)。
 fn summarize(entry: &Value) -> Option<ListingSummary> {
     // 过期的 id 在 result 里是 null;没有 id 的条目我们也没法去重,一并跳过。
@@ -231,6 +253,75 @@ mod listing_tests {
         assert_eq!(third.item_name, "Sapphire Ring");
         assert_eq!(third.type_line, "Sapphire Ring");
         assert_eq!(third.price, Some(Price::new(500, Currency::Divine)));
+    }
+
+    /// 问了 4 个 id,其中 `zzz999` 已经没了 —— 服务端在它的位置上放了个 `null`。
+    /// 按 id 回话就能指着它说"就是这条没了",而不是只知道"少了一条"。
+    #[test]
+    fn a_gone_id_comes_back_as_none_in_request_order() {
+        let requested: Vec<String> = ["aaa111", "bbb222", "zzz999", "ccc333"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let pairs = parse_fetch_response_by_id(&requested, FETCH_JSON.as_bytes()).unwrap();
+
+        let shape: Vec<(&str, bool)> = pairs
+            .iter()
+            .map(|(id, listing)| (id.as_str(), listing.is_some()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("aaa111", true),
+                ("bbb222", true),
+                ("zzz999", false),
+                ("ccc333", true)
+            ]
+        );
+        assert_eq!(pairs[0].1.as_ref().unwrap().item_name, "Choir of the Storm");
+    }
+
+    /// **2026-09-07 实测的形状**(`trade_probe --observe`,匿名):拿一条真 id
+    /// 加一条把末 4 位改过的假 id 去 fetch,服务端回的是 **HTTP 200**、`result`
+    /// 数组**长度仍然等于问的个数**、查不到的那一格是 `null`,而且顺序就是
+    /// 请求里的顺序。不是 404,也不是少给一条。
+    ///
+    /// 这一条钉的就是那次真答复的形状 —— 市场观察全靠"哪个 id 变成了 null"
+    /// 来断定一条挂单没了,形状变了必须有人来看一眼。
+    #[test]
+    fn the_shape_the_server_really_answered_on_2026_09_07() {
+        // 真 id 在前、假 id 在后,`null` 落在末尾 —— 上面那个测试里 `null`
+        // 在中间,两处位置都验过了。
+        let real = "75da72f5ff03ee9fba70c3e1b9bb8f41c0abfca87d877b24aa01fbfc9150eb0e";
+        let fake = "75da72f5ff03ee9fba70c3e1b9bb8f41c0abfca87d877b24aa01fbfc9150fc1f";
+        let body = format!(
+            r#"{{"result":[{{"id":"{real}","listing":{{"indexed":"2026-09-07T12:47:39Z",
+               "price":{{"type":"~price","amount":1,"currency":"divine"}},
+               "account":{{"name":"poeSayad25#5334","online":{{"league":"Forbidden Rites"}}}},
+               "whisper":"@x hi"}},
+               "item":{{"name":"Choir of the Storm","typeLine":"Lapis Amulet"}}}},null]}}"#
+        );
+        let requested = vec![real.to_string(), fake.to_string()];
+        let pairs = parse_fetch_response_by_id(&requested, body.as_bytes()).unwrap();
+
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, real);
+        assert_eq!(pairs[0].1.as_ref().unwrap().account, "poeSayad25#5334");
+        assert_eq!(pairs[1].0, fake);
+        assert!(pairs[1].1.is_none(), "查不到的 id 就是 None");
+    }
+
+    /// 万一服务端不补 `null` 而是干脆少给一条,答案也必须一样 ——
+    /// 我们按 id 对号,不按位置。
+    #[test]
+    fn a_short_result_array_still_lines_up_with_the_request() {
+        let body = br#"{"result":[{"id":"ccc333","listing":{"indexed":"2026-09-06T09:40:00Z"},
+            "item":{"typeLine":"Sapphire Ring"}}]}"#;
+        let requested: Vec<String> = ["aaa111", "ccc333"].iter().map(|s| s.to_string()).collect();
+        let pairs = parse_fetch_response_by_id(&requested, body).unwrap();
+        assert_eq!(pairs[0].0, "aaa111");
+        assert!(pairs[0].1.is_none(), "第一个 id 没回来 = 它没了");
+        assert_eq!(pairs[1].1.as_ref().unwrap().type_line, "Sapphire Ring");
     }
 
     #[test]

@@ -159,13 +159,58 @@ pub fn default_label_for(query_json: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// 把查询 JSON 包成 search 接口的请求体,排序固定按价格升序 —— 我们只关心最便宜那几件。
+/// 把查询 JSON 包成 search 接口的请求体,排序固定按价格升序 —— 蹲价只关心最便宜那几件。
+pub fn search_request_body(query_json: &str) -> String {
+    with_sort(query_json, "price", "asc")
+}
+
+/// 同上,但排序键由调用方指定:市场观察要的是"最新挂上来的 100 条"
+/// (`with_sort(q, "indexed", "desc")`),不是"最便宜的 100 条"。
 ///
 /// 走 `serde_json::Value` 拼装(而不是字符串拼接),保证出去的一定是合法 JSON;
 /// 万一传进来的不是 JSON,退化成 `"query": null`,让服务端去报错而不是这里 panic。
-pub fn search_request_body(query_json: &str) -> String {
-    let query: Value = serde_json::from_str(query_json).unwrap_or(Value::Null);
+///
+/// 两种输入形状都认:搜索 id 解出来的是查询本身,而请求体是把它包在 `query`
+/// 里的。后者还可能自带一个 `sort` —— 我们只取 `query` 那一半,原来的排序
+/// 自然就被换掉了,这正是"替换或插入"想要的效果。
+pub fn with_sort(query_json: &str, field: &str, direction: &str) -> String {
+    json!({ "query": query_part(query_json), "sort": { field: direction } }).to_string()
+}
+
+/// 在查询上加一格"只看这个卖家",其余条件原样保留。
+///
+/// 交易站把卖家筛选放在 `filters.trade_filters.filters.account.input`(网页上
+/// 那个 Seller 输入框)。市场观察靠它区分"这单卖掉了"和"卖家整批撤了" ——
+/// 一条挂单消失时回头查一次卖家,他其它单还在就更像是卖掉了。
+pub fn with_seller_filter(query_json: &str, account: &str) -> String {
+    let mut query = query_part(query_json);
+    let trade_filters = object_entry(
+        object_entry(object_entry(&mut query, "filters"), "trade_filters"),
+        "filters",
+    );
+    *object_entry(trade_filters, "account") = json!({ "input": account });
     json!({ "query": query, "sort": { "price": "asc" } }).to_string()
+}
+
+/// 取"查询"那一半:外面套着 `query` 就往里走一步,没套就是它自己。
+fn query_part(query_json: &str) -> Value {
+    let value: Value = serde_json::from_str(query_json).unwrap_or(Value::Null);
+    match value.get("query") {
+        Some(inner) if inner.is_object() => inner.clone(),
+        _ => value,
+    }
+}
+
+/// 往对象里挖出(必要时建出)一个子对象,好把新格子塞进去而不动别的键。
+fn object_entry<'a>(parent: &'a mut Value, key: &str) -> &'a mut Value {
+    if !parent.is_object() {
+        *parent = json!({});
+    }
+    parent
+        .as_object_mut()
+        .expect("just replaced it with an object")
+        .entry(key.to_string())
+        .or_insert_with(|| json!({}))
 }
 
 /// URL 里 marker 之前那一截必须像个主机名(可带 scheme),否则一段随手粘来的
@@ -387,6 +432,67 @@ mod search_ref_tests {
         let body: Value = serde_json::from_str(&search_request_body(&json)).unwrap();
         assert_eq!(body["query"]["name"], "Choir of the Storm");
         assert_eq!(body["sort"]["price"], "asc");
+    }
+
+    /// 市场观察要"最新的 100 条",所以排序键得能换,查询本身一个字不能动。
+    #[test]
+    fn a_custom_sort_replaces_the_price_sort_and_keeps_the_query() {
+        let json = decode_search_id(FIXTURE_ID).unwrap();
+        let body: Value = serde_json::from_str(&with_sort(&json, "indexed", "desc")).unwrap();
+        assert_eq!(body["sort"], json!({ "indexed": "desc" }));
+        assert!(body["sort"].get("price").is_none(), "价格排序被换掉了");
+        assert_eq!(body["query"]["name"], "Choir of the Storm");
+        assert_eq!(body["query"]["status"]["option"], "online");
+    }
+
+    /// 请求体形状的输入(外面套着 `query`、自带一个 `sort`)也得认:
+    /// 不然会拼出 `{"query":{"query":…}}` 这种服务端读不懂的东西。
+    #[test]
+    fn a_request_shaped_input_is_unwrapped_before_the_sort_is_swapped() {
+        let body: Value = serde_json::from_str(&with_sort(
+            r#"{"query":{"name":"Mageblood"},"sort":{"price":"asc"}}"#,
+            "indexed",
+            "desc",
+        ))
+        .unwrap();
+        assert_eq!(body["query"], json!({ "name": "Mageblood" }));
+        assert_eq!(body["sort"], json!({ "indexed": "desc" }));
+    }
+
+    /// 卖家筛选塞在 `filters.trade_filters.filters.account.input`,
+    /// 查询里原有的条件(名字、词缀、别的 filters)一个都不能掉。
+    #[test]
+    fn a_seller_filter_is_added_without_dropping_the_rest_of_the_query() {
+        let body: Value = serde_json::from_str(&with_seller_filter(
+            r#"{"name":"Choir of the Storm","filters":{"type_filters":{"filters":{"ilvl":{"min":68}}}}}"#,
+            "山箏#5319",
+        ))
+        .unwrap();
+        let query = &body["query"];
+        assert_eq!(query["name"], "Choir of the Storm");
+        assert_eq!(
+            query["filters"]["type_filters"]["filters"]["ilvl"]["min"],
+            68
+        );
+        assert_eq!(
+            query["filters"]["trade_filters"]["filters"]["account"],
+            json!({ "input": "山箏#5319" })
+        );
+        assert_eq!(body["sort"], json!({ "price": "asc" }));
+    }
+
+    /// 查询里本来就有 `trade_filters`(比如"只看在线卖家")的时候,
+    /// 只加 account 这一格,兄弟格子留着。
+    #[test]
+    fn an_existing_trade_filter_keeps_its_siblings() {
+        let body: Value = serde_json::from_str(&with_seller_filter(
+            r#"{"filters":{"trade_filters":{"filters":{"price":{"max":5}}}}}"#,
+            "Seller#1234",
+        ))
+        .unwrap();
+        let trade = &body["query"]["filters"]["trade_filters"]["filters"];
+        assert_eq!(trade["price"]["max"], 5);
+        assert_eq!(trade["account"]["input"], "Seller#1234");
     }
 
     /// 蹲一件具体的暗金:查询里写着它的名字,备注名就该是那个名字。
