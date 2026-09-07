@@ -1481,8 +1481,8 @@ impl RuntimeActor {
                         status: 503,
                         message: format!(
                             "the trade site answered 503 to both travel requests for listing \
-                             {listing_id} — a fresh token did not help, so the seller (or your \
-                             own game client) is probably not online{}",
+                             {listing_id} — a fresh token did not help, so check that your own \
+                             game client is logged in and standing in a town or hideout{}",
                             detail_suffix(&excerpt)
                         ),
                     };
@@ -1502,10 +1502,14 @@ impl RuntimeActor {
 
     /// 刷新 token 的 fetch 回来了。
     ///
-    /// 三种"拿不到 token"分得很开:挂单没了、卖家离线、这次 fetch 没带
-    /// cookie。三种都是 [`HideoutOutcome::TokenMissing`],但用户该看见的话
-    /// 完全不一样 —— 第一种是"晚了一步",第二种是"人不在,谁去都没用",
-    /// 第三种是"你的会话有问题"。
+    /// 只看 token 在不在,不看卖家在不在线:即刻购买(instant buyout)的货
+    /// 就摆在卖家藏身处的商店里,官网对十几个小时没上线的卖家照样给
+    /// "去藏身处"。所以能不能传送是交易站发不发 token 说了算。
+    ///
+    /// 两种"拿不到 token"分得很开:挂单没了、这次 fetch 拿回来的挂单不带
+    /// token。两种都是 [`HideoutOutcome::TokenMissing`],但用户该看见的话
+    /// 不一样 —— 前一种是"晚了一步",后一种是"这条货不支持传送,或者你的
+    /// 会话有问题"。
     fn on_hideout_token(&mut self, alert_id: i64, listings: &[ListingSummary], now: i64) {
         let Some(flow) = self.hideout.get(&alert_id) else {
             return;
@@ -1522,26 +1526,13 @@ impl RuntimeActor {
             );
             return;
         };
-        if !listing.online {
-            // 卖家不在线,谁也传送不过去。交易站也就不会发 hideout_token。
-            let seller = seller_name(listing);
-            self.token_missing(
-                alert_id,
-                format!(
-                    "refetch of listing {listing_id} says {seller} is offline — \
-                     the trade site only hands out a hideout token for an online seller, \
-                     so there is nothing to send"
-                ),
-            );
-            return;
-        }
         let Some(token) = listing.hideout_token.clone() else {
             self.token_missing(
                 alert_id,
                 format!(
-                    "refetch of listing {listing_id} returned no hideout_token \
-                     (the request went out without a POESESSID, or the trade site \
-                     no longer offers travel for this listing)"
+                    "listing {listing_id} came back without a hideout_token — \
+                     it may not be an instant-buyout listing, or the fetch went \
+                     out without a session"
                 ),
             );
             return;
@@ -2005,18 +1996,6 @@ fn detail_suffix(excerpt: &str) -> String {
     }
 }
 
-/// 挂单上那个卖家怎么称呼。账号名空着(服务端偶尔不给)就退回角色名,
-/// 两个都空就说"the seller" —— 一句话里不该出现一个空洞。
-fn seller_name(listing: &ListingSummary) -> String {
-    for name in [&listing.account, &listing.character] {
-        let name = name.trim();
-        if !name.is_empty() {
-            return name.to_string();
-        }
-    }
-    "the seller".to_string()
-}
-
 /// 本地时区今天零点的 unix 秒。"今天叫了几次"按本地日期算才符合直觉;
 /// 算不出来(时区数据坏了)就退回"过去 24 小时"。
 fn start_of_today(now: i64) -> i64 {
@@ -2068,7 +2047,8 @@ mod actor_tests {
         whisper_error: Option<String>,
         /// fetch 回来的挂单带不带 hideout_token(真实世界里取决于带没带 cookie)。
         hideout_token: Option<String>,
-        /// fetch 回来的卖家在不在线。离线的卖家拿不到 hideout_token。
+        /// fetch 回来的卖家在不在线。跟 hideout_token 没关系:即刻购买的货
+        /// 摆在藏身处商店里,人不在也能传送过去。
         seller_offline: bool,
         /// fetch 回一个空 `result`(那件货在这几秒里被买走了)。
         fetch_returns_nothing: bool,
@@ -2745,10 +2725,12 @@ mod actor_tests {
             panic!("expected a Failed, got {outcomes:#?}");
         };
         assert_eq!(*status, 503);
-        // 换过 token 还是 503:该说的是"人多半不在线",而不是干巴巴一句
-        // "被拒了两次" —— 后者不告诉用户下一步该做什么。
+        // 换过 token 还是 503:该给的是下一步能做的事(去看自己的游戏客户端),
+        // 而不是干巴巴一句"被拒了两次",更不是甩锅给"卖家不在线"。
         assert!(message.contains("both travel requests"), "{message}");
-        assert!(message.contains("not online"), "{message}");
+        assert!(message.contains("your own game client"), "{message}");
+        assert!(message.contains("town or hideout"), "{message}");
+        assert!(!message.contains("not online"), "{message}");
         assert!(message.contains(r#"{"error":{"code":8}}"#), "{message}");
         // 再点一次也还是最多两次:这是"每次点击"的账,不是"每条提醒"的账。
         thread::sleep(Duration::from_millis(200));
@@ -2799,16 +2781,20 @@ mod actor_tests {
         // `TokenMissing` 上没有消息字段,所以"为什么"必须出现在日志里,
         // 而且要说清是哪一件货。
         assert!(
-            logged(&seen, &["no hideout_token", "POESESSID"]),
+            logged(
+                &seen,
+                &["came back without a hideout_token", "without a session"]
+            ),
             "{:#?}",
             logs(&seen)
         );
     }
 
-    /// 卖家离线:交易站不会给 hideout_token,发过去也没人接。
-    /// 这条必须是 `TokenMissing` + 一句说得清的日志,不是 `Failed(0)`。
+    /// 卖家显示离线,但挂单带着 token:即刻购买(instant buyout)的货就摆在
+    /// 人家藏身处的商店里,官网对十几个小时没上线的卖家照样给"去藏身处"。
+    /// 所以在不在线不作数,有 token 就发 —— 而且只发这一次。
     #[test]
-    fn an_offline_seller_is_a_missing_token_with_a_reason_not_a_bare_failure() {
+    fn an_offline_seller_with_a_token_still_travels() {
         let (transport, log) = FakeTrade::new();
         let handle =
             RuntimeHandle::start_offline(hideout_settings(), RuntimePaths::in_memory(), transport)
@@ -2817,7 +2803,7 @@ mod actor_tests {
         let mut seen = Vec::new();
         let alert_id = first_alert(&handle, &mut seen);
         {
-            // 重新抓回来的那一条:有 token,但人已经下线了。
+            // 重新抓回来的那一条:有 token,但人显示已经下线了。
             let mut log = log.lock().unwrap();
             log.hideout_token = Some("tok".to_string());
             log.seller_offline = true;
@@ -2826,12 +2812,45 @@ mod actor_tests {
 
         assert_eq!(
             outcomes,
+            vec![HideoutOutcome::Refreshed, HideoutOutcome::Sent],
+            "{seen:#?}"
+        );
+        assert_eq!(
+            log.lock().unwrap().whispers,
+            vec!["tok".to_string()],
+            "有 token 就该正好发一次"
+        );
+    }
+
+    /// 反过来:人在线也救不回一个不存在的 token。有没有 token 是唯一的判据,
+    /// 所以这一条必须还是 `TokenMissing`,而且一个请求都不发。
+    #[test]
+    fn an_online_seller_without_a_token_is_still_a_missing_token() {
+        let (transport, log) = FakeTrade::new();
+        let handle =
+            RuntimeHandle::start_offline(hideout_settings(), RuntimePaths::in_memory(), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        let alert_id = first_alert(&handle, &mut seen);
+        {
+            let mut log = log.lock().unwrap();
+            log.hideout_token = None;
+            log.seller_offline = false;
+        }
+        let outcomes = hideout_outcomes(&handle, &mut seen, alert_id);
+
+        assert_eq!(
+            outcomes,
             vec![HideoutOutcome::Refreshed, HideoutOutcome::TokenMissing],
             "{seen:#?}"
         );
-        assert!(log.lock().unwrap().whispers.is_empty(), "人都不在线了,别发");
+        assert!(log.lock().unwrap().whispers.is_empty(), "没 token 就别发");
         assert!(
-            logged(&seen, &["offline", "Seller", "hideout token"]),
+            logged(
+                &seen,
+                &["came back without a hideout_token", "instant-buyout"]
+            ),
             "{:#?}",
             logs(&seen)
         );
@@ -3033,31 +3052,6 @@ mod actor_tests {
             unreachable!()
         };
         assert!(message.ends_with("listing x"), "{message}");
-    }
-
-    /// 账号名空着也要说得出一个称呼,不能在句子中间留一个洞。
-    #[test]
-    fn a_seller_without_an_account_name_still_has_a_name() {
-        let mut listing = ListingSummary {
-            id: "a".to_string(),
-            item_name: "x".to_string(),
-            type_line: "x".to_string(),
-            price: None,
-            account: "Seller#1".to_string(),
-            character: "Char".to_string(),
-            online: false,
-            afk: false,
-            indexed: String::new(),
-            whisper: String::new(),
-            whisper_token: None,
-            hideout_token: None,
-            icon: String::new(),
-        };
-        assert_eq!(seller_name(&listing), "Seller#1");
-        listing.account = "  ".to_string();
-        assert_eq!(seller_name(&listing), "Char");
-        listing.character = String::new();
-        assert_eq!(seller_name(&listing), "the seller");
     }
 
     /// 没有会话时点"去藏身处":一句话说清楚,一个请求都不发。
