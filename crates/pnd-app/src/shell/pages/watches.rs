@@ -19,14 +19,14 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::switch::Switch;
 use gpui_component::{Sizable as _, Size, StyledExt as _};
 
-use pnd_domain::{Price, WatchId, parse_search_reference};
+use pnd_domain::{Price, WatchId, decode_search_id, default_label_for, parse_search_reference};
 use pnd_runtime::{LiveOffReason, LiveRunState, RuntimeCommand, WatchRunState, WatchStatus};
 use pnd_settings::{AppSettings, WatchEntry};
 use pnd_trade::{FETCH_POLICY, SEARCH_POLICY};
 
 use super::{Cell, TableContent, Tone, column, number_column};
 use crate::i18n::{self, Text};
-use crate::shell::link::{countdown_text, local_clock};
+use crate::shell::link::{countdown_text, local_clock, local_hm};
 use crate::shell::{
     AppShell, Choice, ChoiceSelect, choice_select, field_label, field_row, hint, page_heading,
     panel, picker, table,
@@ -197,10 +197,6 @@ pub fn watch_rows(
     text: &'static Text,
     now: i64,
 ) -> Vec<Vec<Cell>> {
-    // 秒推连上之后轮询会自己放慢一档。不说出来的话,状态那一格上的倒计时
-    // 突然从 5 分钟变成 15 分钟,看起来就像"轮询出问题了"。
-    let relaxed =
-        settings.watcher.poll_interval_when_live_seconds > settings.watcher.poll_interval_seconds;
     settings
         .watches
         .iter()
@@ -211,10 +207,7 @@ pub fn watch_rows(
                 Cell::plain(entry.label.clone()),
                 Cell::muted(entry.league.clone()),
                 Cell::data(entry.price_cap.display()),
-                Cell::new(
-                    status_text(state, live, text, now, relaxed),
-                    status_tone(state),
-                ),
+                Cell::new(status_text(state, live, text, now), status_tone(state)),
                 match live.and_then(|status| status.last_poll_at) {
                     Some(at) => Cell::data(local_clock(at)),
                     None => Cell::muted(text.watches_never),
@@ -273,7 +266,7 @@ pub(crate) fn live_text(live: LiveRunState, text: &'static Text, now: i64) -> St
         }
         LiveRunState::Connecting => text.live_connecting.to_owned(),
         LiveRunState::Connected { since } => {
-            i18n::fill(text.live_connected_since, &[&local_clock(since)])
+            i18n::fill(text.live_connected_since, &[&local_hm(since)])
         }
         LiveRunState::Backoff { until, attempt } => i18n::fill(
             text.live_backoff,
@@ -300,7 +293,6 @@ fn status_text(
     status: Option<&WatchStatus>,
     text: &'static Text,
     now: i64,
-    relaxed: bool,
 ) -> String {
     let word = status_word(state, text);
     if state == WatchRunState::Disabled {
@@ -326,14 +318,44 @@ fn status_text(
     if let Some(status) = status {
         line.push_str(" · ");
         line.push_str(&live_text(status.live, text, now));
-        // 只在"真连上了"而且"设置里那两档确实不一样"的时候说。连接中、
-        // 退避中都还在按普通档轮询,说了就是句假话。
-        if relaxed && matches!(status.live, LiveRunState::Connected { .. }) {
-            line.push(' ');
-            line.push_str(text.watches_live_relaxed);
-        }
     }
     line
+}
+
+/// 备注名:用户填了就听他的,留空就问搜索自己叫什么,再不行拿 id 前缀顶上。
+///
+/// 新增和"改这一条"走的是同一句 —— 改的时候把名字清空,拿到的也是从搜索里
+/// 取出来的名字,而不是又一次 `H4sIAAAAA`。
+fn label_for(typed: &str, search_id: &str) -> String {
+    let typed = typed.trim();
+    if !typed.is_empty() {
+        return typed.to_owned();
+    }
+    decode_search_id(search_id)
+        .ok()
+        .and_then(|query| default_label_for(&query))
+        .unwrap_or_else(|| search_id.chars().take(LABEL_FROM_ID_CHARS).collect())
+}
+
+/// 表下面那一句"倒计时怎么突然变长了"。
+///
+/// 为什么不写进状态那一格:那一列只有 430 像素,而这句话对每一条连上秒推的
+/// 搜索都是同一句 —— 抄 N 遍还把前面"还有多久轮询"挤没了。真连上了才说:
+/// 连接中、退避中都还在按普通档轮询,说了就是假话。
+fn live_relaxed_hint(
+    settings: &AppSettings,
+    status: &BTreeMap<WatchId, WatchStatus>,
+    text: &'static Text,
+) -> Option<&'static str> {
+    if settings.watcher.poll_interval_when_live_seconds <= settings.watcher.poll_interval_seconds {
+        return None;
+    }
+    settings
+        .watches
+        .iter()
+        .filter_map(|entry| status.get(&entry.id))
+        .any(|status| matches!(status.live, LiveRunState::Connected { .. }))
+        .then_some(text.watches_live_relaxed)
 }
 
 /// 框里的字。
@@ -372,6 +394,9 @@ impl AppShell {
                     .overflow_hidden()
                     .child(table(&self.watches_table)),
             )
+            // 整张表共用的一句注解:有搜索连上了秒推,所以那几条的轮询间隔
+            // 是放宽过的。没有这回事的时候它不出现。
+            .children(live_relaxed_hint(&self.settings, &self.watch_status, text).map(hint))
             .child(self.watches_row_actions(cx))
             .child(self.budget_strip())
     }
@@ -781,15 +806,9 @@ impl AppShell {
         Some(Price::from_trade(amount, &currency))
     }
 
-    /// 备注名。留空就拿搜索 id 的前几个字符顶上 —— 第一列全空的话,
-    /// 三条搜索长得一模一样。
+    /// 备注名那一格。留空的处理在 [`label_for`] 里。
     fn form_label(&self, search_id: &str, cx: &Context<Self>) -> String {
-        let label = text_of(&self.watches_form.label, cx);
-        if label.is_empty() {
-            search_id.chars().take(LABEL_FROM_ID_CHARS).collect()
-        } else {
-            label
-        }
+        label_for(&text_of(&self.watches_form.label, cx), search_id)
     }
 
     /// 表格里选中了一行 → 把那条搜索装进表单。
@@ -916,6 +935,9 @@ mod watches_page_tests {
     use super::*;
     use crate::i18n;
 
+    /// 一条真的搜索 id(Choir of the Storm),查询里写着物品名。
+    const FIXTURE_ID: &str = "H4sIAAAAAAAAAx2LvQnAIBBGV5GvdgLbjJAyWAhRFPRO9FIEcfdo2vcz0MXJ02EGuEpiggFTTuQxNcgVv8AROTXFQUn06hRuBfof13cNyFt35eheOKQsvm1hp50f6Xdj02AAAAA";
+
     fn settings() -> AppSettings {
         AppSettings {
             watches: vec![
@@ -1037,10 +1059,22 @@ mod watches_page_tests {
         assert_eq!(rows[1][5].text(), "—");
     }
 
-    /// 秒推连上之后轮询自己放慢一档。状态那一格必须说出来 —— 倒计时从
-    /// 5 分钟跳到 15 分钟,不解释的话看起来就像"轮询停了"。
+    /// 备注名留空时,名字从搜索自己身上取 —— `H4sIAAAAA` 认不出是什么东西。
     #[test]
-    fn a_relaxed_poll_interval_says_why() {
+    fn an_empty_label_comes_from_the_search_itself() {
+        assert_eq!(label_for("My amulet", FIXTURE_ID), "My amulet");
+        assert_eq!(label_for("   ", FIXTURE_ID), "Choir of the Storm");
+        // 解不开的 id(以及三样都没写的纯词缀搜索)才轮到 id 前缀顶上。
+        assert_eq!(label_for("", "notasearchid"), "notasearch");
+    }
+
+    /// 秒推连上之后轮询自己放慢一档,得有人说一声 —— 倒计时从 3 分钟跳到
+    /// 5 分钟,不解释的话看起来就像"轮询停了"。
+    ///
+    /// 但这句解释不进状态那一格:那一列只有 430 像素,挤进来就把前面
+    /// "还有多久轮询"一起裁掉了。它是整张表共用的一句话,所以放表下面。
+    #[test]
+    fn the_relaxed_note_sits_under_the_table_not_in_the_status_cell() {
         let mut settings = settings();
         let status = BTreeMap::from([(
             WatchId("w-1".to_string()),
@@ -1058,23 +1092,22 @@ mod watches_page_tests {
             settings.watcher.poll_interval_when_live_seconds
                 > settings.watcher.poll_interval_seconds
         );
-        let rows = watch_rows(&settings, &status, &i18n::ENGLISH, 1_000_000);
-        assert!(
-            rows[0][3]
-                .text()
-                .ends_with("(live connected, polling relaxed)"),
-            "{}",
-            rows[0][3].text()
-        );
+        for language in i18n::LANGUAGES {
+            let text = i18n::text(language);
+            let rows = watch_rows(&settings, &status, text, 1_000_000);
+            assert!(
+                !rows[0][3].text().contains('('),
+                "{language} 的状态格里还留着括号解释:{}",
+                rows[0][3].text()
+            );
+            let footer = live_relaxed_hint(&settings, &status, text);
+            assert_eq!(footer, Some(text.watches_live_relaxed));
+            assert!(!footer.unwrap().trim().is_empty());
+        }
 
         // 两档一样就没有"放宽"这回事,那句话不该出现。
         settings.watcher.poll_interval_when_live_seconds = settings.watcher.poll_interval_seconds;
-        let rows = watch_rows(&settings, &status, &i18n::ENGLISH, 1_000_000);
-        assert!(
-            !rows[0][3].text().contains("relaxed"),
-            "{}",
-            rows[0][3].text()
-        );
+        assert_eq!(live_relaxed_hint(&settings, &status, &i18n::ENGLISH), None);
     }
 
     /// 只有真连上了才说。连接中、退避中都还在按普通档轮询,说了就是假话。
@@ -1095,6 +1128,24 @@ mod watches_page_tests {
             "{}",
             rows[0][3].text()
         );
+        assert_eq!(
+            live_relaxed_hint(&settings(), &status, &i18n::ENGLISH),
+            None
+        );
+    }
+
+    /// "秒推自 15:18:49" 里的秒数在这一列上只是占地方:它回答的是"连上多久
+    /// 了",精确到分钟就够,而省下的三个字符正是状态格差的那几个。
+    #[test]
+    fn the_live_since_time_drops_the_seconds() {
+        for language in i18n::LANGUAGES {
+            let line = live_text(
+                LiveRunState::Connected { since: 1_000_000 },
+                i18n::text(language),
+                1_000_000,
+            );
+            assert_eq!(line.matches(':').count(), 1, "{language}: {line}");
+        }
     }
 
     #[test]

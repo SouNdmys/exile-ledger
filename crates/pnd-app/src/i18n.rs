@@ -119,8 +119,8 @@ catalogue! {
     watches_changes_saved,
     /// 改搜索本身要走"删了重加",因为 runtime 的一切都挂在这条搜索的 id 上。
     watches_edit_search_locked,
-    /// live 连上之后轮询会自动放慢,状态那一格得说出来 —— 否则看起来像
-    /// "轮询停了"。
+    /// live 连上之后轮询会自动放慢。这句写在表格下面而不是状态那一格里:
+    /// 每条连上的搜索都是同一句话,抄进 430 像素的格子里只会把倒计时挤掉。
     watches_live_relaxed,
     /// "1 divine = {} chaos / {} exalted"
     watches_rates,
@@ -500,7 +500,7 @@ pub static ENGLISH: Text = Text {
     watches_cancel_edit: "Cancel",
     watches_changes_saved: "Changes saved.",
     watches_edit_search_locked: "The search itself cannot be edited. To point this watch somewhere else, remove it and add the new search.",
-    watches_live_relaxed: "(live connected, polling relaxed)",
+    watches_live_relaxed: "Live search is connected, so those watches poll on the slower interval.",
     watches_rates: "1 divine = {} chaos / {} exalted",
     watches_rates_unknown: "rates not loaded yet",
     status_disabled: "disabled",
@@ -770,7 +770,7 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     watches_cancel_edit: "取消",
     watches_changes_saved: "已保存修改。",
     watches_edit_search_locked: "搜索本身改不了。要让这条搜索盯别的东西,把它删掉,重新粘一条进来。",
-    watches_live_relaxed: "(live 已连上,轮询放宽)",
+    watches_live_relaxed: "秒推已连上,连上的那几条按放宽后的间隔轮询。",
     watches_rates: "1 divine = {} chaos / {} exalted",
     watches_rates_unknown: "还没读到汇率",
     status_disabled: "已停用",

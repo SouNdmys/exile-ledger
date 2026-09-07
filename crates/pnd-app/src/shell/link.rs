@@ -850,6 +850,14 @@ pub(crate) fn local_clock(at: i64) -> String {
     local_format(at, "%H:%M:%S")
 }
 
+/// unix 秒 → 本地 `%H:%M`。状态那一格里的"秒推自 …"用它。
+///
+/// 秒推是连上就一直连着的,那个时间回答的是"连了多久了",精确到分钟绰绰有余;
+/// 而状态格只有 430 像素,省下来的三个字符正好是它差的那几个。
+pub(crate) fn local_hm(at: i64) -> String {
+    local_format(at, "%H:%M")
+}
+
 /// unix 秒 → 本地 `%m-%d %H:%M`。提醒历史用它:只有时分的话,
 /// 昨天和今天的提醒长得一模一样。
 pub(crate) fn local_stamp(at: i64) -> String {

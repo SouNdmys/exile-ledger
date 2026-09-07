@@ -138,6 +138,27 @@ pub fn decode_search_id(id: &str) -> Result<String, SearchIdError> {
     Ok(json)
 }
 
+/// 搜索自己带的名字,拿来当备注名的默认值。
+///
+/// 为什么不直接用搜索 id 的前缀:`H4sIAAAAA` 对人来说是一串噪音,而查询里
+/// 十有八九已经写着"我在找什么"了 —— 蹲一件暗金就是 `name`,蹲一类底子就是
+/// `type`,从关键词搜进来的是 `term`。三个都没有(纯词缀搜索)才轮到 id 顶上。
+pub fn default_label_for(query_json: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(query_json).ok()?;
+    // 两种形状都会递到这儿:搜索 id 解出来的是查询本身,而请求体是把它包在
+    // `query` 里的。有那一层就往里走一步,没有就当场用。
+    let query = match value.get("query") {
+        Some(inner) if inner.is_object() => inner,
+        _ => &value,
+    };
+    ["name", "type", "term"]
+        .into_iter()
+        .find_map(|key| query.get(key)?.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
 /// 把查询 JSON 包成 search 接口的请求体,排序固定按价格升序 —— 我们只关心最便宜那几件。
 ///
 /// 走 `serde_json::Value` 拼装(而不是字符串拼接),保证出去的一定是合法 JSON;
@@ -366,6 +387,46 @@ mod search_ref_tests {
         let body: Value = serde_json::from_str(&search_request_body(&json)).unwrap();
         assert_eq!(body["query"]["name"], "Choir of the Storm");
         assert_eq!(body["sort"]["price"], "asc");
+    }
+
+    /// 蹲一件具体的暗金:查询里写着它的名字,备注名就该是那个名字。
+    #[test]
+    fn a_named_search_labels_itself_with_the_item_name() {
+        assert_eq!(
+            default_label_for(r#"{"query":{"name":"Mageblood","status":{"option":"online"}}}"#),
+            Some("Mageblood".to_string())
+        );
+        // 搜索 id 解出来的是查询本身,外面没有 `query` 那一层,两种形状都得认。
+        let json = decode_search_id(FIXTURE_ID).unwrap();
+        assert_eq!(
+            default_label_for(&json),
+            Some("Choir of the Storm".to_string())
+        );
+    }
+
+    /// 没有名字就退到底子,再退到关键词 —— 都比一串 base64 认得出来。
+    #[test]
+    fn a_type_only_search_falls_back_to_the_type_then_the_term() {
+        assert_eq!(
+            default_label_for(r#"{"query":{"type":"Sapphire Ring","stats":[]}}"#),
+            Some("Sapphire Ring".to_string())
+        );
+        assert_eq!(
+            default_label_for(r#"{"query":{"term":"tornado shot"}}"#),
+            Some("tornado shot".to_string())
+        );
+    }
+
+    /// 纯词缀搜索三样都没有,这时候没有比 id 前缀更好的东西,所以返回 `None`
+    /// 让调用方去顶。空字符串也算没有 —— 空的备注名和没填一样难认。
+    #[test]
+    fn a_search_with_neither_a_name_nor_a_type_has_no_default_label() {
+        assert_eq!(
+            default_label_for(r#"{"query":{"stats":[{"type":"and","filters":[]}]}}"#),
+            None
+        );
+        assert_eq!(default_label_for(r#"{"query":{"name":"   "}}"#), None);
+        assert_eq!(default_label_for("not json at all"), None);
     }
 
     #[test]

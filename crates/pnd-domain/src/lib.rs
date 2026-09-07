@@ -8,6 +8,6 @@ pub mod search_ref;
 pub use listing::{ListingSummary, WatchId};
 pub use price::{Currency, CurrencyRates, Price, PriceCap, Verdict, judge, to_divine_milli};
 pub use search_ref::{
-    SearchIdError, SearchRef, decode_search_id, encode_league_path, live_page_url,
-    parse_search_reference, search_page_url, search_request_body,
+    SearchIdError, SearchRef, decode_search_id, default_label_for, encode_league_path,
+    live_page_url, parse_search_reference, search_page_url, search_request_body,
 };
