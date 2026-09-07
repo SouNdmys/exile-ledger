@@ -184,7 +184,7 @@ impl Default for NinjaTuning {
             top_global_skills: 10,
             top_uniques: 20,
             refresh_hours: 24,
-            min_request_gap_ms: 1000,
+            min_request_gap_ms: 2000,
             hardcore: false,
         }
     }
