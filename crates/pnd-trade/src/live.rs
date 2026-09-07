@@ -228,9 +228,14 @@ pub fn describe_live_message(text: &str) -> String {
     };
     match &value {
         Value::Object(fields) => {
-            let keys: Vec<String> = fields.keys().map(|key| format!("{key:?}")).collect();
+            // 显式按键名排序:serde_json 的对象顺序取决于有没有开 `preserve_order`,
+            // 而那个特性是整个工作区一起决定的(gpui 会打开它),单独编译这个
+            // crate 和整仓编译会得到两种顺序。日志行不该随编译方式变。
+            let mut sorted: Vec<(&String, &Value)> = fields.iter().collect();
+            sorted.sort_by(|left, right| left.0.cmp(right.0));
+            let keys: Vec<String> = sorted.iter().map(|(key, _)| format!("{key:?}")).collect();
             let mut out = format!("keys=[{}]", keys.join(", "));
-            for (key, value) in fields {
+            for (key, value) in sorted {
                 out.push(' ');
                 out.push_str(&describe_field(key, value));
             }
