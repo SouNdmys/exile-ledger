@@ -56,11 +56,14 @@ const REMEMBERED_CARDS: usize = 16;
 const CARD_TITLE_CHARS: usize = 46;
 const CARD_LINE_CHARS: usize = 60;
 
-/// 交易站的报错正文裁到这个长度。
+/// "去藏身处"那一行的长度上限。
 ///
-/// 它偶尔回的是一整页 HTML;整页跟在"失败 HTTP 503:"后面,真正有用的
-/// 那半句会被挤到屏幕外,而卡片脚注根本放不下。
-const HIDEOUT_MESSAGE_CHARS: usize = 120;
+/// 裁的是**拼好之后的整行**,不是中间某一段:平台层给卡片脚注的额度就是
+/// 160 个字,而"状态码 + 交易站说的那句话"永远排在最前面,所以裁掉的
+/// 一定是句尾的模板。早先裁的是消息那一段(120 字),于是同一条报错在
+/// 英文界面上 146 个字、中文界面上 137 个字 —— 白白扔掉十几个字的额度,
+/// 扔掉的还正好是"下一步该干嘛"那半句。
+const HIDEOUT_LINE_CHARS: usize = 160;
 
 // ---------------------------------------------------------------------
 // 启动
@@ -754,26 +757,30 @@ pub(crate) fn card_text_for(
 /// 纯函数带测试:这句话会同时出现在卡片脚注、状态行和提醒记录页,而这四种
 /// 结局里有三种是"没成",用户凭这一句判断下一步该干嘛(去网页点 Travel、
 /// 还是先去设置页粘 cookie)。
+///
+/// 排版只有一条纪律:**状态码和交易站说的那句原因排在最前面,裁只裁句尾。**
+/// runtime 那边已经把 GGG 的报错(`GGG error 6: Forbidden`)提到了消息开头,
+/// 所以这一行前几十个字必然是"码 + 为什么",后面的模板被
+/// [`HIDEOUT_LINE_CHARS`] 裁掉也不影响判断。
 #[must_use]
 pub(crate) fn hideout_text(outcome: &HideoutOutcome, text: &'static Text) -> String {
-    match outcome {
+    let line = match outcome {
         HideoutOutcome::Sent => text.hideout_sent.to_owned(),
         HideoutOutcome::NoSession => text.hideout_no_session.to_owned(),
         HideoutOutcome::TokenMissing => text.hideout_token_missing.to_owned(),
         HideoutOutcome::Refreshed => text.hideout_refreshing.to_owned(),
         // 状态码 0 = 请求压根没出门(网络断了、URL 拼不出来)。写成
         // "HTTP 0" 只会让人去查一个不存在的状态码,所以这一档单独说。
-        HideoutOutcome::Failed { status: 0, message } => i18n::fill(
-            text.hideout_not_sent,
-            &[&clip(message, HIDEOUT_MESSAGE_CHARS)],
-        ),
+        HideoutOutcome::Failed { status: 0, message } => {
+            i18n::fill(text.hideout_not_sent, &[message])
+        }
         // 状态码和交易站自己说的那句话是失败时仅有的线索(503 = token 过期,
-        // 403 = 会话不对):吞掉它们等于让人只能重试到死。
-        HideoutOutcome::Failed { status, message } => i18n::fill(
-            text.hideout_failed_http,
-            &[&status.to_string(), &clip(message, HIDEOUT_MESSAGE_CHARS)],
-        ),
-    }
+        // 403 = token 过期或会话不对):吞掉它们等于让人只能重试到死。
+        HideoutOutcome::Failed { status, message } => {
+            i18n::fill(text.hideout_failed_http, &[&status.to_string(), message])
+        }
+    };
+    clip(&line, HIDEOUT_LINE_CHARS)
 }
 
 /// 提醒历史里那个动作码 → 同一句人话。
@@ -1052,8 +1059,65 @@ mod link_tests {
             message: "x".repeat(5_000),
         };
         let line = hideout_text(&outcome, &i18n::ENGLISH);
-        assert!(line.chars().count() < 160, "{} 个字", line.chars().count());
+        assert!(line.chars().count() <= 160, "{} 个字", line.chars().count());
         assert!(line.ends_with('…'), "{line}");
+    }
+
+    /// 上限该管的是"拼好之后的那一行",不是中间那一段消息。
+    ///
+    /// 裁中间那一段的话,每种语言剩下的长度都不一样,而且都没用满卡片脚注
+    /// 的额度 —— 白扔掉的字正好是句尾"下一步该干嘛"那半句。
+    #[test]
+    fn the_hideout_line_is_capped_as_a_whole_line() {
+        let long = HideoutOutcome::Failed {
+            status: 403,
+            message: "x".repeat(500),
+        };
+        for language in i18n::LANGUAGES {
+            let line = hideout_text(&long, i18n::text(language));
+            assert_eq!(
+                line.chars().count(),
+                HIDEOUT_LINE_CHARS,
+                "{language}: {line}"
+            );
+        }
+        // 短的一句不该被填充,也不该无端多一个省略号。
+        let short = hideout_text(
+            &HideoutOutcome::Failed {
+                status: 403,
+                message: "nope".to_string(),
+            },
+            &i18n::ENGLISH,
+        );
+        assert_eq!(short, "hideout: failed HTTP 403: nope");
+    }
+
+    /// 真实世界的那一行:一个非 HTML 的 403,body 是 GGG 的错误 JSON。
+    /// 状态码和原因必须挨着排在最前面 —— 后面的模板被裁掉都无所谓,
+    /// 这两样是用户唯一能拿去判断"下一步干嘛"的东西。
+    #[test]
+    fn a_ggg_error_on_a_403_leads_the_footer() {
+        let outcome = HideoutOutcome::Failed {
+            status: 403,
+            message: format!(
+                "GGG error 6: Forbidden — the trade site refused the travel request for \
+                 listing {} with HTTP 403 — the POESESSID is probably no longer valid",
+                "abc123".repeat(20)
+            ),
+        };
+        let line = hideout_text(&outcome, &i18n::ENGLISH);
+        assert!(
+            line.starts_with("hideout: failed HTTP 403: GGG error 6: Forbidden — "),
+            "{line}"
+        );
+        assert!(line.chars().count() <= HIDEOUT_LINE_CHARS, "{line}");
+        assert!(line.ends_with('…'), "长的那条要在句尾裁:{line}");
+
+        assert!(
+            hideout_text(&outcome, &i18n::SIMPLIFIED_CHINESE)
+                .starts_with("去藏身处:失败 HTTP 403:GGG error 6: Forbidden"),
+            "中文那一行也一样"
+        );
     }
 
     /// 结局要能塞进卡片脚注 —— 那一行有长度上限,超了整张卡片就构造不出来。

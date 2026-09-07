@@ -30,7 +30,7 @@ use pnd_storage::{
 use pnd_trade::live::{LiveConfig, MAX_LIVE_CONNECTIONS_PER_ACCOUNT};
 use pnd_trade::{
     BucketUsage, Budget, MAX_FETCH_IDS, SEARCH_LONG_WINDOW_REQUESTS, SEARCH_LONG_WINDOW_SECS,
-    TradeClient,
+    TradeClient, ggg_error, jwt_expiry,
 };
 use thiserror::Error;
 
@@ -43,8 +43,8 @@ use crate::live_worker::{
     LiveConnector, LiveEvent, LiveOffReason, LiveRunState, LiveWorkerConfig, LiveWorkerHandle,
     TungsteniteConnector, spawn_live_worker,
 };
-use crate::now_secs;
 use crate::poll::{PollOutcome, PollScheduler, budget_floor_interval};
+use crate::{describe_token, now_secs};
 
 /// 汇率多久重读一次。ninja 自己的缓存是 5 分钟,15 分钟一次既不会读到
 /// 陈年数据,也不至于为了一张换算表天天打扰人家。
@@ -66,9 +66,18 @@ const HIDEOUT_WHISPER_LABEL: &str = "hideout-whisper";
 /// 设置页那个"测试会话"发出去的一次搜索。
 const SESSION_CHECK_LABEL: &str = "session-check";
 
-/// hideout_token 超过这么久就当它过期了,点按钮时先重新 fetch 一次。
+/// token 里没有 `exp` 时的兜底:拿到超过这么久就当它过期了。
 /// 计划里定的 10 分钟 —— 那是个短命 JWT。
+///
+/// 只是兜底:token 自己带 `exp` 的时候听它的(见 [`usable_token`])。
+/// 2026-09-07 那次 403 的头号嫌疑就是"真实 TTL 比这条规矩短"。
 const HIDEOUT_TOKEN_MAX_AGE_SECS: i64 = 600;
+
+/// `exp` 只剩这么点(秒)就别发了,先换一张。
+///
+/// 30 秒是给路上留的:请求要在网关队列里排一下、TLS 要握一次手,再加上
+/// 本机和服务端的时钟差。卡着最后一秒发出去,到那头正好过期。
+const HIDEOUT_TOKEN_EXPIRY_MARGIN_SECS: i64 = 30;
 
 /// 一次点击最多 POST 几次 whisper。两次:原始 token 一次,换过 token 再一次。
 /// 再不成就停手 —— 反复捅一个拒绝我们的接口没有意义。
@@ -1424,8 +1433,17 @@ impl RuntimeActor {
         self.hideout.insert(alert_id, flow_for(&row));
         match token {
             Some(token) => self.post_whisper(alert_id, &token),
-            // 没有 token,或者它已经太老了:先去换一个新的。
-            None => self.refresh_hideout_token(alert_id),
+            // 没有 token,或者它已经(快)作废了:先去换一张新的。
+            //
+            // 这一句得留在日志里:不然"点一次却打了两个请求"看着像 bug,
+            // 而真跑之后要靠它回答"到底是没 token 还是 exp 过了"。
+            None => {
+                self.emit(RuntimeEvent::Log(format!(
+                    "hideout alert {alert_id}: refetching first — hideout_token {}",
+                    describe_token(row.hideout_token.as_deref(), now)
+                )));
+                self.refresh_hideout_token(alert_id);
+            }
         }
     }
 
@@ -1511,23 +1529,15 @@ impl RuntimeActor {
                 let _ = status;
                 self.finish_hideout(alert_id, HideoutOutcome::Sent);
             }
-            ReplyKind::Whisper(Err(GatewayError::Status {
-                status: 503,
-                excerpt,
-            })) => {
-                // 503 差不多就是"这个 token 过期了"。换一个再试一次,
-                // 但只换一次。
+            ReplyKind::Whisper(Err(GatewayError::Status { status, excerpt }))
+                if looks_like_a_stale_token(status) =>
+            {
+                // 401/403/503 差不多都是"这个 token 不好使了"。换一个再试
+                // 一次,但只换一次。(HTML 的 403 走不到这里 —— 网关把它
+                // 认成 `CloudflareHold` 了,换新 token 也照样被拦。)
                 let refreshed = self.hideout.get(&alert_id).is_some_and(|f| f.refreshed);
                 if refreshed {
-                    let outcome = HideoutOutcome::Failed {
-                        status: 503,
-                        message: format!(
-                            "the trade site answered 503 to both travel requests for listing \
-                             {listing_id} — a fresh token did not help, so check that your own \
-                             game client is logged in and standing in a town or hideout{}",
-                            detail_suffix(&excerpt)
-                        ),
-                    };
+                    let outcome = hideout_retry_exhausted(status, &listing_id, &excerpt);
                     self.finish_hideout(alert_id, outcome);
                 } else {
                     self.refresh_hideout_token(alert_id);
@@ -1864,11 +1874,21 @@ fn healthy_state(live: LiveRunState) -> WatchRunState {
 
 /// 手上这个 hideout_token 还能直接用吗。
 ///
-/// 纯函数:超过 [`HIDEOUT_TOKEN_MAX_AGE_SECS`] 就当它过期了(它是个短命 JWT,
-/// 我们不解它、也不验签,只按"什么时候拿到的"算)。没有取回时刻的一律当过期,
-/// 宁可多 fetch 一次也不要发一个必然被拒的请求。
+/// 纯函数,两条规矩,顺序要紧:
+///
+/// 1. **token 自己说了什么时候作废(`exp`),就听它的。** 它是那张票的
+///    发行方写的,比我们从外面猜准。剩不到
+///    [`HIDEOUT_TOKEN_EXPIRY_MARGIN_SECS`] 秒就当它已经没了。
+/// 2. 没有 `exp` 才退回"拿到多久了":超过 [`HIDEOUT_TOKEN_MAX_AGE_SECS`]
+///    当过期,连什么时候拿的都不知道也当过期。
+///
+/// 只解码不验签 —— 我们要的只是一个时刻,没有任何一处拿它做安全判断。
+/// 宁可多 fetch 一次,也不要发一个必然被拒的请求。
 fn usable_token(token: Option<&str>, fetched_at: Option<i64>, now: i64) -> Option<String> {
     let token = token.map(str::trim).filter(|token| !token.is_empty())?;
+    if let Some(exp) = jwt_expiry(token) {
+        return (exp - now > HIDEOUT_TOKEN_EXPIRY_MARGIN_SECS).then(|| token.to_string());
+    }
     let fetched_at = fetched_at?;
     (now - fetched_at <= HIDEOUT_TOKEN_MAX_AGE_SECS).then(|| token.to_string())
 }
@@ -1958,6 +1978,50 @@ impl HideoutStep {
     }
 }
 
+/// 这个状态码值不值得"换一张 token 再试一次"。
+///
+/// 503 是计划里就写着的("通常是 token 过期")。401/403 是 2026-09-07 那次
+/// 真跑加进来的:一条挂了 37 分钟的挂单点下去回了个**非 HTML** 的 403 ——
+/// 那不是 Cloudflare(那种带 HTML,网关另有一条路),是交易站自己在说
+/// "这张票我不认"。换一张新的正好能分清"票过期了"和"人不认了":
+/// 换过还是同一个码,才轮到怀疑会话。
+fn looks_like_a_stale_token(status: u16) -> bool {
+    matches!(status, 401 | 403 | 503)
+}
+
+/// 换过 token 还是被拒:这是最后一句话,所以必须说清下一步能做什么。
+///
+/// 503 和 401/403 给的建议不一样,因为它们说的根本不是一件事:503 是
+/// "服务端这会儿不接这一单"(多半是你自己的游戏客户端不在城里),
+/// 401/403 是"它不认你这个人"。
+fn hideout_retry_exhausted(status: u16, listing_id: &str, excerpt: &str) -> HideoutOutcome {
+    let advice = if status == 503 {
+        "check that your own game client is logged in and standing in a town or hideout"
+    } else {
+        "the POESESSID is probably no longer valid — paste a fresh one into settings"
+    };
+    let (reason, detail) = excerpt_parts(excerpt);
+    HideoutOutcome::Failed {
+        status,
+        message: format!(
+            "{reason}the trade site answered {status} to both travel requests for listing \
+             {listing_id} — a fresh token did not help, so {advice}{detail}"
+        ),
+    }
+}
+
+/// 交易站的报错正文 → (提到句首的原因, 挂在句尾的原文)。
+///
+/// 认得出是 GGG 的错误就把那句话提到最前面,后面的模板随便裁;认不出来就
+/// 原样挂在句尾,一个字都不丢。为什么要提前:卡片脚注和状态行都会被截断,
+/// 而被截掉的必须是模板 —— 那句"为什么"是这一行里唯一有信息量的东西。
+fn excerpt_parts(excerpt: &str) -> (String, String) {
+    match ggg_error(excerpt) {
+        Some(reason) => (format!("{reason} — "), String::new()),
+        None => (String::new(), detail_suffix(excerpt)),
+    }
+}
+
 /// 一次网关失败 → 卡片脚注上那句话。
 ///
 /// 纯函数,所以每一条路径都能在测试里钉死。`status` 只有在服务端真的答了
@@ -2000,31 +2064,39 @@ fn hideout_failure(step: HideoutStep, listing_id: &str, error: &GatewayError) ->
         GatewayError::Status {
             status: 404,
             excerpt,
-        } => (
-            404,
-            format!(
-                "listing {listing_id} is gone — the trade site answered 404 to {what}{}",
-                detail_suffix(excerpt)
-            ),
-        ),
+        } => {
+            let (reason, detail) = excerpt_parts(excerpt);
+            (
+                404,
+                format!(
+                    "{reason}listing {listing_id} is gone — \
+                     the trade site answered 404 to {what}{detail}"
+                ),
+            )
+        }
         GatewayError::Status {
             status: status @ (401 | 403),
             excerpt,
-        } => (
-            *status,
-            format!(
-                "the trade site refused {what} for listing {listing_id} with HTTP {status} — \
-                 the POESESSID is probably no longer valid{}",
-                detail_suffix(excerpt)
-            ),
-        ),
-        GatewayError::Status { status, excerpt } => (
-            *status,
-            format!(
-                "the trade site answered HTTP {status} to {what} for listing {listing_id}{}",
-                detail_suffix(excerpt)
-            ),
-        ),
+        } => {
+            let (reason, detail) = excerpt_parts(excerpt);
+            (
+                *status,
+                format!(
+                    "{reason}the trade site refused {what} for listing {listing_id} with \
+                     HTTP {status} — the POESESSID is probably no longer valid{detail}"
+                ),
+            )
+        }
+        GatewayError::Status { status, excerpt } => {
+            let (reason, detail) = excerpt_parts(excerpt);
+            (
+                *status,
+                format!(
+                    "{reason}the trade site answered HTTP {status} to {what} \
+                     for listing {listing_id}{detail}"
+                ),
+            )
+        }
     };
     HideoutOutcome::Failed { status, message }
 }
@@ -2971,6 +3043,127 @@ mod actor_tests {
         );
     }
 
+    /// 401/403 和 503 一样,可能只是"这张 token 过期了"—— 2026-09-07 那次
+    /// 真跑里,一条离线卖家的挂单点下去就是个非 HTML 的 403。所以这两个码
+    /// 也走"换一张再试一次",而且仍然只换一次、只再试一次。
+    #[test]
+    fn a_401_or_403_refreshes_the_token_and_retries_exactly_once() {
+        for refused in [401u16, 403] {
+            let (transport, log) = FakeTrade::new();
+            {
+                let mut log = log.lock().unwrap();
+                log.hideout_token = Some("tok".to_string());
+                log.whisper_statuses.push_back(refused);
+                log.whisper_statuses.push_back(200);
+            }
+            let handle = RuntimeHandle::start_offline(
+                hideout_settings(),
+                RuntimePaths::in_memory(),
+                transport,
+            )
+            .unwrap();
+
+            let mut seen = Vec::new();
+            let alert_id = first_alert(&handle, &mut seen);
+            let fetches_before = log.lock().unwrap().fetches.len();
+            let outcomes = hideout_outcomes(&handle, &mut seen, alert_id);
+
+            assert_eq!(
+                outcomes,
+                vec![HideoutOutcome::Refreshed, HideoutOutcome::Sent],
+                "{refused}: {seen:#?}"
+            );
+            let log = log.lock().unwrap();
+            assert_eq!(log.whispers.len(), 2, "{refused}: 刷新之后正好再试一次");
+            assert_eq!(
+                log.fetches.len(),
+                fetches_before + 1,
+                "{refused}: 刷新 token 只该多打一次 fetch"
+            );
+        }
+    }
+
+    /// 换过 token 还是 403:停手。而且那句话要说"会话可能不认你了",
+    /// 不是让人去看自己站在哪儿 —— 403 和 503 的下一步完全不同。
+    #[test]
+    fn two_403s_give_up_and_never_post_a_third_time() {
+        let (transport, log) = FakeTrade::new();
+        {
+            let mut log = log.lock().unwrap();
+            log.hideout_token = Some("tok".to_string());
+            log.whisper_statuses.extend([403, 403, 403, 403]);
+            log.whisper_body = Some(r#"{"error":{"code":6,"message":"Forbidden"}}"#.to_string());
+        }
+        let handle =
+            RuntimeHandle::start_offline(hideout_settings(), RuntimePaths::in_memory(), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        let alert_id = first_alert(&handle, &mut seen);
+        let outcomes = hideout_outcomes(&handle, &mut seen, alert_id);
+
+        assert_eq!(outcomes[0], HideoutOutcome::Refreshed);
+        let HideoutOutcome::Failed { status, message } = &outcomes[1] else {
+            panic!("expected a Failed, got {outcomes:#?}");
+        };
+        assert_eq!(*status, 403);
+        // 服务端说的那句话排在最前面:后面的模板被裁掉也没关系,它不能。
+        assert!(message.starts_with("GGG error 6: Forbidden"), "{message}");
+        assert!(message.contains("both travel requests"), "{message}");
+        assert!(message.contains("POESESSID"), "{message}");
+        assert!(
+            !message.contains("town or hideout"),
+            "403 不是'你不在城里':{message}"
+        );
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            log.lock().unwrap().whispers.len(),
+            2,
+            "第三次 POST 不该存在"
+        );
+    }
+
+    /// 交易站的报错正文认得出来就提到句首。理由很实在:卡片脚注和状态行
+    /// 都会被裁短,裁掉的该是模板,不是唯一有信息量的那半句。
+    #[test]
+    fn a_ggg_error_body_leads_the_sentence() {
+        let refused = hideout_failure(
+            HideoutStep::Whisper,
+            "listing-9",
+            &GatewayError::Status {
+                status: 403,
+                excerpt: r#"{"error":{"code":6,"message":"Forbidden"}}"#.to_string(),
+            },
+        );
+        let HideoutOutcome::Failed { status, message } = refused else {
+            unreachable!()
+        };
+        assert_eq!(status, 403);
+        assert!(
+            message.starts_with("GGG error 6: Forbidden — "),
+            "{message}"
+        );
+        assert!(message.contains("listing-9"), "{message}");
+        assert!(
+            !message.contains(r#"{"error""#),
+            "翻译过就别在句尾再挂一遍原文:{message}"
+        );
+
+        // 认不出来的 body 一个字都不丢,还是原样挂在句尾。
+        let raw = hideout_failure(
+            HideoutStep::Whisper,
+            "listing-9",
+            &GatewayError::Status {
+                status: 500,
+                excerpt: "upstream exploded".to_string(),
+            },
+        );
+        let HideoutOutcome::Failed { message, .. } = raw else {
+            unreachable!()
+        };
+        assert!(message.ends_with(": upstream exploded"), "{message}");
+    }
+
     /// 事件流里的每一句日志。失败的原因走这条路 —— 卡片脚注只放得下
     /// 一个状态码。
     fn logs(seen: &[RuntimeEvent]) -> Vec<String> {
@@ -3113,13 +3306,17 @@ mod actor_tests {
 
     /// whisper 被拒了(JSON 的 403):状态码要是真的 403,消息里要有
     /// 服务端 body 的那句话 —— 早先这两样都丢了,只剩一个 `失败(0)`。
+    ///
+    /// 两次都回 403:第一次会换 token 再试,所以要连着拒两次才走到结局。
     #[test]
     fn a_refused_whisper_keeps_the_real_status_and_the_body() {
         let (transport, log) = FakeTrade::new();
         {
             let mut log = log.lock().unwrap();
-            log.hideout_token = Some("tok".to_string());
-            log.whisper_statuses.push_back(403);
+            // 故意不叫 "tok":那三个字母是英文单词 token 的前缀,
+            // 用它去查"token 有没有泄进消息里"永远查不准。
+            log.hideout_token = Some("secret-jwt-value".to_string());
+            log.whisper_statuses.extend([403, 403]);
             log.whisper_body = Some(r#"{"error":{"code":6,"message":"Forbidden"}}"#.to_string());
         }
         let handle =
@@ -3136,8 +3333,15 @@ mod actor_tests {
         assert_eq!(*status, 403, "状态码不能被抹成 0");
         assert!(message.contains("POESESSID"), "{message}");
         assert!(message.contains("Forbidden"), "body 那句话要带上:{message}");
-        assert!(!message.contains("tok"), "token 不许出现在消息里:{message}");
-        assert_eq!(log.lock().unwrap().whispers.len(), 1, "403 不该重试");
+        assert!(
+            !message.contains("secret-jwt-value"),
+            "token 不许出现在消息里:{message}"
+        );
+        assert_eq!(
+            log.lock().unwrap().whispers.len(),
+            2,
+            "换一次 token 再试一次,就这两次"
+        );
         assert!(logged(&seen, &["failed (HTTP 403)"]), "{:#?}", logs(&seen));
     }
 
@@ -3172,6 +3376,13 @@ mod actor_tests {
             logged(&seen, &["failed (no HTTP answer)", "Cloudflare"]),
             "{:#?}",
             logs(&seen)
+        );
+        // 403 走"换 token 再试一次",但 **HTML 的** 403 不走:那不是交易站
+        // 在拒绝我们,是根本没到交易站。换十张新 token 也一样被拦。
+        assert_eq!(
+            log.lock().unwrap().whispers.len(),
+            1,
+            "Cloudflare 的 403 不该重试"
         );
     }
 
@@ -3297,6 +3508,68 @@ mod actor_tests {
 
         assert_eq!(outcomes, vec![HideoutOutcome::NoSession]);
         assert!(log.lock().unwrap().whispers.is_empty());
+    }
+
+    /// 造一张"在 `exp` 这一刻作废"的 JWT。头和载荷是真的 base64url JSON,
+    /// 签名那一段是占位符 —— 我们从来不看它。
+    fn jwt_expiring_at(exp: i64) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        fn encode(bytes: &[u8]) -> String {
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let b = [
+                    chunk[0],
+                    *chunk.get(1).unwrap_or(&0),
+                    *chunk.get(2).unwrap_or(&0),
+                ];
+                let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+                for i in 0..chunk.len() + 1 {
+                    out.push(ALPHABET[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
+                }
+            }
+            out
+        }
+        format!(
+            "{}.{}.{}",
+            encode(br#"{"alg":"HS256","typ":"JWT"}"#),
+            encode(format!(r#"{{"exp":{exp}}}"#).as_bytes()),
+            "c2lnbmF0dXJl"
+        )
+    }
+
+    /// token 自己说了什么时候作废,就该听它的 —— "才拿到一分钟"救不了一张
+    /// 五秒后就过期的票。这是那次 403 的第一个嫌疑:真实 TTL 比我们那条
+    /// 10 分钟的规矩短。
+    #[test]
+    fn a_token_expiring_in_five_seconds_is_refetched_even_though_it_is_a_minute_old() {
+        let now = 1_757_260_800;
+        let a_minute_ago = Some(now - 60);
+
+        assert_eq!(
+            usable_token(Some(&jwt_expiring_at(now + 5)), a_minute_ago, now),
+            None,
+            "五秒后就作废,发出去也是白发"
+        );
+        assert!(
+            usable_token(Some(&jwt_expiring_at(now + 600)), a_minute_ago, now).is_some(),
+            "还有十分钟,直接发"
+        );
+        // 30 秒的余量是给路上留的(排队 + TLS 握手 + 两头的时钟差):
+        // 卡在边上的一律先换一张。
+        assert_eq!(
+            usable_token(Some(&jwt_expiring_at(now + 30)), a_minute_ago, now),
+            None
+        );
+        assert!(usable_token(Some(&jwt_expiring_at(now + 31)), a_minute_ago, now).is_some());
+        assert_eq!(
+            usable_token(Some(&jwt_expiring_at(now - 1)), a_minute_ago, now),
+            None,
+            "已经过期了"
+        );
+        // exp 说了算:连"什么时候拿到的"都不需要知道。
+        assert!(usable_token(Some(&jwt_expiring_at(now + 600)), None, now).is_some());
+        // 反过来也一样 —— 半小时前拿的,但它说自己还有十分钟,那就照发。
+        assert!(usable_token(Some(&jwt_expiring_at(now + 600)), Some(now - 1_800), now).is_some());
     }
 
     #[test]

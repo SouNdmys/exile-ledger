@@ -4,14 +4,16 @@
 use thiserror::Error;
 
 pub mod client;
+pub mod jwt;
 pub mod listing;
 pub mod live;
 pub mod rate_limit;
 
 pub use client::{
     MAX_FETCH_IDS, SearchResponse, TradeClient, TradeResponse, TransportError, fetch_url,
-    parse_search_response, search_url, whisper_url,
+    ggg_error, parse_search_response, search_url, whisper_url,
 };
+pub use jwt::{jwt_claims, jwt_expiry, jwt_header};
 pub use listing::parse_fetch_response;
 pub use live::{
     DEFAULT_READ_TIMEOUT, LiveConfig, LiveError, LiveMessage, LiveSession,

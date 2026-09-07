@@ -52,3 +52,38 @@ pub fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
+
+/// 一张短命 token 的"体检报告":有没有、多长、什么时候作废、还剩多久。
+///
+/// **永远不印 token 本身。** 它是能替你私聊、替你传送的凭证,而这个字符串
+/// 会进日志、进探针的屏幕输出。长度和 `exp` 已经够回答唯一要紧的那个问题:
+/// "我按下按钮的这一刻,它还活着吗"。
+///
+/// 运行时决定"要不要先换一张"时记的就是这一句,两个探针印的也是这一句 ——
+/// 于是屏幕上看到的和程序判断的是同一件事。
+#[must_use]
+pub fn describe_token(token: Option<&str>, now: i64) -> String {
+    let Some(token) = token else {
+        return "absent".to_string();
+    };
+    let chars = token.chars().count();
+    let Some(exp) = pnd_trade::jwt_expiry(token) else {
+        // 不是"坏了" —— 只是问不出作废时刻,那时只能退回"拿到多久了"去猜。
+        return format!("present ({chars} chars, no readable exp)");
+    };
+    let left = exp - now;
+    let when = chrono::DateTime::from_timestamp(exp, 0).map_or_else(
+        || exp.to_string(),
+        |utc| {
+            utc.with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+                .to_string()
+        },
+    );
+    let remaining = if left > 0 {
+        format!("{}m{}s left", left / 60, left % 60)
+    } else {
+        format!("expired {}s ago", -left)
+    };
+    format!("present ({chars} chars, exp {when} local, {remaining})")
+}

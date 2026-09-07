@@ -50,7 +50,7 @@ use pnd_runtime::actor::{
     HideoutOutcome, RuntimeCommand, RuntimeEvent, RuntimeHandle, RuntimePaths, WatchStatus,
 };
 use pnd_runtime::live_worker::{LiveOffReason, LiveRunState};
-use pnd_runtime::now_secs;
+use pnd_runtime::{describe_token, now_secs};
 use pnd_settings::{AppSettings, WatchEntry};
 use pnd_trade::client::{MAX_FETCH_IDS, TradeClient, parse_search_response};
 use pnd_trade::listing::parse_fetch_response;
@@ -309,6 +309,13 @@ fn print_event(event: &RuntimeEvent, labels: &BTreeMap<String, String>) {
                 matched.cap.display()
             );
             println!("{at}           whisper: {}", listing.whisper);
+            // "去藏身处"能不能成,第一个问题就是这张票还活着没有。印的是
+            // 生产代码算出来的那句话(`pnd_runtime::describe_token`),
+            // token 本身一个字符都不出现。
+            println!(
+                "{at}           hideout_token {}",
+                describe_token(listing.hideout_token.as_deref(), now_secs())
+            );
         }
         RuntimeEvent::SessionChecked { valid, detail } => {
             println!(

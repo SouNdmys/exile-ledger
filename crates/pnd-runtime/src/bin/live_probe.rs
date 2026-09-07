@@ -32,6 +32,7 @@ use pnd_domain::{ListingSummary, Price, SearchRef, live_page_url, parse_search_r
 use pnd_runtime::now_secs;
 use pnd_settings::SettingsStore;
 use pnd_trade::client::{MAX_FETCH_IDS, TradeClient};
+use pnd_trade::jwt::{jwt_claims, jwt_header};
 use pnd_trade::listing::parse_fetch_response;
 use pnd_trade::live::{
     LiveConfig, LiveError, LiveMessage, LiveSession, live_ws_url, reconnect_delay,
@@ -301,36 +302,13 @@ fn presence(listing: &ListingSummary) -> &'static str {
 // token:只说形状,不说内容
 // ---------------------------------------------------------------------
 
-/// 一个 token 的"体检报告":有没有、多长、什么时候过期。
+/// 一个 token 的"体检报告"。解码、算剩余时间都在生产代码里
+/// ([`pnd_runtime::describe_token`] → `pnd_trade::jwt`),探针只负责摆版面 ——
+/// 早先这里自己抄了一份 base64url 解码,那就等于验证了一个和生产不一样的东西。
 ///
-/// **绝不打印 token 本身** —— 它是能替你私聊、替你传送的凭证。长度和 `exp`
-/// 足够回答第二版要问的那个问题:"点按钮的时候它还没过期吗"。
+/// **绝不打印 token 本身**:它是能替你私聊、替你传送的凭证。
 fn describe_token(token: Option<&str>) -> String {
-    let Some(token) = token else {
-        return "absent".to_string();
-    };
-    match jwt_exp(token) {
-        Some(exp) => {
-            let left = exp - now_secs();
-            let when = chrono::DateTime::from_timestamp(exp, 0)
-                .map(|utc| {
-                    utc.with_timezone(&chrono::Local)
-                        .format("%H:%M:%S")
-                        .to_string()
-                })
-                .unwrap_or_else(|| exp.to_string());
-            format!(
-                "present ({} chars, exp {when} local, {})",
-                token.len(),
-                if left > 0 {
-                    format!("{}m{}s left", left / 60, left % 60)
-                } else {
-                    format!("expired {}s ago", -left)
-                }
-            )
-        }
-        None => format!("present ({} chars, not a readable JWT)", token.len()),
-    }
+    pnd_runtime::describe_token(token, now_secs())
 }
 
 /// 把订阅回执那张 JWT 拆开印出来:长度、还有多久过期、header、payload。
@@ -342,79 +320,33 @@ fn describe_token(token: Option<&str>) -> String {
 /// `Other`),只看得见前几十个字符。下一次跑完,我们就能凭 `iss`/`exp`
 /// 这些声明说清楚它到底是什么,而不是靠猜。
 fn print_subscription_token(token: &str) {
-    let (header, payload) = jwt_sections(token);
     println!(
         "{}            token    {}",
         stamp(),
         describe_token(Some(token))
     );
-    println!("{}            header   {header}", stamp());
-    println!("{}            payload  {payload}", stamp());
+    println!(
+        "{}            header   {}",
+        stamp(),
+        section(jwt_header(token))
+    );
+    println!(
+        "{}            payload  {}",
+        stamp(),
+        section(jwt_claims(token))
+    );
     println!(
         "{}            (the signature is never decoded or printed)",
         stamp()
     );
 }
 
-/// JWT 的头两段解出来的 JSON 原文:(header, payload)。第三段是签名,不碰。
-fn jwt_sections(token: &str) -> (String, String) {
-    let mut parts = token.split('.');
-    let header = decode_jwt_section(parts.next());
-    let payload = decode_jwt_section(parts.next());
-    (header, payload)
-}
-
-/// 一段 base64url → JSON 文本。解不开就照实说是哪一步解不开,别装作没这段。
-fn decode_jwt_section(part: Option<&str>) -> String {
-    let Some(part) = part else {
-        return "(missing)".to_string();
-    };
-    let Some(bytes) = decode_base64url(part) else {
-        return format!("(not base64url, {} chars)", part.chars().count());
-    };
-    match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(value) => value.to_string(),
-        Err(error) => format!("(not JSON: {error})"),
-    }
-}
-
-/// 从 JWT 的第二段(payload)里捞 `exp`。
-///
-/// 不验签、不解密:我们只想知道"还有多久过期",拿它做任何安全判断都不对。
-/// 解不出来就当没有,调用方只少印一个时间。
-fn jwt_exp(token: &str) -> Option<i64> {
-    let payload = token.split('.').nth(1)?;
-    let bytes = decode_base64url(payload)?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    value.get("exp")?.as_i64()
-}
-
-/// base64url 解码(无填充)。JWT 的 payload 就这一种写法。
-fn decode_base64url(input: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() / 4 * 3 + 3);
-    let mut acc: u32 = 0;
-    let mut bits: u32 = 0;
-    for ch in input.chars() {
-        if ch == '=' {
-            break;
-        }
-        let value = match ch {
-            'A'..='Z' => ch as u32 - 'A' as u32,
-            'a'..='z' => ch as u32 - 'a' as u32 + 26,
-            '0'..='9' => ch as u32 - '0' as u32 + 52,
-            '+' | '-' => 62,
-            '/' | '_' => 63,
-            _ => return None,
-        };
-        acc = (acc << 6) | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1u32 << bits) - 1;
-        }
-    }
-    Some(out)
+/// 解得开就印 JSON 原文,解不开就照实说一句 —— 别装作没这一段。
+fn section(value: Option<serde_json::Value>) -> String {
+    value.map_or_else(
+        || "(not readable base64url JSON)".to_string(),
+        |value| value.to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------

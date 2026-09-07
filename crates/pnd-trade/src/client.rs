@@ -94,6 +94,24 @@ impl TradeResponse {
     }
 }
 
+/// 交易站的报错正文 → 一句人话:`GGG error 6: Forbidden`。
+///
+/// GGG 的接口错误统一长这样:`{"error":{"code":N,"message":"..."}}`。原样
+/// 摆出来的话,卡片脚注上那一行就成了一串大括号和引号,而真正有信息量的
+/// 只有里面那半句 —— 尤其是它还会被裁短。
+///
+/// **`code` 和 `message` 两样齐了才认。** 只有 code 的时候(服务端确实这么
+/// 回过一次)翻译成 "GGG error 8" 反而更糟:那个数字我们自己也不认识,
+/// 不如把 body 原样摆出来,至少能拿去搜。
+#[must_use]
+pub fn ggg_error(body: &str) -> Option<String> {
+    let root: Value = serde_json::from_str(body).ok()?;
+    let error = root.get("error")?;
+    let code = error.get("code")?.as_i64()?;
+    let message = error.get("message")?.as_str()?.trim();
+    (!message.is_empty()).then(|| format!("GGG error {code}: {message}"))
+}
+
 /// 压成一行、掐到 [`BODY_EXCERPT_CHARS`] 个字符。
 fn excerpt(text: &str) -> String {
     let mut squeezed = String::new();
@@ -212,7 +230,19 @@ impl TradeClient {
     /// 发一次私聊(`whisper_token`)或去藏身处(`hideout_token`)。
     ///
     /// 必须带会话,而且 `Referer` 要是这条挂单所在的搜索页 —— 服务端拿它当
-    /// 来源校验。503 通常意味着 token 过期,重新 fetch 一次拿新 token 即可。
+    /// 来源校验。
+    ///
+    /// # token 过期长什么样
+    ///
+    /// **401 / 403 / 503 都可能只是"这张 token 不好使了"**,处置一样:重新
+    /// fetch 一次那条挂单拿新 token,再发一次;换过还是同一个码,才轮到
+    /// 怀疑会话(401/403)或者你自己的游戏客户端不在城里(503)。
+    /// 2026-09-07 一次真跑里,一条挂了 37 分钟的挂单点下去回的就是个
+    /// **非 HTML** 的 403 —— 那不是 Cloudflare(那种带 HTML,调用方另有
+    /// 一条路),是交易站自己在拒绝这张票。
+    ///
+    /// 别只靠"拿到多久了"去判断过不过期:token 是 JWT,自己带 `exp`
+    /// (见 [`crate::jwt::jwt_expiry`]),听它的比从外面猜准。
     ///
     /// 这个方法是给第二版的卡片按钮用的:**永远由用户点一次才调用**,
     /// 程序自己不会调。
@@ -454,6 +484,32 @@ mod client_tests {
         // 多字节也按字符数掐,不能从半个汉字中间切开。
         let chinese = response(&"错".repeat(500)).body_excerpt();
         assert_eq!(chinese.chars().count(), BODY_EXCERPT_CHARS);
+    }
+
+    /// GGG 的报错要翻成"错误码 + 那句话",而且只在两样都齐的时候翻 ——
+    /// 翻不出来的一律回 `None`,让调用方原样把 body 摆出来。
+    #[test]
+    fn a_ggg_error_body_reads_as_one_sentence() {
+        assert_eq!(
+            ggg_error(r#"{"error":{"code":6,"message":"Forbidden"}}"#).as_deref(),
+            Some("GGG error 6: Forbidden")
+        );
+        // `body_excerpt` 会把换行压成空格,压过的那一版也得认得出来。
+        assert_eq!(
+            ggg_error(r#"{ "error": { "code": 2, "message": "Invalid query" } }"#).as_deref(),
+            Some("GGG error 2: Invalid query")
+        );
+
+        // 只有 code 没有 message:翻译出来的 "GGG error 8" 谁也不认识,
+        // 不如把原文留给调用方。
+        assert_eq!(ggg_error(r#"{"error":{"code":8}}"#), None);
+        assert_eq!(ggg_error(r#"{"error":{"message":"Forbidden"}}"#), None);
+        assert_eq!(ggg_error(r#"{"error":{"code":6,"message":"  "}}"#), None);
+        assert_eq!(ggg_error(r#"{"id":"x","total":3}"#), None, "根本不是报错");
+        assert_eq!(ggg_error("<!DOCTYPE html><html>"), None);
+        assert_eq!(ggg_error(""), None);
+        // 裁短过的 JSON 解不开 —— 那也该回 None,而不是拼一句半截话。
+        assert_eq!(ggg_error(r#"{"error":{"code":6,"messa"#), None);
     }
 
     #[test]
