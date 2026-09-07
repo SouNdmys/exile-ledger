@@ -82,6 +82,8 @@ catalogue! {
     watches_league_placeholder,
     watches_price_cap_label,
     watches_price_cap_placeholder,
+    /// 上限格旁边那句话:上限本身也算命中("≤",不是"<")。
+    watches_cap_hint,
     watches_currency_label,
     watches_add_button,
     watches_enable_toggle,
@@ -96,6 +98,9 @@ catalogue! {
     watches_empty,
     /// 表格里"下一轮什么时候":"{} 后再轮询"
     watches_next_in,
+    /// 表格里"到底多久一次":"每 {} 秒"。倒计时只说下一轮,说不出节奏 ——
+    /// 而节奏会因为秒推连上、退避、多加一条搜索而变。
+    watches_poll_every,
     /// 还没轮询过的那一格。
     watches_never,
     /// 选中一行之后那一排按钮的标题。
@@ -467,6 +472,7 @@ pub static ENGLISH: Text = Text {
     watches_league_placeholder: "empty = the league from Settings",
     watches_price_cap_label: "Price cap",
     watches_price_cap_placeholder: "20",
+    watches_cap_hint: "alerts when price ≤ cap",
     watches_currency_label: "Currency",
     watches_add_button: "Add watch",
     watches_enable_toggle: "Enabled",
@@ -480,6 +486,7 @@ pub static ENGLISH: Text = Text {
     watches_col_hits_today: "Hits today",
     watches_empty: "No watches yet. Paste a search above to start one.",
     watches_next_in: "next in {}",
+    watches_poll_every: "every {} s",
     watches_never: "never",
     watches_row_actions: "Selected watch",
     watches_remove: "Remove",
@@ -735,6 +742,7 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     watches_league_placeholder: "留空 = 用设置页那个联赛",
     watches_price_cap_label: "价格上限",
     watches_price_cap_placeholder: "20",
+    watches_cap_hint: "价格 ≤ 上限就提醒",
     watches_currency_label: "货币",
     watches_add_button: "新增搜索",
     watches_enable_toggle: "启用",
@@ -748,6 +756,7 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     watches_col_hits_today: "今日命中",
     watches_empty: "还没有搜索。在上面粘一条进来就开始蹲。",
     watches_next_in: "{} 后再轮询",
+    watches_poll_every: "每 {} 秒",
     watches_never: "还没跑过",
     watches_row_actions: "选中的搜索",
     watches_remove: "删除",

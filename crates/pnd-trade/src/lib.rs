@@ -19,8 +19,8 @@ pub use live::{
     reconnect_delay,
 };
 pub use rate_limit::{
-    BucketUsage, Budget, FETCH_POLICY, RateHeaders, RateLimiter, SEARCH_POLICY, backoff_after_429,
-    parse_rate_headers,
+    BucketUsage, Budget, FETCH_POLICY, RateHeaders, RateLimiter, SEARCH_LONG_WINDOW_REQUESTS,
+    SEARCH_LONG_WINDOW_SECS, SEARCH_POLICY, backoff_after_429, parse_rate_headers,
 };
 
 /// 响应体读不懂。两个解析器(search 和 fetch)共用一个错误类型:

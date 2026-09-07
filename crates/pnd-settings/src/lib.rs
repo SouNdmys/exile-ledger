@@ -92,8 +92,11 @@ impl WatchEntry {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default)]
 pub struct WatcherTuning {
+    /// 兜底轮询的档位(秒)。默认 180:6 小时 299 次的搜索预算下,一条搜索
+    /// 三分钟一次离地板(≈72 秒)还远,而好价挂出来到你看见它最多差三分钟。
     pub poll_interval_seconds: u64,
-    /// WebSocket 健康时的轮询档位。有秒推兜着,轮询只是保险,可以放慢。
+    /// WebSocket 健康时的轮询档位。有秒推兜着,轮询只是保险,可以放慢 ——
+    /// 但也就放慢到 5 分钟:秒推漏一条(重连的那几十秒里上架的)得有人接住。
     pub poll_interval_when_live_seconds: u64,
     pub max_live_connections: u32,
     /// 只用服务端限速头允许量的这个百分比,不贴着上限跑。
@@ -107,8 +110,8 @@ pub struct WatcherTuning {
 impl Default for WatcherTuning {
     fn default() -> Self {
         Self {
-            poll_interval_seconds: 300,
-            poll_interval_when_live_seconds: 900,
+            poll_interval_seconds: 180,
+            poll_interval_when_live_seconds: 300,
             max_live_connections: 5,
             budget_percent: 50,
             limit_margin: 1,
@@ -529,7 +532,8 @@ mod settings_tests {
         let settings: AppSettings = serde_json::from_str("{}").expect("parse");
         assert_eq!(settings, AppSettings::default());
         assert_eq!(settings.league, "Forbidden Rites");
-        assert_eq!(settings.watcher.poll_interval_seconds, 300);
+        assert_eq!(settings.watcher.poll_interval_seconds, 180);
+        assert_eq!(settings.watcher.poll_interval_when_live_seconds, 300);
         assert_eq!(settings.alert.opacity, 235);
         assert_eq!(settings.ninja.sample_target, 2000);
         assert_eq!(settings.user_agent_mode, UserAgentMode::Identified);
@@ -549,7 +553,7 @@ mod settings_tests {
         assert_eq!(loaded.settings.league, "Standard");
         assert_eq!(loaded.settings.watcher.budget_percent, 30);
         // 没写的键仍然是默认值,不会被那个未知键带塌。
-        assert_eq!(loaded.settings.watcher.poll_interval_seconds, 300);
+        assert_eq!(loaded.settings.watcher.poll_interval_seconds, 180);
     }
 
     #[test]

@@ -3,12 +3,15 @@
 //! 纯逻辑,不碰时钟也不碰网络 —— `now` 一律由调用方传进来。这样"退避到底
 //! 退了多久"这种问题可以在测试里一秒钟跑完两个小时,而不用真的等。
 //!
-//! 三条规矩:
+//! 四条规矩:
 //! - 多条搜索**错开起跑**。同时加三条搜索,如果三条都在同一秒醒,网关会连着
 //!   发三次 search,预算的账在瞬间被打满,而且这种整齐的节奏一看就是机器。
 //! - 失败了就**指数退避**,封顶 30 分钟。接口挂了或者网断了,原样的节奏反复
 //!   捅它没有意义。
 //! - WebSocket 健康的时候轮询**放宽**到另一档:有秒推兜着,轮询只是保险。
+//! - 再勤也不能勤过**预算地板**([`budget_floor_interval`])。设置里那两个
+//!   数字是"想多久一次",地板是"6 小时 299 次的额度分给这几条搜索之后,
+//!   最快能多久一次" —— 两者取大。
 
 use std::collections::BTreeMap;
 
@@ -45,6 +48,8 @@ pub struct PollEntry {
 #[derive(Debug, Clone, Default)]
 pub struct PollScheduler {
     entries: BTreeMap<WatchId, PollEntry>,
+    /// 每条搜索最快能多久轮一次(秒)。0 = 还没算过,不设限。
+    budget_floor: u64,
 }
 
 impl PollScheduler {
@@ -67,6 +72,7 @@ impl PollScheduler {
         stagger_index: usize,
         count: usize,
     ) {
+        let interval = interval.max(self.budget_floor);
         if let Some(entry) = self.entries.get_mut(&watch_id) {
             entry.interval = interval;
             return;
@@ -132,10 +138,11 @@ impl PollScheduler {
         outcome: PollOutcome,
         tuning: &WatcherTuning,
     ) {
+        let floor = self.budget_floor;
         let Some(entry) = self.entries.get_mut(watch_id) else {
             return;
         };
-        let base = base_interval(entry.live_healthy, tuning);
+        let base = base_interval(entry.live_healthy, tuning, floor);
         match outcome {
             PollOutcome::Ok => {
                 entry.failures = 0;
@@ -147,6 +154,19 @@ impl PollScheduler {
             }
         }
         entry.next_at = now + entry.interval as i64;
+    }
+
+    /// 换一条预算地板。搜索条数一变(加了一条、停了一条)就重算一次。
+    ///
+    /// 只影响**以后**算出来的间隔:已经排好的那一轮不动 —— 用户刚加了第二条
+    /// 搜索,第一条没理由为此推迟。
+    pub fn set_budget_floor(&mut self, floor: u64) {
+        self.budget_floor = floor;
+    }
+
+    #[must_use]
+    pub fn budget_floor(&self) -> u64 {
+        self.budget_floor
     }
 
     /// 换一条搜索的 live 档位。只影响**下一次** `reschedule` 算出来的间隔:
@@ -176,13 +196,38 @@ impl PollScheduler {
     }
 }
 
-/// 正常情况下的间隔:WS 活着走宽松档,否则走普通档。
-fn base_interval(live_healthy: bool, tuning: &WatcherTuning) -> u64 {
-    if live_healthy {
+/// 正常情况下的间隔:WS 活着走宽松档,否则走普通档;两档都不能快过地板。
+fn base_interval(live_healthy: bool, tuning: &WatcherTuning, floor: u64) -> u64 {
+    let configured = if live_healthy {
         tuning.poll_interval_when_live_seconds
     } else {
         tuning.poll_interval_seconds
+    };
+    configured.max(floor)
+}
+
+/// 这么多条搜索一起跑,每条最快能多久轮一次而不超预算。
+///
+/// 一轮轮询发一次 search,所以一个窗口里的搜索总数是
+/// `搜索条数 × (窗口 / 间隔)`;要它不超过 `budget_per_window`,反解出来就是
+/// `间隔 ≥ 搜索条数 × 窗口 / 预算`。向上取整 —— 差一次也是超。
+///
+/// 默认那份预算(6 小时 299 次)下:一条搜索 73 秒,两条 145 秒,三条 217 秒。
+/// 一条搜索都没启用时是 0(不设限):没人花额度,也就没有地板可言。
+#[must_use]
+pub fn budget_floor_interval(
+    enabled_watches: usize,
+    budget_per_window: u32,
+    window_secs: u32,
+) -> u64 {
+    if enabled_watches == 0 {
+        return 0;
     }
+    // 预算是 0 就除不下去。当成 1 次:算出来是"一个窗口跑一轮",
+    // 已经是能给的最慢节奏了,再慢也没有意义。
+    let budget = u64::from(budget_per_window.max(1));
+    let total = u64::from(window_secs).saturating_mul(enabled_watches as u64);
+    total.div_ceil(budget)
 }
 
 /// `interval * 2^failures`,封顶半小时。`checked_pow` 兜住"连挂 40 轮"
@@ -322,6 +367,49 @@ mod poll_tests {
         scheduler.defer(&watch("a"), 1_000);
         assert!(scheduler.due(1_000).is_empty());
         assert_eq!(scheduler.entry(&watch("a")).unwrap().next_at, 1_300);
+    }
+
+    /// 地板就是"额度分完之后每条搜索最快多久一次"。
+    #[test]
+    fn the_budget_floor_is_the_window_divided_by_the_budget() {
+        // 6 小时 299 次:一条搜索 72.2 秒,向上取整 73 —— 差一次也是超。
+        assert_eq!(budget_floor_interval(1, 299, 21_600), 73);
+        assert_eq!(budget_floor_interval(2, 299, 21_600), 145);
+        assert_eq!(budget_floor_interval(3, 299, 21_600), 217);
+        // 整除的时候不多加一秒。
+        assert_eq!(budget_floor_interval(1, 100, 1_000), 10);
+        assert_eq!(budget_floor_interval(4, 100, 1_000), 40);
+        // 一条都没启用 = 没人花额度,不设限。
+        assert_eq!(budget_floor_interval(0, 299, 21_600), 0);
+        // 预算是 0 也不能除出个 panic:退成"一个窗口跑一轮"。
+        assert_eq!(budget_floor_interval(1, 0, 21_600), 21_600);
+    }
+
+    /// 设置里填得再勤也快不过地板,而且宽松档同样受它管。
+    #[test]
+    fn the_floor_wins_over_a_too_eager_setting() {
+        let mut scheduler = PollScheduler::new();
+        let tuning = WatcherTuning {
+            poll_interval_seconds: 60,
+            poll_interval_when_live_seconds: 90,
+            ..WatcherTuning::default()
+        };
+        scheduler.set_budget_floor(budget_floor_interval(3, 299, 21_600));
+        scheduler.upsert(watch("a"), 60, 0, 0, 1);
+        assert_eq!(scheduler.entry(&watch("a")).unwrap().interval, 217);
+
+        scheduler.reschedule(&watch("a"), 1_000, PollOutcome::Ok, &tuning);
+        assert_eq!(scheduler.entry(&watch("a")).unwrap().next_at, 1_217);
+
+        // 宽松档也一样:90 秒快过地板,照地板走。
+        scheduler.set_live_healthy(&watch("a"), true);
+        scheduler.reschedule(&watch("a"), 2_000, PollOutcome::Ok, &tuning);
+        assert_eq!(scheduler.entry(&watch("a")).unwrap().next_at, 2_217);
+
+        // 填得比地板还慢就听用户的。
+        scheduler.set_budget_floor(73);
+        scheduler.reschedule(&watch("a"), 3_000, PollOutcome::Ok, &tuning);
+        assert_eq!(scheduler.entry(&watch("a")).unwrap().next_at, 3_090);
     }
 
     #[test]

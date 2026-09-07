@@ -39,7 +39,7 @@ pub use ninja_sampler::{
     character_limit, highest_stage, plan_partitions, refresh_prices, run_sampler, should_skip,
     stage_order,
 };
-pub use poll::{PollEntry, PollOutcome, PollScheduler};
+pub use poll::{PollEntry, PollOutcome, PollScheduler, budget_floor_interval};
 
 /// 现在是 unix 秒。
 ///

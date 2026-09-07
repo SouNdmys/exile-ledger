@@ -164,10 +164,10 @@ pub fn table_content(text: &'static Text) -> TableContent {
             column("label", text.watches_col_label, 200.),
             column("league", text.watches_col_league, 130.),
             number_column("cap", text.watches_col_cap, 90.),
-            // 这一格现在同时写轮询和 live 两件事:量过最长的一句
-            // ("polling · next in 15 min · live disabled: session invalid"),
-            // 窄一点就会把"为什么没连上"那半句裁掉。
-            column("status", text.watches_col_status, 360.),
+            // 这一格现在写三件事:轮询、节奏、live。量过最长的一句
+            // ("polling · next in 15 min · every 300 s · live disabled: session
+            // invalid"),窄一点就会把"为什么没连上"那半句裁掉。
+            column("status", text.watches_col_status, 430.),
             column("last_poll", text.watches_col_last_poll, 120.),
             number_column("hits", text.watches_col_hits_today, 80.),
         ],
@@ -219,9 +219,12 @@ pub fn watch_rows(
                     Some(at) => Cell::data(local_clock(at)),
                     None => Cell::muted(text.watches_never),
                 },
-                match live.map_or(0, |status| status.hits_today) {
-                    0 => Cell::muted(text.common_none),
-                    hits => Cell::accent(hits.to_string()),
+                // "—" 留给"还没有状态可说"。已经在跑却一次没中,那是个
+                // 实实在在的 0 —— 用破折号写它,看起来像程序没在数。
+                match live.map(|status| status.hits_today) {
+                    None => Cell::muted(text.common_none),
+                    Some(0) => Cell::muted("0"),
+                    Some(hits) => Cell::accent(hits.to_string()),
                 },
             ]
         })
@@ -310,6 +313,15 @@ fn status_text(
             text.watches_next_in,
             &[&countdown_text(next - now, text)],
         ));
+    }
+    // 倒计时只说"下一轮什么时候",说不出节奏 —— 而节奏会因为秒推连上、
+    // 退避、多加一条搜索(预算要分)而变。没在排班的那条是 0,不写。
+    if let Some(every) = status
+        .map(|status| status.poll_every_secs)
+        .filter(|every| *every > 0)
+    {
+        line.push_str(" · ");
+        line.push_str(&i18n::fill(text.watches_poll_every, &[&every.to_string()]));
     }
     if let Some(status) = status {
         line.push_str(" · ");
@@ -446,7 +458,10 @@ impl AppShell {
                         text.watches_currency_label,
                         &self.watches_form.currency,
                         110.,
-                    )),
+                    ))
+                    // 上限本身也算命中。不写出来的话,"我填 223,它是 223,
+                    // 到底响不响"只能靠猜。
+                    .child(hint(text.watches_cap_hint)),
             )
             .child(
                 field_row()
@@ -931,6 +946,7 @@ mod watches_page_tests {
                 state: WatchRunState::Polling,
                 live: LiveRunState::Disabled(LiveOffReason::NoSession),
                 next_poll_at: Some(1_000_090),
+                poll_every_secs: 180,
                 last_poll_at: Some(1_000_000),
                 hits_today: 4,
                 ..WatchStatus::default()
@@ -948,19 +964,67 @@ mod watches_page_tests {
         assert_eq!(rows[0][2].text(), "20 divine");
     }
 
-    /// 状态那一格要同时回答三件事:现在在干嘛、下一轮什么时候、秒推怎么样。
+    /// 状态那一格要同时回答四件事:现在在干嘛、下一轮什么时候、多久一次、
+    /// 秒推怎么样。
     #[test]
-    fn the_status_cell_carries_the_countdown_and_the_live_state() {
+    fn the_status_cell_carries_the_countdown_the_cadence_and_the_live_state() {
         let rows = watch_rows(&settings(), &status(), &i18n::ENGLISH, 1_000_000);
         assert_eq!(
             rows[0][3].text(),
-            "polling · next in 1 min · live disabled: no session"
+            "polling · next in 1 min · every 180 s · live disabled: no session"
         );
         assert_eq!(
             rows[0][4].text(),
             crate::shell::link::local_clock(1_000_000)
         );
         assert_eq!(rows[0][5].text(), "4");
+    }
+
+    /// 还没排上班的那条(停用、搜索 id 坏了)节奏是 0,那半句就不该出现 ——
+    /// "每 0 秒"是句假话。
+    #[test]
+    fn a_watch_that_is_not_scheduled_says_nothing_about_its_cadence() {
+        let status = BTreeMap::from([(
+            WatchId("w-1".to_string()),
+            WatchStatus {
+                state: WatchRunState::Backoff,
+                poll_every_secs: 0,
+                ..WatchStatus::default()
+            },
+        )]);
+        let rows = watch_rows(&settings(), &status, &i18n::ENGLISH, 1_000_000);
+        assert!(
+            !rows[0][3].text().contains("every"),
+            "{}",
+            rows[0][3].text()
+        );
+    }
+
+    /// 已经在跑却一次没中,那是个实实在在的 0。"—" 只留给"还没有状态可说"。
+    #[test]
+    fn a_running_watch_with_no_hits_shows_a_zero() {
+        let status = BTreeMap::from([(
+            WatchId("w-1".to_string()),
+            WatchStatus {
+                state: WatchRunState::Polling,
+                ..WatchStatus::default()
+            },
+        )]);
+        let rows = watch_rows(&settings(), &status, &i18n::ENGLISH, 1_000_000);
+        assert_eq!(rows[0][5].text(), "0");
+        assert_eq!(rows[1][5].text(), "—", "没有状态的那条还是破折号");
+    }
+
+    /// 上限本身也算命中,两种语言都得把"≤"说出来 —— 填 223 遇上 223 到底
+    /// 响不响,不该靠猜。
+    #[test]
+    fn the_cap_hint_says_the_cap_itself_counts() {
+        for language in i18n::LANGUAGES {
+            assert!(
+                i18n::text(language).watches_cap_hint.contains('≤'),
+                "{language} 的上限说明没写清等于也算"
+            );
+        }
     }
 
     /// 用户把开关拨掉,屏幕上立刻就是"已停用",不等 actor 的下一条事件。
@@ -989,7 +1053,7 @@ mod watches_page_tests {
             },
         )]);
 
-        // 默认设置里普通档 300 秒、秒推档 900 秒 —— 确实放宽了。
+        // 默认设置里普通档 180 秒、秒推档 300 秒 —— 确实放宽了。
         assert!(
             settings.watcher.poll_interval_when_live_seconds
                 > settings.watcher.poll_interval_seconds

@@ -28,7 +28,10 @@ use pnd_storage::{
     default_watch_db_path,
 };
 use pnd_trade::live::{LiveConfig, MAX_LIVE_CONNECTIONS_PER_ACCOUNT};
-use pnd_trade::{BucketUsage, Budget, MAX_FETCH_IDS, TradeClient};
+use pnd_trade::{
+    BucketUsage, Budget, MAX_FETCH_IDS, SEARCH_LONG_WINDOW_REQUESTS, SEARCH_LONG_WINDOW_SECS,
+    TradeClient,
+};
 use thiserror::Error;
 
 use crate::decide::{Decision, MatchedListing, coalesce, decide};
@@ -41,7 +44,7 @@ use crate::live_worker::{
     TungsteniteConnector, spawn_live_worker,
 };
 use crate::now_secs;
-use crate::poll::{PollOutcome, PollScheduler};
+use crate::poll::{PollOutcome, PollScheduler, budget_floor_interval};
 
 /// 汇率多久重读一次。ninja 自己的缓存是 5 分钟,15 分钟一次既不会读到
 /// 陈年数据,也不至于为了一张换算表天天打扰人家。
@@ -176,6 +179,12 @@ pub struct WatchStatus {
     /// "为什么没连上""退避到什么时候"。
     pub live: LiveRunState,
     pub next_poll_at: Option<i64>,
+    /// 现在这条搜索多久轮一次(秒)。设置里那个数字和预算地板取大者,
+    /// 退避期间就是退避后的间隔;0 = 没在排班(停用了,或者搜索 id 坏了)。
+    ///
+    /// 界面要它是因为"下一轮 14 分钟后"回答不了"到底多久一次" —— 那两个
+    /// 数字在秒推连上、退避、多加一条搜索之后都会变。
+    pub poll_every_secs: u64,
     pub last_poll_at: Option<i64>,
     pub last_total: Option<u64>,
     pub hits_today: u32,
@@ -686,6 +695,13 @@ impl RuntimeActor {
             .iter()
             .filter(|entry| entry.enabled)
             .count();
+        // 搜索额度 6 小时就那么多次,几条搜索分着花。设置里填得再勤,
+        // 也不能勤过这个地板 —— 超了不是报错,是被服务端 429 冷却。
+        self.scheduler.set_budget_floor(budget_floor_interval(
+            enabled_count,
+            budget.effective_limit(SEARCH_LONG_WINDOW_REQUESTS),
+            SEARCH_LONG_WINDOW_SECS,
+        ));
         let mut stagger = 0usize;
 
         for entry in &settings.watches {
@@ -705,6 +721,11 @@ impl RuntimeActor {
                         || runtime.entry.league != entry.league
                 }
             };
+            // 上限(金额或货币)是用户刚刚亲手改过的东西 —— 他在等答案,
+            // 而不是等下一个整点。别的改动(改名、开关 live)不排队,
+            // 免得每保存一次就白花一次搜索额度。
+            let cap_changed =
+                known.is_some_and(|runtime| runtime.entry.price_cap != entry.price_cap);
 
             let query_body = if query_stale {
                 // 搜索 id 或联赛变了 = 这是另一次搜索。已经连着的那条 live
@@ -742,6 +763,10 @@ impl RuntimeActor {
                 stagger,
                 enabled_count,
             );
+            if cap_changed {
+                // 和"立刻查一次"按钮走同一条路:排在此刻,限速器一放行就发。
+                self.scheduler.poll_now(&entry.id, now);
+            }
             stagger += 1;
             self.upsert_watch(entry.clone(), query_body, WatchRunState::Polling, None, now);
         }
@@ -1010,7 +1035,7 @@ impl RuntimeActor {
         let stored = self
             .note(self.store.watch_state(&watch_id), "watch_state")
             .flatten();
-        let next_poll_at = self.scheduler.entry(&watch_id).map(|entry| entry.next_at);
+        let (next_poll_at, poll_every_secs) = self.schedule_of(&watch_id);
 
         match self.watches.get_mut(&watch_id) {
             Some(runtime) => {
@@ -1025,6 +1050,7 @@ impl RuntimeActor {
                     state
                 };
                 runtime.status.next_poll_at = next_poll_at;
+                runtime.status.poll_every_secs = poll_every_secs;
                 runtime.status.hits_today = hits_today;
                 if last_error.is_some() {
                     runtime.status.last_error = last_error;
@@ -1037,6 +1063,7 @@ impl RuntimeActor {
                     // `sync_live_workers` 或者 worker 自己报上来。
                     live: LiveRunState::Off,
                     next_poll_at,
+                    poll_every_secs,
                     last_poll_at: stored.as_ref().and_then(|state| state.last_poll_at),
                     last_total: stored.as_ref().and_then(|state| state.last_total),
                     hits_today,
@@ -1102,9 +1129,10 @@ impl RuntimeActor {
         // 请求一发出去就把下一轮排上:否则 `next_at` 停在过去,主循环会
         // 一直觉得"这条该跑了"而空转。
         self.scheduler.defer(watch_id, now);
-        let next_at = self.scheduler.entry(watch_id).map(|entry| entry.next_at);
+        let (next_at, every) = self.schedule_of(watch_id);
         if let Some(runtime) = self.watches.get_mut(watch_id) {
             runtime.status.next_poll_at = next_at;
+            runtime.status.poll_every_secs = every;
         }
 
         self.gateway.submit(GatewayRequest {
@@ -1299,7 +1327,7 @@ impl RuntimeActor {
         self.note(self.store.clear_failures(watch_id, now), "clear_failures");
         self.scheduler
             .reschedule(watch_id, now, PollOutcome::Ok, &self.settings.watcher);
-        let next_at = self.scheduler.entry(watch_id).map(|entry| entry.next_at);
+        let (next_at, every) = self.schedule_of(watch_id);
         let hits_today = self
             .note(
                 self.store.hits_since(watch_id, start_of_today(now)),
@@ -1312,6 +1340,7 @@ impl RuntimeActor {
             runtime.status.failures = 0;
             runtime.status.last_error = None;
             runtime.status.next_poll_at = next_at;
+            runtime.status.poll_every_secs = every;
             runtime.status.hits_today = hits_today;
         }
         self.emit_status(watch_id);
@@ -1324,7 +1353,7 @@ impl RuntimeActor {
             .unwrap_or(0);
         self.scheduler
             .reschedule(watch_id, now, PollOutcome::Failed, &self.settings.watcher);
-        let next_at = self.scheduler.entry(watch_id).map(|entry| entry.next_at);
+        let (next_at, every) = self.schedule_of(watch_id);
         let state = if matches!(error, GatewayError::CloudflareHold) {
             WatchRunState::Held
         } else {
@@ -1336,8 +1365,21 @@ impl RuntimeActor {
             runtime.status.failures = failures;
             runtime.status.last_error = Some(error.to_string());
             runtime.status.next_poll_at = next_at;
+            runtime.status.poll_every_secs = every;
         }
         self.emit_status(watch_id);
+    }
+
+    /// 时间表上这条搜索的(下一次, 多久一次)。
+    ///
+    /// 两个数字总是一起读:界面上"下一轮 14 分钟后"回答不了"到底多久一次",
+    /// 而分两处去问时间表,迟早有一处忘了更新。不在表上(停用了、搜索 id
+    /// 坏了)就是 `(None, 0)`。
+    fn schedule_of(&self, watch_id: &WatchId) -> (Option<i64>, u64) {
+        match self.scheduler.entry(watch_id) {
+            Some(entry) => (Some(entry.next_at), entry.interval),
+            None => (None, 0),
+        }
     }
 
     /// 一次 fetch 带几个 id。设置里能调,但服务端上限就是 10。
@@ -2052,6 +2094,9 @@ mod actor_tests {
         seller_offline: bool,
         /// fetch 回一个空 `result`(那件货在这几秒里被买走了)。
         fetch_returns_nothing: bool,
+        /// 让 fetch 回来的每件货都标这个价(divine)。不设就用下面那套
+        /// 18、17、16… 的递减价。
+        price_divine: Option<i64>,
         /// search 响应的 `X-Rate-Limit-Rules` 写什么。`None` = 不给限速头。
         /// 会话检查看的就是这一行。
         rate_rules: Option<String>,
@@ -2085,11 +2130,17 @@ mod actor_tests {
     }
 
     /// 按问到的 id 现编一批挂单。价格从 18 divine 起每条便宜 1 个(封底 1),
-    /// 所以最后一条最便宜 —— 合成卡片的标题该是它。
+    /// 所以最后一条最便宜 —— 合成卡片的标题该是它。`price_divine` 给了
+    /// 就一律用它,那是"上限刚好卡在这个数上"那几个测试要的。
     ///
     /// `online = false` 时干脆不给 `account.online` 这个键 —— 交易站离线时
     /// 就是这么回的(不是回 `null`),摘要那一层认的也是"这个键在不在"。
-    fn listings_json(ids: &[String], token: Option<&str>, online: bool) -> String {
+    fn listings_json(
+        ids: &[String],
+        token: Option<&str>,
+        online: bool,
+        price_divine: Option<i64>,
+    ) -> String {
         let items: Vec<String> = ids
             .iter()
             .enumerate()
@@ -2108,7 +2159,7 @@ mod actor_tests {
                         "price":{{"type":"~price","amount":{},"currency":"divine"}},
                         "account":{{"name":"Seller{id}","lastCharacterName":"Char{id}"{presence}}}}},
                      "item":{{"name":"Choir of the Storm","typeLine":"Lapis Amulet"}}}}"#,
-                    (18 - index as i64).max(1)
+                    price_divine.unwrap_or((18 - index as i64).max(1))
                 )
             })
             .collect();
@@ -2152,19 +2203,20 @@ mod actor_tests {
             _search_id: &str,
             _session: Option<&str>,
         ) -> Result<TradeResponse, pnd_trade::TransportError> {
-            let (token, offline, nothing) = {
+            let (token, offline, nothing, price) = {
                 let mut log = self.log.lock().unwrap();
                 log.fetches.push(ids.to_vec());
                 (
                     log.hideout_token.clone(),
                     log.seller_offline,
                     log.fetch_returns_nothing,
+                    log.price_divine,
                 )
             };
             if nothing {
                 return ok(r#"{"result":[]}"#);
             }
-            ok(&listings_json(ids, token.as_deref(), !offline))
+            ok(&listings_json(ids, token.as_deref(), !offline, price))
         }
 
         fn whisper(
@@ -2294,6 +2346,184 @@ mod actor_tests {
             .filter(|event| matches!(event, RuntimeEvent::ListingMatched(_)))
             .count();
         assert_eq!(cards, 1, "同样的挂单响了两次:{seen:#?}");
+    }
+
+    /// 太贵的挂单不该把去重表堵死。
+    ///
+    /// 真实现场:上限 221 的时候轮到一件 222 divine 的 Mageblood,程序把它
+    /// 记成"见过了";用户随即把上限改成 223,同一件货再轮到时被去重表挡掉,
+    /// 一声都没响。上限是用户随时会动的东西,"见过"必须是"已经为它叫过一次",
+    /// 而不是"这条数据我读到过"。
+    #[test]
+    fn a_listing_that_was_too_expensive_alerts_after_the_cap_is_raised() {
+        let (transport, log) = FakeTrade::new();
+        log.lock().unwrap().price_divine = Some(222);
+
+        let mut settings = settings();
+        settings.watches[0].price_cap = Price::new(221_000, Currency::Divine);
+        // 一次只抓一件:这样"响了几次"数的就是这一件货。
+        settings.watcher.fetch_batch = 1;
+        let handle =
+            RuntimeHandle::start_offline(settings.clone(), RuntimePaths::in_memory(), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        wait_for(
+            &handle,
+            &mut seen,
+            |event| {
+                matches!(
+                    event,
+                    RuntimeEvent::WatchStatus { status, .. } if status.last_total == Some(2)
+                )
+            },
+            "the first poll to finish",
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::ListingMatched(_))),
+            "222 divine 贵过 221 的上限,这一轮不该叫人:{seen:#?}"
+        );
+
+        // 用户把上限改成 223 —— 那件 222 的货现在够便宜了。
+        settings.watches[0].price_cap = Price::new(223_000, Currency::Divine);
+        handle
+            .try_send(RuntimeCommand::ApplySettings(Box::new(settings)))
+            .unwrap();
+        handle
+            .try_send(RuntimeCommand::PollNow(WatchId("w1".to_string())))
+            .unwrap();
+
+        wait_for(
+            &handle,
+            &mut seen,
+            |event| matches!(event, RuntimeEvent::ListingMatched(_)),
+            "a ListingMatched after the cap was raised",
+        );
+        // 再跑一轮同样的货:这回它真的"已经叫过了",不该有第二张卡。
+        handle
+            .try_send(RuntimeCommand::PollNow(WatchId("w1".to_string())))
+            .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        while let Some(event) = handle.try_next_event() {
+            seen.push(event);
+        }
+        let cards = seen
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::ListingMatched(_)))
+            .count();
+        assert_eq!(cards, 1, "同一件货响了不止一次:{seen:#?}");
+    }
+
+    /// 改完上限就立刻再查一次。
+    ///
+    /// live 连着的时候轮询会放宽到十几分钟一次,用户改完上限盯着屏幕等了
+    /// 一刻钟才想明白"下一轮还没到"。上限是他刚刚亲手动过的东西,答案该在
+    /// 几秒内出现;别的改动(改个备注名)则不该白花一次搜索额度。
+    #[test]
+    fn changing_the_price_cap_schedules_the_next_poll_right_away() {
+        let (transport, log) = FakeTrade::new();
+        let mut settings = settings();
+        // 普通档拉到一小时:没有这条规矩的话,下一轮要等到一小时之后。
+        settings.watcher.poll_interval_seconds = 3_600;
+        let handle =
+            RuntimeHandle::start_offline(settings.clone(), RuntimePaths::in_memory(), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        wait_for(
+            &handle,
+            &mut seen,
+            |event| {
+                matches!(
+                    event,
+                    RuntimeEvent::WatchStatus { status, .. } if status.last_total == Some(2)
+                )
+            },
+            "the first poll to finish",
+        );
+        assert_eq!(log.lock().unwrap().searches, 1);
+
+        // 只改备注名:时间表一动不动。
+        settings.watches[0].label = "renamed".to_string();
+        handle
+            .try_send(RuntimeCommand::ApplySettings(Box::new(settings.clone())))
+            .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        while let Some(event) = handle.try_next_event() {
+            seen.push(event);
+        }
+        assert_eq!(
+            log.lock().unwrap().searches,
+            1,
+            "改个名字不该白花一次搜索额度"
+        );
+
+        // 改上限:下一轮就排在此刻。
+        settings.watches[0].price_cap = Price::new(30_000, Currency::Divine);
+        handle
+            .try_send(RuntimeCommand::ApplySettings(Box::new(settings)))
+            .unwrap();
+        wait_for(
+            &handle,
+            &mut seen,
+            |event| {
+                matches!(event, RuntimeEvent::WatchStatus { status, .. }
+                    if status.next_poll_at.is_some_and(|at| at <= now_secs()))
+            },
+            "next_poll_at to move to now",
+        );
+
+        // 而且真的跑起来了 —— 排上却不发,和没排一样。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while log.lock().unwrap().searches < 2 && Instant::now() < deadline {
+            match handle.try_next_event() {
+                Some(event) => seen.push(event),
+                None => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        assert_eq!(
+            log.lock().unwrap().searches,
+            2,
+            "改了上限之后没有立刻再查一次:{seen:#?}"
+        );
+    }
+
+    /// 设置里填 60 秒也快不过预算地板,而且界面上看得见到底多久一次。
+    #[test]
+    fn the_budget_floor_holds_the_poll_interval_and_reaches_the_status() {
+        let (transport, _log) = FakeTrade::new();
+        let mut settings = settings();
+        settings.watcher.poll_interval_seconds = 60;
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::in_memory(), transport).unwrap();
+
+        let mut seen = Vec::new();
+        let event = wait_for(
+            &handle,
+            &mut seen,
+            |event| {
+                matches!(
+                    event,
+                    RuntimeEvent::WatchStatus { status, .. } if status.last_total == Some(2)
+                )
+            },
+            "the first poll to finish",
+        );
+        let RuntimeEvent::WatchStatus { status, .. } = event else {
+            unreachable!()
+        };
+        // 6 小时 299 次的额度,一条搜索最快 73 秒一轮 —— 填 60 也没用。
+        assert_eq!(status.poll_every_secs, 73);
+        assert!(
+            status
+                .next_poll_at
+                .is_some_and(|at| at - now_secs() > 60 && at - now_secs() <= 73),
+            "下一轮排在 {:?},现在是 {}",
+            status.next_poll_at,
+            now_secs()
+        );
     }
 
     #[test]

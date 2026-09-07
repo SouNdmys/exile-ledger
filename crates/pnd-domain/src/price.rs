@@ -233,6 +233,40 @@ mod price_tests {
         );
     }
 
+    /// 上限本身算命中("≤ 上限",不是"< 上限")。
+    ///
+    /// 界面上那句说明照着这条写。差一个等号就是"我填 223,市面上摆着一件
+    /// 223,程序一声不响" —— 这个边界值得单独钉一次。
+    #[test]
+    fn a_listing_priced_exactly_at_the_cap_is_a_hit() {
+        let cap = divine(223.0);
+        assert_eq!(
+            judge(&cap, Some(&divine(223.0)), &CurrencyRates::none()),
+            Verdict::Hit
+        );
+        assert_eq!(
+            judge(&cap, Some(&divine(222.999)), &CurrencyRates::none()),
+            Verdict::Hit
+        );
+        assert_eq!(
+            judge(&cap, Some(&divine(223.001)), &CurrencyRates::none()),
+            Verdict::TooExpensive
+        );
+        // 换算过去正好等于上限的异币种也一样算命中。
+        let rates = CurrencyRates {
+            chaos_per_divine_milli: Some(10_000),
+            ..CurrencyRates::none()
+        };
+        assert_eq!(
+            judge(
+                &divine(2.0),
+                Some(&Price::from_trade(20.0, "chaos")),
+                &rates
+            ),
+            Verdict::Hit
+        );
+    }
+
     #[test]
     fn cross_currency_needs_rates() {
         let cap = divine(20.0);

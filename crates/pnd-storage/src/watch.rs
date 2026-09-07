@@ -9,6 +9,10 @@
 //!
 //! 去重键是 `(watch_id, listing_id, price_milli, price_currency)`:同一件东西
 //! 降价重挂算一条新单,值得再叫你一次;原价还挂在那儿就不该反复响。
+//!
+//! 那一行上的 `verdict` 记的是**这一声叫过没有**:记成 `hit` 才算叫过。
+//! 上限是你随时会改的东西,一件当初太贵、只是被记了一笔的货,在你把上限
+//! 提上去之后必须还能响 —— 否则"我调高了上限却没动静"就是必然。
 
 use std::path::Path;
 use std::time::Duration;
@@ -138,7 +142,10 @@ impl AlertSource {
     }
 }
 
-/// 记一条挂单的结果:第一次见到才值得叫人。
+/// 记一条挂单的结果:`New` 才值得往下走判定。
+///
+/// "见过"说的是**已经为它叫过一次**,不是"这条数据我读到过":一件太贵的货
+/// 会进表,但它还没叫过,所以上限一提它照样能响。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeenOutcome {
     New,
@@ -339,10 +346,13 @@ impl WatchStore {
 
     // ---- seen_listings --------------------------------------------------
 
-    /// 记下"这条搜索见过这件东西、这个价"。
+    /// 记下"这条搜索见过这件东西、这个价",并回答"这一声还没叫过吗"。
     ///
-    /// 只有真的插进去了才返回 `New` —— 判定要不要叫人就看这一个返回值。
-    /// 已经见过的只把 `last_seen_at` 往前推,好知道它还挂在市面上。
+    /// `New` = 这个价第一次进表,**或者**这一行头一回够便宜。所以一件当初
+    /// 太贵、被记下来的货,在你把上限提上去之后会重新算一次新单 —— 早先这里
+    /// 只看"这行插进去了没有",于是上限一改,先前记下的那些反而永远叫不响了。
+    ///
+    /// 已经叫过的只把 `last_seen_at` 往前推,好知道它还挂在市面上。
     pub fn record_listing(
         &self,
         watch_id: &WatchId,
@@ -368,12 +378,28 @@ impl WatchStore {
             ],
         )?;
         if inserted > 0 {
+            // 这个价第一次进表。够不够便宜是判定那一层的事,这里只说"没见过"。
             return Ok(SeenOutcome::New);
         }
         // 冲突分支单独写一条 UPDATE,而不是 `DO UPDATE`:一条 upsert 语句
         // 无论插入还是更新都报"改了 1 行",分不出这单是不是新的。
+        //
+        // 存着的 `verdict` 就是"这一行叫过没有":一旦记成 `hit` 就不再改回去,
+        // 否则用户把上限调低再调回来,同一件货会再响一次。
+        let stored: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT verdict FROM seen_listings
+                 WHERE watch_id = ?1 AND listing_id = ?2
+                   AND price_milli = ?3 AND price_currency = ?4",
+                params![watch_id.as_str(), listing.id, price_milli, price_currency],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let alerted = stored.as_deref() == Some(verdict_code(Verdict::Hit));
+        let verdict = if alerted { Verdict::Hit } else { verdict };
         self.conn.execute(
-            "UPDATE seen_listings SET last_seen_at = ?5
+            "UPDATE seen_listings SET last_seen_at = ?5, verdict = ?6
              WHERE watch_id = ?1 AND listing_id = ?2
                AND price_milli = ?3 AND price_currency = ?4",
             params![
@@ -382,9 +408,14 @@ impl WatchStore {
                 price_milli,
                 price_currency,
                 now,
+                verdict_code(verdict),
             ],
         )?;
-        Ok(SeenOutcome::AlreadySeen)
+        Ok(if !alerted && verdict == Verdict::Hit {
+            SeenOutcome::New
+        } else {
+            SeenOutcome::AlreadySeen
+        })
     }
 
     // ---- alerts ---------------------------------------------------------
@@ -772,6 +803,58 @@ mod watch_tests {
             )
             .expect("read");
         assert_eq!((first, last), (100, 200));
+    }
+
+    /// 太贵的那一行不该把以后的提醒堵死。
+    ///
+    /// 现场:上限 221 的时候看到一件 222 的,它进了去重表;用户随后把上限
+    /// 改成 223,同一件东西再看到时如果还算"见过了",这一声就永远不会响。
+    #[test]
+    fn a_listing_first_seen_as_too_expensive_is_new_again_once_it_hits() {
+        let store = store();
+        let id = watch("w-1");
+        let item = listing("aaa", divine(222_000));
+        assert_eq!(
+            store
+                .record_listing(&id, &item, Verdict::TooExpensive, 100)
+                .expect("record"),
+            SeenOutcome::New
+        );
+        // 还是太贵:没什么新鲜的。
+        assert_eq!(
+            store
+                .record_listing(&id, &item, Verdict::TooExpensive, 110)
+                .expect("record"),
+            SeenOutcome::AlreadySeen
+        );
+        // 上限提上去了 —— 这件货对用户来说是第一次"够便宜"。
+        assert_eq!(
+            store
+                .record_listing(&id, &item, Verdict::Hit, 120)
+                .expect("record"),
+            SeenOutcome::New,
+            "上限提上去之后这件货该重新算一次新单"
+        );
+        // 叫过一次就够了。
+        assert_eq!(
+            store
+                .record_listing(&id, &item, Verdict::Hit, 130)
+                .expect("record"),
+            SeenOutcome::AlreadySeen
+        );
+        // 上限又调回去也不该把"已经叫过"这件事忘掉。
+        assert_eq!(
+            store
+                .record_listing(&id, &item, Verdict::TooExpensive, 140)
+                .expect("record"),
+            SeenOutcome::AlreadySeen
+        );
+        assert_eq!(
+            store
+                .record_listing(&id, &item, Verdict::Hit, 150)
+                .expect("record"),
+            SeenOutcome::AlreadySeen
+        );
     }
 
     /// 无价单也要能进去重表:主键里有价格,NULL 会让它每轮都算新单。

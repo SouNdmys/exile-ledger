@@ -23,6 +23,13 @@ pub const SEARCH_POLICY: &str = "trade-search-request-limit";
 /// 抓取挂单详情的限速策略名。
 pub const FETCH_POLICY: &str = "trade-fetch-request-limit";
 
+/// search 策略最长的那个桶:6 小时 600 次(2026-09-06 实测的 `600:21600:3600`)。
+///
+/// 短窗口(10 秒 5 次那种)靠限速器排队就能扛过去,只有这个 6 小时的桶会在
+/// 跑了一整天之后把人卡死 —— 所以轮询节奏的地板按它算。
+pub const SEARCH_LONG_WINDOW_REQUESTS: u32 = 600;
+pub const SEARCH_LONG_WINDOW_SECS: u32 = 21_600;
+
 /// 一条 `次数:窗口秒:冷却秒` 三元组。
 ///
 /// 同样的写法在两个头里含义不同:在上限头里三个数是"允许次数 / 窗口 /
@@ -153,8 +160,11 @@ impl Default for Budget {
 }
 
 impl Budget {
+    /// 服务端说这个桶能发 `requests` 次,我们自己只用其中多少次。
+    ///
     /// 至少留 1 次:预算再小也得能发出请求,否则整条策略永远卡死。
-    fn effective_limit(&self, requests: u32) -> u32 {
+    #[must_use]
+    pub fn effective_limit(&self, requests: u32) -> u32 {
         (requests.saturating_mul(self.percent) / 100)
             .saturating_sub(self.margin)
             .max(1)
@@ -580,6 +590,18 @@ mod rate_limit_tests {
             .map(|b| budget.effective_limit(b.requests))
             .collect();
         assert_eq!(fetch, vec![5, 7, 24, 499]);
+    }
+
+    /// 轮询节奏的地板照这两个常数算,所以它们必须还是实测的那一对。
+    #[test]
+    fn the_long_search_window_matches_the_measured_header() {
+        let longest = search_headers().limits["Ip"].last().copied().expect("桶");
+        assert_eq!(longest.requests, SEARCH_LONG_WINDOW_REQUESTS);
+        assert_eq!(longest.window_secs, SEARCH_LONG_WINDOW_SECS);
+        assert_eq!(
+            Budget::default().effective_limit(SEARCH_LONG_WINDOW_REQUESTS),
+            299
+        );
     }
 
     #[test]
