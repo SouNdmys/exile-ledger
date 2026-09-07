@@ -306,6 +306,7 @@ pub struct AppShell {
     pub(crate) mods_table: Entity<TableState<SimpleTable>>,
 
     pub(crate) uniques_partition_select: ChoiceSelect,
+    pub(crate) mods_class_select: ChoiceSelect,
     pub(crate) mods_slot_select: ChoiceSelect,
     pub(crate) mods_rarity_select: ChoiceSelect,
     pub(crate) mods_kind_select: ChoiceSelect,
@@ -423,7 +424,7 @@ impl AppShell {
         let uniques_table = new_table(pages::ninja_uniques::table_content(text), window, cx);
         let mods_table = new_table(pages::ninja_mods::table_content(text), window, cx);
 
-        // 四个下拉先按空数据造出来:库还没读呢。第一次 render 时
+        // 五个下拉先按空数据造出来:库还没读呢。第一次 render 时
         // `sync_ninja_filters` 会拿真数据把它们重造一遍。
         let uniques_partition_select = choice_select(
             pages::ninja_uniques::partition_choices(&[], text),
@@ -431,6 +432,8 @@ impl AppShell {
             window,
             cx,
         );
+        let mods_class_select =
+            choice_select(pages::ninja_mods::class_choices(&[], text), "", window, cx);
         let mods_slot_select =
             choice_select(pages::ninja_mods::slot_choices(&[], text), "", window, cx);
         // 稀有度是唯一一个不从"全部"起步的下拉:这一页要回答的是"我该给自己
@@ -461,6 +464,20 @@ impl AppShell {
                 cx.notify();
             },
         )
+        .detach();
+        // 职业不在那三个之列:每个职业各有一套完整的词缀行,换一个就得回库里
+        // 重查那一套,而不是在内存里筛一遍现有的行。
+        cx.subscribe(&mods_class_select, |this: &mut AppShell, _, event, cx| {
+            let SelectEvent::Confirm(Some(value)) = event else {
+                return;
+            };
+            if this.ninja.selected_class == value.as_ref() {
+                return;
+            }
+            this.ninja.selected_class = value.to_string();
+            this.reload_ninja_mods();
+            cx.notify();
+        })
         .detach();
         for select in [&mods_slot_select, &mods_rarity_select, &mods_kind_select] {
             cx.subscribe(select, |this: &mut AppShell, _, event, cx| {
@@ -527,6 +544,7 @@ impl AppShell {
             uniques_table,
             mods_table,
             uniques_partition_select,
+            mods_class_select,
             mods_slot_select,
             mods_rarity_select,
             mods_kind_select,
@@ -721,15 +739,26 @@ impl AppShell {
         self.ninja_filters_dirty = false;
         let text = self.text();
         let partitions = pages::ninja_uniques::partition_choices(&self.ninja.partition_keys, text);
+        let classes = pages::ninja_mods::class_choices(&self.ninja.classes, text);
         let slots = pages::ninja_mods::slot_choices(&self.ninja.mods, text);
         let rarities = pages::ninja_mods::rarity_choices(&self.ninja.mods, text);
         let kinds = pages::ninja_mods::kind_choices(&self.ninja.mods, text);
         let partition = self.ninja.selected_partition.clone();
+        let class = self.ninja.selected_class.clone();
 
         relabel_select(
             &self.uniques_partition_select.clone(),
             partitions,
             Some(&partition),
+            window,
+            cx,
+        );
+        // 分区和职业跟着数据走:上一轮选的那个这一版没有了,`load` 已经把它退回
+        // "全部",下拉得跟上,不然它指着一个查不到东西的值。
+        relabel_select(
+            &self.mods_class_select.clone(),
+            classes,
+            Some(&class),
             window,
             cx,
         );

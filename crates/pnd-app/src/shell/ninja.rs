@@ -12,6 +12,8 @@
 //!   `IndexState::league_url_for_name` 在采样线程里给出。
 //! - **一次读齐。** 换筛选器、翻页都不该再打一次库:开一次连接把这一轮的
 //!   快照、分区清单、暗金榜、词缀统计全读进内存(几千行而已),之后全在内存里筛。
+//!   两个例外是**分区**和**职业**:每个分区一份暗金榜、每个职业一整套词缀统计,
+//!   全读进来是十几倍的量,换一次就回库里重查那一段。
 //! - **采样线程的生死。** 句柄挂在 `AppShell` 上,丢掉它就是取消 + 收摊;
 //!   一轮没跑完的时候"刷新"按钮是灰的,免得同一个库上并排跑两条采样线程。
 
@@ -72,8 +74,13 @@ pub struct NinjaData {
     pub characters_pending: u32,
     /// 参考价里最旧的那次抓取时刻。
     pub prices_fetched_at: Option<i64>,
-    /// 这一轮全部的词缀统计。筛选是在内存里做的:1,500 行而已,
-    /// 每换一次下拉都回去打一次库不值当。
+    /// 这一轮统计里出现过的职业,各自采到了多少个角色。职业下拉的选项。
+    pub classes: Vec<(String, u32)>,
+    /// 当前选中的职业(`""` = 所有职业合起来的那一套统计)。
+    pub selected_class: String,
+    /// **选中那个职业**的全部词缀统计。部位/稀有度/类型三个下拉是在内存里筛的
+    /// (1,500 行而已),但职业不是:每个职业各有一套完整的行,全读进来就是十几
+    /// 倍的量,而且换职业本来就该像换分区一样回库里重查一次。
     pub mods: Vec<SlotModStat>,
 }
 
@@ -149,12 +156,14 @@ pub fn percent_text(value: f64, text: &'static Text) -> String {
 
 /// 把这一轮的缓存整份读进内存。
 ///
-/// `want_partition` 是用户上次选的那个分区;它这一轮不在了(换快照了)就退回
-/// 全联赛,而不是让筛选器指着一条查不到东西的键。
+/// `want_partition` / `want_class` 是用户上次选的那个分区和职业;这一轮它不在了
+/// (换快照了、那个职业还没采到人)就退回"全部",而不是让筛选器指着一个查不到
+/// 东西的值。
 pub fn load(
     store: &NinjaStore,
     league_url: &str,
     want_partition: &str,
+    want_class: &str,
 ) -> Result<NinjaData, StorageError> {
     let (characters_pending, characters_done, _failed) = store.character_counts(league_url)?;
     let mut data = NinjaData {
@@ -178,10 +187,29 @@ pub fn load(
     let (total, uniques) = load_uniques(store, league_url, &version, &data.selected_partition)?;
     data.partition_total = total;
     data.uniques = uniques;
-    // 阈值给 0:筛掉哪些行是界面上那个开关的事,库里读全份。
-    data.mods = store.slot_mods(league_url, &version, None, None, 0.0)?;
+    data.classes = store.mod_classes(league_url, &version)?;
+    data.selected_class = if data.classes.iter().any(|(class, _)| class == want_class) {
+        want_class.to_owned()
+    } else {
+        String::new()
+    };
+    data.mods = load_mods(store, league_url, &version, &data.selected_class)?;
     data.snapshot = Some(snapshot);
     Ok(data)
+}
+
+/// 一个职业的那一套词缀统计。换个职业只用重跑这一段。
+///
+/// 阈值给 0:筛掉哪些行是界面上那个开关的事,库里读全份。
+pub fn load_mods(
+    store: &NinjaStore,
+    league_url: &str,
+    version: &str,
+    class: &str,
+) -> Result<Vec<SlotModStat>, StorageError> {
+    // 空串在库里是"全样本"那一套行的键,而查询里它得写成 `None`。
+    let class = (!class.is_empty()).then_some(class);
+    store.slot_mods_of_kind(league_url, version, None, None, None, class, 0.0)
 }
 
 /// 一个分区的暗金榜:人气 × 参考价。换个分区只用重跑这一段。
@@ -400,8 +428,9 @@ impl AppShell {
     pub(crate) fn reload_ninja(&mut self) {
         let league_url = self.ninja.league_url.clone();
         let wanted = self.ninja.selected_partition.clone();
+        let class = self.ninja.selected_class.clone();
         let loaded = match &self.ninja_store {
-            Some(store) => load(store, &league_url, &wanted),
+            Some(store) => load(store, &league_url, &wanted, &class),
             None => return,
         };
         match loaded {
@@ -437,6 +466,30 @@ impl AppShell {
         }
     }
 
+    /// 只重读词缀统计。换一次职业筛选器走的是这条路 —— 每个职业各有一套完整的
+    /// 行,只有选中的那一套值得读进内存;暗金榜和它无关,不用跟着重读。
+    pub(crate) fn reload_ninja_mods(&mut self) {
+        let league_url = self.ninja.league_url.clone();
+        let class = self.ninja.selected_class.clone();
+        let Some(version) = self.ninja.version().map(ToOwned::to_owned) else {
+            return;
+        };
+        let loaded = match &self.ninja_store {
+            Some(store) => load_mods(store, &league_url, &version, &class),
+            None => return,
+        };
+        match loaded {
+            Ok(rows) => {
+                self.ninja.mods = rows;
+                self.mods_dirty = true;
+                // 部位/稀有度/类型那三个下拉的选项是从这批行里长出来的:
+                // 换了职业,它们也得跟着重造。
+                self.ninja_filters_dirty = true;
+            }
+            Err(error) => self.push_log(format!("could not read the modifier heat: {error}")),
+        }
+    }
+
     /// 联赛改了就换一份缓存视图 —— 库里的行是按联赛短名分的。
     pub(crate) fn resync_ninja_league(&mut self) {
         let league_url = league_url_guess(&self.settings.league);
@@ -455,6 +508,7 @@ mod ninja_tests {
 
     fn stat(slot: &str, characters: u32, sample: u32) -> SlotModStat {
         SlotModStat {
+            class: String::new(),
             slot: slot.to_owned(),
             rarity: "Rare".to_owned(),
             mod_kind: "explicit".to_owned(),
@@ -682,7 +736,7 @@ mod ninja_tests {
     #[test]
     fn an_empty_cache_loads_as_an_empty_view() {
         let store = NinjaStore::open_in_memory().expect("store");
-        let data = load(&store, "forbiddenrites", "").expect("load");
+        let data = load(&store, "forbiddenrites", "", "").expect("load");
         assert_eq!(data.league_url, "forbiddenrites");
         assert!(data.snapshot.is_none());
         assert!(data.version().is_none());
@@ -756,7 +810,7 @@ mod ninja_tests {
             .complete_character(league, "dota-1809", "King", "today", "{}", 5_100)
             .expect("done");
 
-        let data = load(&store, league, "").expect("load");
+        let data = load(&store, league, "", "").expect("load");
         assert_eq!(data.version(), Some("today"));
         assert_eq!(data.characters_done, 2, "昨天采的那个不能从抬头里消失");
         // 抬头那句话直接印这个数(格式由 `ninja_uniques` 那边的测试守)。
@@ -769,6 +823,86 @@ mod ninja_tests {
             )
             .contains("已采 2 个角色")
         );
+    }
+
+    /// 词缀页的职业维度:下拉的选项从库里长出来,选中的那个职业单独读一套行。
+    ///
+    /// 每个职业各有一套完整统计,所以这里**不能**把全部行读进内存再筛 ——
+    /// 那是十几倍的量;换职业和换分区一样,回库里重查一次。
+    #[test]
+    fn the_mods_come_back_for_the_chosen_class_with_its_own_denominator() {
+        let store = NinjaStore::open_in_memory().expect("store");
+        let league = "forbiddenrites";
+        let version = "1733-20260906-24495";
+        store
+            .upsert_snapshot(&SnapshotRow {
+                league_url: league.to_owned(),
+                version: version.to_owned(),
+                snapshot_name: "forbidden-rites".to_owned(),
+                total_characters: 65_371,
+                stage: pnd_storage::SnapshotStage::Aggregated,
+                started_at: 1_000,
+                finished_at: Some(2_000),
+            })
+            .expect("snapshot");
+        let whole = vec![pnd_ninja::plan::Partition::new(
+            pnd_ninja::plan::PartitionTier::Whole,
+            Vec::new(),
+        )];
+        store
+            .enqueue_partitions(league, version, &whole)
+            .expect("enqueue");
+        let people: Vec<pnd_ninja::plan::SampledCharacter> =
+            [("a-1", "One", "Deadeye"), ("b-2", "Two", "Deadeye")]
+                .iter()
+                .map(|(account, name, class)| pnd_ninja::plan::SampledCharacter {
+                    account: (*account).to_owned(),
+                    name: (*name).to_owned(),
+                    class: (*class).to_owned(),
+                    level: 98,
+                    from_partition: String::new(),
+                    tier: pnd_ninja::plan::PartitionTier::Whole,
+                })
+                .collect();
+        store
+            .complete_partition(league, version, "", 2, &[], &people, 2_000)
+            .expect("complete");
+        for (account, name) in [("a-1", "One"), ("b-2", "Two")] {
+            store
+                .complete_character(league, account, name, version, "{}", 2_000)
+                .expect("done");
+        }
+        let deadeye = SlotModStat {
+            class: "Deadeye".to_owned(),
+            characters: 9,
+            sample_size: 12,
+            ..stat("BodyArmour", 13, 47)
+        };
+        store
+            .replace_item_mods(league, version, &[stat("BodyArmour", 13, 47), deadeye])
+            .expect("mods");
+
+        // 默认停在"全部":读到的是全样本那一套,分母是 47。
+        let all = load(&store, league, "", "").expect("load");
+        assert_eq!(all.classes, vec![("Deadeye".to_owned(), 2)]);
+        assert_eq!(all.selected_class, "");
+        assert_eq!(all.mods.len(), 1);
+        assert_eq!(all.mods[0].sample_size, 47);
+
+        // 选了职业:换一套行,分母跟着换成这个职业自己的。
+        let picked = load(&store, league, "", "Deadeye").expect("load");
+        assert_eq!(picked.selected_class, "Deadeye");
+        assert_eq!(picked.mods.len(), 1);
+        assert_eq!(picked.mods[0].class, "Deadeye");
+        assert_eq!(
+            (picked.mods[0].characters, picked.mods[0].sample_size),
+            (9, 12)
+        );
+
+        // 上次选的职业这一轮没采到人就退回"全部",而不是指着一个空职业。
+        let gone = load(&store, league, "", "Nobody").expect("load");
+        assert_eq!(gone.selected_class, "");
+        assert_eq!(gone.mods[0].sample_size, 47);
     }
 
     /// 一份跑完的缓存要能整份读回来:分区清单、暗金榜(拼上价格)、词缀统计。
@@ -834,7 +968,7 @@ mod ninja_tests {
             .replace_item_mods("forbiddenrites", version, &[stat("BodyArmour", 13, 47)])
             .expect("mods");
 
-        let data = load(&store, "forbiddenrites", "").expect("load");
+        let data = load(&store, "forbiddenrites", "", "").expect("load");
         assert_eq!(data.version(), Some(version));
         assert_eq!(data.partition_keys, vec!["", "class=Deadeye"]);
         assert_eq!(data.selected_partition, "");
@@ -857,14 +991,14 @@ mod ninja_tests {
         assert!((top.share_percent - 11.418).abs() < 0.01);
 
         // 换一个分区只换榜,分母跟着换。
-        let deadeye = load(&store, "forbiddenrites", "class=Deadeye").expect("load");
+        let deadeye = load(&store, "forbiddenrites", "class=Deadeye", "").expect("load");
         assert_eq!(deadeye.selected_partition, "class=Deadeye");
         assert_eq!(deadeye.partition_total, Some(4_000));
         assert_eq!(deadeye.uniques[0].name, "Beira's Anguish");
         assert_eq!(deadeye.uniques[0].price_milli, None, "没挂单就没有参考价");
 
         // 上次选的分区这一轮没有了(换快照)就退回全联赛,而不是指着一条空键。
-        let gone = load(&store, "forbiddenrites", "class=Nobody").expect("load");
+        let gone = load(&store, "forbiddenrites", "class=Nobody", "").expect("load");
         assert_eq!(gone.selected_partition, "");
         assert_eq!(gone.uniques[0].name, "Wake of Destruction");
     }

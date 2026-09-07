@@ -219,6 +219,9 @@ catalogue! {
     // -- 词缀热度页 --
     mods_heading,
     mods_subtitle,
+    mods_class_label,
+    /// 职业下拉里的一项:职业名 + 这个职业采到了几个角色
+    mods_class_option,
     mods_slot_label,
     mods_rarity_label,
     mods_kind_label,
@@ -234,6 +237,10 @@ catalogue! {
     mods_sample_line,
     /// 筛选器停在"全部"时的那一句:"所有部位合起来,一共采样 {} 个角色"
     mods_sample_any,
+    /// 选了职业时的那一句:分母换成了这个职业自己的人数
+    mods_sample_class,
+    /// 选了职业、部位却停在"全部"时的那一句
+    mods_sample_class_any,
     mods_empty,
     mods_rarity_unique,
     mods_rarity_rare,
@@ -592,6 +599,8 @@ pub static ENGLISH: Text = Text {
 
     mods_heading: "Modifier heat",
     mods_subtitle: "Which modifiers the sampled characters actually carry, by slot.",
+    mods_class_label: "Class",
+    mods_class_option: "{} ({})",
     mods_slot_label: "Slot",
     mods_rarity_label: "Rarity",
     mods_kind_label: "Kind",
@@ -605,6 +614,8 @@ pub static ENGLISH: Text = Text {
     mods_col_p75: "p75",
     mods_sample_line: "from {} characters wearing {}, of {} sampled",
     mods_sample_any: "every slot together, out of {} sampled characters",
+    mods_sample_class: "from {} characters wearing {}, class {}, out of {} sampled in that class",
+    mods_sample_class_any: "every slot together for {}, out of {} sampled characters in that class",
     mods_empty: "No modifier stats yet. Refresh on the Unique heat page samples characters and builds them.",
     mods_rarity_unique: "Unique",
     mods_rarity_rare: "Rare",
@@ -873,6 +884,8 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
 
     mods_heading: "词缀热度",
     mods_subtitle: "采样到的角色身上,各个部位实际带着哪些词缀。",
+    mods_class_label: "职业",
+    mods_class_option: "{}({} 人)",
     mods_slot_label: "部位",
     mods_rarity_label: "稀有度",
     mods_kind_label: "词缀类型",
@@ -886,6 +899,8 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     mods_col_p75: "p75",
     mods_sample_line: "统计自 {} 个穿了 {} 的角色(一共采样 {} 个)",
     mods_sample_any: "所有部位合起来,一共采样 {} 个角色",
+    mods_sample_class: "统计自 {} 个穿了 {} 的 {} 角色(该职业共采样 {} 个)",
+    mods_sample_class_any: "{} 的所有部位合起来,该职业共采样 {} 个角色",
     mods_empty: "还没有词缀统计。去暗金热度页按刷新,采完角色就会有。",
     mods_rarity_unique: "暗金",
     mods_rarity_rare: "稀有",

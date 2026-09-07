@@ -81,6 +81,7 @@ CREATE INDEX IF NOT EXISTS ninja_characters_queue ON ninja_characters(league_url
 CREATE TABLE IF NOT EXISTS ninja_item_mods (
     league_url TEXT NOT NULL,
     version TEXT NOT NULL,
+    class TEXT NOT NULL DEFAULT '',
     slot TEXT NOT NULL,
     rarity TEXT NOT NULL,
     mod_kind TEXT NOT NULL,
@@ -92,7 +93,7 @@ CREATE TABLE IF NOT EXISTS ninja_item_mods (
     p25 REAL,
     p50 REAL,
     p75 REAL,
-    PRIMARY KEY (league_url, version, slot, rarity, mod_kind, stat_id)
+    PRIMARY KEY (league_url, version, class, slot, rarity, mod_kind, stat_id)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS ninja_unique_prices (
@@ -133,6 +134,35 @@ fn add_primary_currency_column(conn: &Connection) -> Result<(), StorageError> {
         "ALTER TABLE ninja_unique_prices
              ADD COLUMN primary_currency TEXT NOT NULL DEFAULT 'divine'",
     )?;
+    Ok(())
+}
+
+/// 2026-09-07 加的一维:词缀统计现在**按职业分**,`class` 是主键的一列。
+///
+/// 这一次不能像 `primary_currency` 那样 `ALTER TABLE ADD COLUMN` 了事:SQLite
+/// 改不动一张已经存在的表的主键,而新列不进主键的话,十几个职业的行会在插库时
+/// 全撞进同一个键 —— 表面上有数据,实际只剩最后一个职业的那份。所以老表整张
+/// 删掉,让 `CREATE TABLE IF NOT EXISTS` 按新形状重建。
+///
+/// 删得起:这张表是从 `ninja_characters` 里的详情原文算出来的派生数据,采样线程
+/// 进角色那一步、每 50 个角色、收尾时各重建一次,一个网络请求都不用发。
+///
+/// 必须**在建表语句之前**跑:删完还得有人把它建回来。
+fn drop_item_mods_without_class(conn: &Connection) -> Result<(), StorageError> {
+    let mut columns = conn.prepare("PRAGMA table_info(ninja_item_mods)")?;
+    let names = columns.query_map([], |row| row.get::<_, String>(1))?;
+    // 表还不存在时 `table_info` 一行都不给 —— 那就没有什么可删的。
+    let mut exists = false;
+    for name in names {
+        exists = true;
+        if name? == "class" {
+            return Ok(());
+        }
+    }
+    drop(columns);
+    if exists {
+        conn.execute_batch("DROP TABLE ninja_item_mods")?;
+    }
     Ok(())
 }
 
@@ -312,6 +342,8 @@ impl NinjaStore {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // 采样线程和界面线程各开一个连接读同一个文件,5 秒足够错开一次写事务。
         conn.busy_timeout(Duration::from_secs(5))?;
+        // 顺序有讲究:老词缀表得在建表语句**之前**删掉,不然没人把它建回来。
+        drop_item_mods_without_class(&conn)?;
         conn.execute_batch(NINJA_SCHEMA)?;
         add_primary_currency_column(&conn)?;
         Ok(Self { conn })
@@ -652,14 +684,15 @@ impl NinjaStore {
         {
             let mut insert = tx.prepare(
                 "INSERT OR REPLACE INTO ninja_item_mods
-                     (league_url, version, slot, rarity, mod_kind, stat_id, mod_family,
+                     (league_url, version, class, slot, rarity, mod_kind, stat_id, mod_family,
                       characters, occurrences, sample_size, p25, p50, p75)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )?;
             for stat in stats {
                 insert.execute(params![
                     league_url,
                     version,
+                    stat.class,
                     stat.slot,
                     stat.rarity,
                     stat.mod_kind,
@@ -691,14 +724,55 @@ impl NinjaStore {
         rarity: Option<&str>,
         min_share_percent: f64,
     ) -> Result<Vec<SlotModStat>, StorageError> {
-        self.slot_mods_of_kind(league_url, version, slot, rarity, None, min_share_percent)
+        self.slot_mods_of_kind(
+            league_url,
+            version,
+            slot,
+            rarity,
+            None,
+            None,
+            min_share_percent,
+        )
     }
 
-    /// 同一张表,再多一个词缀类型的筛子(`explicit` / `implicit` / `rune` / …)。
+    /// 这一轮的统计里出现过哪些职业,各自采到了多少个角色。词缀页那个职业下拉。
     ///
-    /// 类型是主键的一维,所以在库里筛比读回来再筛便宜。分成一个兄弟函数而不是
+    /// 名单从 `ninja_item_mods` 来(那才是这一版快照真的算得出统计的职业),
+    /// 人数从 `ninja_characters` 数(**不带 version**:详情是按联赛缓存的,
+    /// 昨天采的人今天照样算数,统计也是这么算的)。
+    pub fn mod_classes(
+        &self,
+        league_url: &str,
+        version: &str,
+    ) -> Result<Vec<(String, u32)>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT stats.class,
+                    (SELECT COUNT(*) FROM ninja_characters AS people
+                     WHERE people.league_url = ?1 AND people.status = 'done'
+                       AND people.class = stats.class)
+             FROM (SELECT DISTINCT class FROM ninja_item_mods
+                   WHERE league_url = ?1 AND version = ?2 AND class <> '') AS stats
+             ORDER BY 2 DESC, 1",
+        )?;
+        let rows = statement.query_map(params![league_url, version], |row| {
+            Ok((row.get::<_, String>(0)?, to_u32(row.get::<_, i64>(1)?)))
+        })?;
+        collect(rows)
+    }
+
+    /// 同一张表,再多两个筛子:词缀类型(`explicit` / `implicit` / `rune` / …)
+    /// 和职业。
+    ///
+    /// 两个都是主键的一维,所以在库里筛比读回来再筛便宜。分成一个兄弟函数而不是
     /// 给 [`slot_mods`](Self::slot_mods) 加参数:那个签名有三个调用方,
-    /// 其中大部分本来就不关心类型。
+    /// 其中大部分本来就不关心这两维。
+    ///
+    /// `class` 给 `None` 就是**全样本那一套行**(库里写的是空串),不是"所有职业
+    /// 的行都要":后者会把同一条词缀按职业数了十几遍,占比全乱。
+    ///
+    /// 参数确实多,但它们就是这张表的五个维度加一个阈值,捆成一个结构体只是把
+    /// 同样几个名字换个地方写。
+    #[allow(clippy::too_many_arguments)]
     pub fn slot_mods_of_kind(
         &self,
         league_url: &str,
@@ -706,23 +780,26 @@ impl NinjaStore {
         slot: Option<&str>,
         rarity: Option<&str>,
         mod_kind: Option<&str>,
+        class: Option<&str>,
         min_share_percent: f64,
     ) -> Result<Vec<SlotModStat>, StorageError> {
         let mut statement = self.conn.prepare(
-            "SELECT slot, rarity, mod_kind, stat_id, mod_family,
+            "SELECT class, slot, rarity, mod_kind, stat_id, mod_family,
                     characters, occurrences, sample_size, p25, p50, p75
              FROM ninja_item_mods
              WHERE league_url = ?1 AND version = ?2
-               AND (?3 IS NULL OR slot = ?3)
-               AND (?4 IS NULL OR rarity = ?4)
-               AND (?5 IS NULL OR mod_kind = ?5)
-               AND CAST(characters AS REAL) * 100.0 / MAX(sample_size, 1) >= ?6
+               AND class = COALESCE(?3, '')
+               AND (?4 IS NULL OR slot = ?4)
+               AND (?5 IS NULL OR rarity = ?5)
+               AND (?6 IS NULL OR mod_kind = ?6)
+               AND CAST(characters AS REAL) * 100.0 / MAX(sample_size, 1) >= ?7
              ORDER BY slot, rarity, mod_kind, characters DESC, stat_id",
         )?;
         let rows = statement.query_map(
             params![
                 league_url,
                 version,
+                class,
                 slot,
                 rarity,
                 mod_kind,
@@ -975,21 +1052,22 @@ fn character_row_from_row(row: &Row<'_>) -> rusqlite::Result<CharacterRow> {
 }
 
 fn slot_mod_from_row(row: &Row<'_>) -> rusqlite::Result<SlotModStat> {
-    let characters: i64 = row.get(5)?;
-    let occurrences: i64 = row.get(6)?;
-    let sample_size: i64 = row.get(7)?;
+    let characters: i64 = row.get(6)?;
+    let occurrences: i64 = row.get(7)?;
+    let sample_size: i64 = row.get(8)?;
     Ok(SlotModStat {
-        slot: row.get(0)?,
-        rarity: row.get(1)?,
-        mod_kind: row.get(2)?,
-        stat_id: row.get(3)?,
-        mod_family: row.get(4)?,
+        class: row.get(0)?,
+        slot: row.get(1)?,
+        rarity: row.get(2)?,
+        mod_kind: row.get(3)?,
+        stat_id: row.get(4)?,
+        mod_family: row.get(5)?,
         characters: to_u32(characters),
         occurrences: to_u32(occurrences),
         sample_size: to_u32(sample_size),
-        p25: row.get(8)?,
-        p50: row.get(9)?,
-        p75: row.get(10)?,
+        p25: row.get(9)?,
+        p50: row.get(10)?,
+        p75: row.get(11)?,
     })
 }
 
@@ -1057,6 +1135,7 @@ mod ninja_tests {
 
     fn stat(slot: &str, rarity: &str, stat_id: &str, characters: u32, sample: u32) -> SlotModStat {
         SlotModStat {
+            class: String::new(),
             slot: slot.to_owned(),
             rarity: rarity.to_owned(),
             mod_kind: "explicit".to_owned(),
@@ -1790,7 +1869,7 @@ mod ninja_tests {
             .expect("replace");
 
         let explicit = store
-            .slot_mods_of_kind(LEAGUE, VERSION, None, None, Some("explicit"), 0.0)
+            .slot_mods_of_kind(LEAGUE, VERSION, None, None, Some("explicit"), None, 0.0)
             .expect("read");
         assert_eq!(
             explicit
@@ -1805,7 +1884,7 @@ mod ninja_tests {
         );
 
         let runes = store
-            .slot_mods_of_kind(LEAGUE, VERSION, None, None, Some("rune"), 0.0)
+            .slot_mods_of_kind(LEAGUE, VERSION, None, None, Some("rune"), None, 0.0)
             .expect("read");
         assert_eq!(runes.len(), 1);
         assert_eq!(runes[0].mod_kind, "rune");
@@ -1818,6 +1897,7 @@ mod ninja_tests {
                 Some("Ring"),
                 Some("Rare"),
                 Some("explicit"),
+                None,
                 2.0,
             )
             .expect("read");
@@ -1826,7 +1906,7 @@ mod ninja_tests {
         // 不认识的类型给空,而不是悄悄退回全部。
         assert!(
             store
-                .slot_mods_of_kind(LEAGUE, VERSION, None, None, Some("enchant"), 0.0)
+                .slot_mods_of_kind(LEAGUE, VERSION, None, None, Some("enchant"), None, 0.0)
                 .expect("read")
                 .is_empty()
         );
@@ -1834,11 +1914,211 @@ mod ninja_tests {
         // `None` 就是不筛:和老的 `slot_mods` 一字不差。
         assert_eq!(
             store
-                .slot_mods_of_kind(LEAGUE, VERSION, None, None, None, 0.0)
+                .slot_mods_of_kind(LEAGUE, VERSION, None, None, None, None, 0.0)
                 .expect("read"),
             store
                 .slot_mods(LEAGUE, VERSION, None, None, 0.0)
                 .expect("read")
+        );
+    }
+
+    /// 职业是主键的一维,所以在库里筛得动;`None` 问的是全样本那一套。
+    #[test]
+    fn item_mods_can_be_narrowed_to_one_class() {
+        let store = store();
+        let of_class = |class: &str, stat_id: &str, characters: u32, sample: u32| SlotModStat {
+            class: class.to_owned(),
+            ..stat("Ring", "Rare", stat_id, characters, sample)
+        };
+        let stats = vec![
+            // 全样本:2,000 个人里 1,800 个戴稀有戒指。
+            of_class("", "base_maximum_life", 1_500, 1_800),
+            of_class("", "base_fire_damage_resistance_%", 900, 1_800),
+            // Deadeye 自己那一套,分母跟着换。
+            of_class("Deadeye", "base_maximum_life", 100, 120),
+            of_class("Deadeye", "base_movement_velocity_+%", 2, 120),
+            of_class("Gemling Legionnaire", "base_maximum_life", 60, 90),
+        ];
+        store
+            .replace_item_mods(LEAGUE, VERSION, &stats)
+            .expect("replace");
+
+        // `None` = 全样本,而不是"所有职业的行加起来"。
+        let whole = store
+            .slot_mods_of_kind(LEAGUE, VERSION, None, None, None, None, 0.0)
+            .expect("read");
+        assert_eq!(whole.len(), 2);
+        assert!(whole.iter().all(|row| row.class.is_empty()));
+        assert_eq!(whole[0].characters, 1_500);
+
+        let deadeye = store
+            .slot_mods_of_kind(LEAGUE, VERSION, None, None, None, Some("Deadeye"), 0.0)
+            .expect("read");
+        assert_eq!(
+            deadeye
+                .iter()
+                .map(|row| (row.class.as_str(), row.stat_id.as_str(), row.sample_size))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Deadeye", "base_maximum_life", 120),
+                ("Deadeye", "base_movement_velocity_+%", 120),
+            ]
+        );
+
+        // 阈值按这个职业自己的分母算:2/120 = 1.7%,被 2% 挡掉。
+        let common = store
+            .slot_mods_of_kind(LEAGUE, VERSION, None, None, None, Some("Deadeye"), 2.0)
+            .expect("read");
+        assert_eq!(common.len(), 1);
+        assert_eq!(common[0].stat_id, "base_maximum_life");
+
+        // 没采到的职业给空,而不是悄悄退回全样本。
+        assert!(
+            store
+                .slot_mods_of_kind(LEAGUE, VERSION, None, None, None, Some("Nobody"), 0.0)
+                .expect("read")
+                .is_empty()
+        );
+
+        // 老签名一个字没变:它问的还是全样本。
+        assert_eq!(
+            store
+                .slot_mods(LEAGUE, VERSION, None, None, 0.0)
+                .expect("read"),
+            whole
+        );
+    }
+
+    /// 职业下拉的选项:这一版统计里有哪些职业,各自采到了几个人。
+    #[test]
+    fn mod_classes_lists_the_sampled_classes_with_their_counts() {
+        let store = store();
+        assert!(store.mod_classes(LEAGUE, VERSION).expect("read").is_empty());
+
+        let of_class = |class: &str| SlotModStat {
+            class: class.to_owned(),
+            ..stat("Ring", "Rare", "base_maximum_life", 10, 20)
+        };
+        store
+            .replace_item_mods(
+                LEAGUE,
+                VERSION,
+                &[
+                    of_class(""),
+                    of_class("Deadeye"),
+                    of_class("Gemling Legionnaire"),
+                ],
+            )
+            .expect("replace");
+
+        // 人数从角色表来:两个 Deadeye 抓到手,一个还在队列里不算数。
+        store
+            .enqueue_partitions(LEAGUE, VERSION, &partitions())
+            .expect("enqueue");
+        let mut people = vec![
+            sampled("a-1", "One", PartitionTier::Whole),
+            sampled("b-2", "Two", PartitionTier::Whole),
+            sampled("c-3", "Three", PartitionTier::Whole),
+            sampled("d-4", "Four", PartitionTier::Whole),
+        ];
+        people[0].class = "Deadeye".to_owned();
+        people[1].class = "Deadeye".to_owned();
+        people[2].class = "Deadeye".to_owned();
+        people[3].class = "Gemling Legionnaire".to_owned();
+        store
+            .complete_partition(LEAGUE, VERSION, "", 4, &[], &people, 1_000)
+            .expect("complete");
+        for (account, name) in [("a-1", "One"), ("b-2", "Two"), ("d-4", "Four")] {
+            store
+                .complete_character(LEAGUE, account, name, VERSION, "{}", 1_000)
+                .expect("done");
+        }
+
+        assert_eq!(
+            store.mod_classes(LEAGUE, VERSION).expect("read"),
+            vec![
+                ("Deadeye".to_owned(), 2),
+                ("Gemling Legionnaire".to_owned(), 1),
+            ],
+            "全样本那一档不是一个职业,人多的排前面"
+        );
+
+        // 另一版快照的统计里还没有职业行,下拉就该是空的。
+        assert!(
+            store
+                .mod_classes(LEAGUE, "other-version")
+                .expect("read")
+                .is_empty()
+        );
+    }
+
+    /// 2026-09-07 之前建的库必须能原地升级。
+    ///
+    /// 这一列进了主键,而 SQLite 改不动已有表的主键:不整张删掉重建,
+    /// 十几个职业的行会全撞进同一个键,词缀页看着有数据,其实只剩最后一个
+    /// 职业那份。删得起——统计是从详情原文算出来的,下一个检查点就重建。
+    #[test]
+    fn an_old_cache_drops_its_class_less_mod_stats() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.execute_batch(
+            "CREATE TABLE ninja_item_mods (
+                 league_url TEXT NOT NULL,
+                 version TEXT NOT NULL,
+                 slot TEXT NOT NULL,
+                 rarity TEXT NOT NULL,
+                 mod_kind TEXT NOT NULL,
+                 stat_id TEXT NOT NULL,
+                 mod_family TEXT NOT NULL,
+                 characters INTEGER NOT NULL,
+                 occurrences INTEGER NOT NULL,
+                 sample_size INTEGER NOT NULL,
+                 p25 REAL,
+                 p50 REAL,
+                 p75 REAL,
+                 PRIMARY KEY (league_url, version, slot, rarity, mod_kind, stat_id)
+             ) STRICT;
+             INSERT INTO ninja_item_mods VALUES
+                 ('forbiddenrites', '1508-20260906-55820', 'Ring', 'Rare', 'explicit',
+                  'base_maximum_life', 'IncreasedLife', 900, 901, 1000, 95.0, 115.0, 135.0);",
+        )
+        .expect("old schema");
+
+        let store = NinjaStore::initialize(conn).expect("upgrade");
+        assert!(
+            store
+                .slot_mods(LEAGUE, VERSION, None, None, 0.0)
+                .expect("read")
+                .is_empty(),
+            "老行没有职业这一维,留着只会是一半新一半旧"
+        );
+
+        // 新形状是能装下每个职业的:同一条词缀,三个职业三行。
+        let of_class = |class: &str| SlotModStat {
+            class: class.to_owned(),
+            ..stat("Ring", "Rare", "base_maximum_life", 10, 20)
+        };
+        store
+            .replace_item_mods(
+                LEAGUE,
+                VERSION,
+                &[of_class(""), of_class("Deadeye"), of_class("Warbringer")],
+            )
+            .expect("replace");
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM ninja_item_mods", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 3, "职业没进主键的话这三行会撞成一行");
+
+        // 升级那一步每次开库都走一遍,第二遍必须是空操作 —— 不然每次开程序
+        // 都把统计清一次。
+        drop_item_mods_without_class(&store.conn).expect("second run");
+        assert_eq!(
+            store
+                .slot_mods_of_kind(LEAGUE, VERSION, None, None, None, Some("Deadeye"), 0.0)
+                .expect("read")
+                .len(),
+            1
         );
     }
 

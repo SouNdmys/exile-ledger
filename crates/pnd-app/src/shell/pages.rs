@@ -300,6 +300,7 @@ mod pages_tests {
     /// 一行词缀统计,拿来量词缀表。
     fn mod_content(text: &'static i18n::Text) -> TableContent {
         let stats = vec![pnd_ninja::aggregate::SlotModStat {
+            class: String::new(),
             slot: "BodyArmour".to_string(),
             rarity: "Rare".to_string(),
             mod_kind: "explicit".to_string(),

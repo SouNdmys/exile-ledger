@@ -5,6 +5,10 @@
 //! 而是从库里已有的统计里长出来的 —— 写死的话,ninja 哪天多一个部位,
 //! 那个部位的行就永远筛不出来。
 //!
+//! 最前面还有第四个下拉:**职业**。它和那三个不是一回事 —— 每个职业在库里
+//! 各有一套完整的统计(分母也是这个职业自己的人数),所以换职业是回库里重查
+//! 一套行,而不是在内存里筛。默认停在"全部",也就是所有职业合起来那一套。
+//!
 //! 默认藏掉占比低于 2% 的行:2,000 个样本下,占比比这还低的"刁钻词缀"
 //! 统计误差比它本身还大,铺出来只会误导。想看就把开关打开。
 
@@ -46,6 +50,33 @@ fn choices_from(
             .map(|value| Choice::new(value.clone(), label(&value))),
     );
     items
+}
+
+/// 职业下拉。职业名是 ninja 的原文(`Deadeye`),不翻译 —— 游戏里就长这样。
+///
+/// 每一项后面挂着这个职业采到了多少个角色:一个只采到 6 个人的职业,它那份
+/// p50 是六个人量出来的,选之前就该看得见。
+pub fn class_choices(classes: &[(String, u32)], text: &'static Text) -> Vec<Choice> {
+    let mut items = vec![Choice::new("", text.common_all)];
+    items.extend(classes.iter().map(|(class, characters)| {
+        Choice::new(
+            class.clone(),
+            i18n::fill(text.mods_class_option, &[class, &characters.to_string()]),
+        )
+    }));
+    items
+}
+
+/// 这个职业采到了几个角色。空串(全部)和没采过的职业都是 0。
+#[must_use]
+pub fn class_characters(classes: &[(String, u32)], class: &str) -> u32 {
+    if class.is_empty() {
+        return 0;
+    }
+    classes
+        .iter()
+        .find(|(name, _)| name == class)
+        .map_or(0, |(_, characters)| *characters)
 }
 
 /// 部位下拉。部位名是 ninja 的 `inventoryId`,不翻译 —— 它就是游戏里的栏位名。
@@ -124,6 +155,9 @@ pub fn table_content(text: &'static Text) -> TableContent {
 /// 筛选在内存里做:整轮统计一共一千多行,每换一次下拉回去打一次库不值当,
 /// 而且"这一页显示的和那三个下拉说的是同一件事"在同一个函数里看得见。
 ///
+/// 职业不在这儿筛:传进来的 `mods` 已经是选中职业那一套行了(见
+/// [`crate::shell::ninja::load_mods`])。
+///
 /// 稀有度那一档的"全部"**不含暗金**:暗金的词缀是固定的,一件
 /// Wake of Destruction 上写着什么,全联赛每一件都写着一模一样的东西,
 /// 所以它的"携带比例"量的是"多少人穿这件暗金",和稀有装的随机词缀不是
@@ -174,6 +208,41 @@ pub fn hidden_count(mods: &[SlotModStat], slot: &str, rarity: &str, kind: &str) 
 #[must_use]
 pub fn sample_size(rows: &[&SlotModStat]) -> u32 {
     rows.iter().map(|stat| stat.sample_size).max().unwrap_or(0)
+}
+
+/// 脚注那一句。
+///
+/// 四种组合各有各的说法,而区别全在**分母**上:选了职业,"一共采样多少个"
+/// 就得换成这个职业自己的人数,不然 47/2000 这种比例会让人以为样本比实际厚
+/// 四十倍。
+///
+/// - `sample`:这一批行的分母(穿了这个部位的角色数)
+/// - `sampled`:整个联赛采到手的角色数
+/// - `class_sampled`:选中职业采到手的角色数
+#[must_use]
+pub fn footer_line(
+    slot: &str,
+    class: &str,
+    sample: u32,
+    sampled: u32,
+    class_sampled: u32,
+    text: &'static Text,
+) -> String {
+    match (slot.is_empty(), class.is_empty()) {
+        (true, true) => i18n::fill(text.mods_sample_any, &[&sampled.to_string()]),
+        (false, true) => i18n::fill(
+            text.mods_sample_line,
+            &[&sample.to_string(), slot, &sampled.to_string()],
+        ),
+        (true, false) => i18n::fill(
+            text.mods_sample_class_any,
+            &[class, &class_sampled.to_string()],
+        ),
+        (false, false) => i18n::fill(
+            text.mods_sample_class,
+            &[&sample.to_string(), slot, class, &class_sampled.to_string()],
+        ),
+    }
 }
 
 /// 列 + 真行。
@@ -256,6 +325,7 @@ impl AppShell {
             .gap(px(8.))
             .px(px(10.))
             .py(px(8.))
+            .child(picker(text.mods_class_label, &self.mods_class_select, 190.))
             .child(picker(text.mods_slot_label, &self.mods_slot_select, 170.))
             .child(picker(
                 text.mods_rarity_label,
@@ -290,18 +360,19 @@ impl AppShell {
         } else {
             hidden_count(&self.ninja.mods, &slot, &rarity, &kind)
         };
-        let sampled = self.ninja.characters_done.to_string();
         // "穿了这个部位的有 47 个人"只有在真的选了一个部位时才成立;
         // 筛选器停在"全部"时那个数字是各部位里最大的一个,写成"这个部位"
-        // 就成了一句假话。
-        let line = if slot.is_empty() {
-            i18n::fill(text.mods_sample_any, &[&sampled])
-        } else {
-            i18n::fill(
-                text.mods_sample_line,
-                &[&sample.to_string(), &slot, &sampled],
-            )
-        };
+        // 就成了一句假话。选了职业时"一共采样多少个"也得跟着换成这个职业
+        // 自己的人数 —— 见 [`footer_line`]。
+        let class = self.ninja.selected_class.clone();
+        let line = footer_line(
+            &slot,
+            &class,
+            sample,
+            self.ninja.characters_done,
+            class_characters(&self.ninja.classes, &class),
+            text,
+        );
         div()
             .flex_none()
             .h_flex()
@@ -333,6 +404,7 @@ mod ninja_mods_tests {
         sample: u32,
     ) -> SlotModStat {
         SlotModStat {
+            class: String::new(),
             slot: slot.to_owned(),
             rarity: rarity.to_owned(),
             mod_kind: kind.to_owned(),
@@ -549,6 +621,79 @@ mod ninja_mods_tests {
             .map(|choice| choice.value().to_string())
             .collect();
         assert_eq!(values, vec!["", "Rare", "Unique"]);
+    }
+
+    /// 职业下拉从库里长出来,每一项写着这个职业采到了几个人。
+    ///
+    /// 那个人数不是装饰:6 个人量出来的 p50 和 200 个人量出来的 p50 在屏幕上
+    /// 长得一模一样,选之前就该知道自己在看多厚的样本。
+    #[test]
+    fn the_class_picker_grows_out_of_the_sampled_classes() {
+        let classes = vec![
+            ("Deadeye".to_owned(), 120u32),
+            ("Gemling Legionnaire".to_owned(), 6),
+        ];
+        let choices = class_choices(&classes, &i18n::ENGLISH);
+        assert_eq!(
+            choices
+                .iter()
+                .map(|choice| choice.value().to_string())
+                .collect::<Vec<_>>(),
+            vec!["", "Deadeye", "Gemling Legionnaire"]
+        );
+        assert_eq!(choices[0].title().to_string(), "All");
+        assert_eq!(choices[1].title().to_string(), "Deadeye (120)");
+        assert_eq!(
+            class_choices(&classes, &i18n::SIMPLIFIED_CHINESE)[2]
+                .title()
+                .to_string(),
+            "Gemling Legionnaire(6 人)"
+        );
+
+        // 还没采过时只剩"全部",而不是一个空下拉。
+        assert_eq!(class_choices(&[], &i18n::ENGLISH).len(), 1);
+
+        assert_eq!(class_characters(&classes, "Deadeye"), 120);
+        assert_eq!(class_characters(&classes, ""), 0);
+        assert_eq!(class_characters(&classes, "Nobody"), 0);
+    }
+
+    /// 脚注要说清这批数是从谁身上来的 —— 选了职业,分母就得换成这个职业
+    /// 自己的人数,而不是继续印全联赛那两千个。
+    #[test]
+    fn the_footer_switches_to_the_class_denominator() {
+        let zh = &i18n::SIMPLIFIED_CHINESE;
+        let en = &i18n::ENGLISH;
+
+        // 全部 + 全部:今天那句话一个字不变。
+        assert_eq!(
+            footer_line("", "", 0, 2_000, 0, zh),
+            "所有部位合起来,一共采样 2000 个角色"
+        );
+        assert_eq!(
+            footer_line("BodyArmour", "", 47, 2_000, 0, zh),
+            "统计自 47 个穿了 BodyArmour 的角色(一共采样 2000 个)"
+        );
+
+        // 选了职业:两个数都换成这个职业自己的。
+        assert_eq!(
+            footer_line("BodyArmour", "Deadeye", 18, 2_000, 20, zh),
+            "统计自 18 个穿了 BodyArmour 的 Deadeye 角色(该职业共采样 20 个)"
+        );
+        assert_eq!(
+            footer_line("BodyArmour", "Deadeye", 18, 2_000, 20, en),
+            "from 18 characters wearing BodyArmour, class Deadeye, out of 20 sampled in that class"
+        );
+
+        // 职业选了、部位还停在"全部"。
+        assert_eq!(
+            footer_line("", "Deadeye", 0, 2_000, 20, zh),
+            "Deadeye 的所有部位合起来,该职业共采样 20 个角色"
+        );
+        assert_eq!(
+            footer_line("", "Deadeye", 0, 2_000, 20, en),
+            "every slot together for Deadeye, out of 20 sampled characters in that class"
+        );
     }
 
     /// 认不出来的稀有度/类型原样显示,而不是整档消失。

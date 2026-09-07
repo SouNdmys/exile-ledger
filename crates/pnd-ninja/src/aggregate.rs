@@ -23,6 +23,12 @@ use crate::plan::is_rarity_bucket;
 /// 一行统计。字段顺序和 `ninja_item_mods` 那张表一一对应。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SlotModStat {
+    /// 这一行算的是哪个职业。**空串 = 全样本**(所有职业合起来)。
+    ///
+    /// 同一份样本因此出两套行:一套 `""` 的全局行,外加每个职业各一套。
+    /// 分开算而不是让界面拿全局行去按职业筛,是因为分母也得跟着换 ——
+    /// "多少人戴戒指"在 Deadeye 里和在全联赛里根本不是一个数。
+    pub class: String,
     /// `inventoryId`;为空时退化成 `slot<itemSlot>`。
     pub slot: String,
     /// `"Rare"` / `"Unique"` / `"Magic"` / `"Normal"` / `""`(接口没给)。
@@ -72,9 +78,49 @@ struct SlotSample {
 
 /// 把一批角色详情压成词缀统计表。
 ///
-/// 输出按 部位 → 稀有度 → 词缀类型 → 人数从多到少 排好,界面直接照着画即可。
+/// 输出**两套行**:一套 `class` 为空的全样本行,外加每个职业各一套。分开算是
+/// 因为占比的分母也得跟着换 —— "多少人戴戒指"在 Deadeye 里和在全联赛里是两个
+/// 数,拿全局行去按职业筛只会得到一堆分母错了的百分比。
+///
+/// 详情里没写职业的人只进全样本:空串是"全部"那一档的键,让他也写空串,
+/// 就等于把全联赛的统计悄悄换成这几个人的。
+///
+/// 输出按 职业 → 部位 → 稀有度 → 词缀类型 → 人数从多到少 排好,界面直接
+/// 照着画即可。
 #[must_use]
 pub fn aggregate_mods(details: &[CharacterDetail]) -> Vec<SlotModStat> {
+    let everyone: Vec<&CharacterDetail> = details.iter().collect();
+    let mut out = aggregate_one_class(&everyone, "");
+
+    let mut classes: Vec<&str> = details
+        .iter()
+        .map(|detail| detail.class.as_str())
+        .filter(|class| !class.is_empty())
+        .collect();
+    classes.sort_unstable();
+    classes.dedup();
+    for class in classes {
+        let members: Vec<&CharacterDetail> = details
+            .iter()
+            .filter(|detail| detail.class == class)
+            .collect();
+        out.extend(aggregate_one_class(&members, class));
+    }
+
+    out.sort_by(|left, right| {
+        left.class
+            .cmp(&right.class)
+            .then_with(|| left.slot.cmp(&right.slot))
+            .then_with(|| left.rarity.cmp(&right.rarity))
+            .then_with(|| left.mod_kind.cmp(&right.mod_kind))
+            .then_with(|| right.characters.cmp(&left.characters))
+            .then_with(|| left.stat_id.cmp(&right.stat_id))
+    });
+    out
+}
+
+/// 一批角色 → 一套行,每行都盖上 `class`。全样本那一套传空串。
+fn aggregate_one_class(details: &[&CharacterDetail], class: &str) -> Vec<SlotModStat> {
     let mut buckets: BTreeMap<StatKey, Bucket> = BTreeMap::new();
     let mut samples: BTreeMap<(String, String), SlotSample> = BTreeMap::new();
 
@@ -125,7 +171,7 @@ pub fn aggregate_mods(details: &[CharacterDetail]) -> Vec<SlotModStat> {
         }
     }
 
-    let mut out: Vec<SlotModStat> = buckets
+    buckets
         .into_iter()
         .map(|((slot, rarity, mod_kind, stat_id), mut bucket)| {
             bucket.values.sort_by(f64::total_cmp);
@@ -133,6 +179,7 @@ pub fn aggregate_mods(details: &[CharacterDetail]) -> Vec<SlotModStat> {
                 .get(&(slot.clone(), rarity.clone()))
                 .map_or(0, |sample| sample.characters);
             SlotModStat {
+                class: class.to_owned(),
                 slot,
                 rarity,
                 mod_kind,
@@ -146,17 +193,7 @@ pub fn aggregate_mods(details: &[CharacterDetail]) -> Vec<SlotModStat> {
                 p75: nearest_rank(&bucket.values, 0.75),
             }
         })
-        .collect();
-
-    out.sort_by(|left, right| {
-        left.slot
-            .cmp(&right.slot)
-            .then_with(|| left.rarity.cmp(&right.rarity))
-            .then_with(|| left.mod_kind.cmp(&right.mod_kind))
-            .then_with(|| right.characters.cmp(&left.characters))
-            .then_with(|| left.stat_id.cmp(&right.stat_id))
-    });
-    out
+        .collect()
 }
 
 /// 五组词缀,顺序无所谓——输出最后会重排。
@@ -306,10 +343,31 @@ mod aggregate_tests {
         .unwrap()
     }
 
+    /// 全样本(职业 = 空串)的那一行。
     fn row<'a>(rows: &'a [SlotModStat], slot: &str, kind: &str, stat: &str) -> &'a SlotModStat {
+        of_class(rows, "", slot, kind, stat)
+    }
+
+    fn of_class<'a>(
+        rows: &'a [SlotModStat],
+        class: &str,
+        slot: &str,
+        kind: &str,
+        stat: &str,
+    ) -> &'a SlotModStat {
         rows.iter()
-            .find(|row| row.slot == slot && row.mod_kind == kind && row.stat_id == stat)
-            .unwrap_or_else(|| panic!("no row for {slot}/{kind}/{stat}"))
+            .find(|row| {
+                row.class == class
+                    && row.slot == slot
+                    && row.mod_kind == kind
+                    && row.stat_id == stat
+            })
+            .unwrap_or_else(|| panic!("no row for {class}/{slot}/{kind}/{stat}"))
+    }
+
+    fn as_class(mut detail: CharacterDetail, class: &str) -> CharacterDetail {
+        detail.class = class.to_owned();
+        detail
     }
 
     /// 一个人两只戒指都带生命,只算一个人、两次出现。
@@ -408,6 +466,114 @@ mod aggregate_tests {
                 ("Ring", "Rare", "explicit", 2),
                 ("Ring", "Rare", "explicit", 1),
                 ("slot4", "Magic", "implicit", 1),
+            ]
+        );
+    }
+
+    /// 每个职业各来一套行,分母跟着换。
+    ///
+    /// "戒指上带生命的人占多少"这个问题,在全联赛和在某一个职业里是两个不同
+    /// 的数,而后者才是"我这个号该做什么装备"的答案。全局那一套一个字都不能
+    /// 变:它是两千个人的底,换职业只是多一个视角,不是换一份数据。
+    #[test]
+    fn every_class_present_gets_its_own_copy_of_the_stats() {
+        let rows = aggregate_mods(&[
+            as_class(alpha(), "Deadeye"),
+            as_class(beta(), "Gemling Legionnaire"),
+        ]);
+
+        let all = row(&rows, "Ring", "explicit", "base_maximum_life");
+        assert_eq!(
+            (all.characters, all.occurrences, all.sample_size),
+            (2, 3, 2)
+        );
+
+        // Deadeye 只有 alpha 一个人,两只戒指:115 和 95。
+        let deadeye = of_class(&rows, "Deadeye", "Ring", "explicit", "base_maximum_life");
+        assert_eq!(
+            (deadeye.characters, deadeye.occurrences, deadeye.sample_size),
+            (1, 2, 1),
+            "分母是这个职业里戴稀有戒指的人数,不是全样本的 2"
+        );
+        assert_eq!(
+            (deadeye.p25, deadeye.p50, deadeye.p75),
+            (Some(95.0), Some(95.0), Some(115.0))
+        );
+
+        let gemling = of_class(
+            &rows,
+            "Gemling Legionnaire",
+            "Ring",
+            "explicit",
+            "base_maximum_life",
+        );
+        assert_eq!(
+            (gemling.characters, gemling.sample_size, gemling.p50),
+            (1, 1, Some(135.0))
+        );
+
+        // alpha 的珠宝只属于 Deadeye:另一个职业里没有这一行。
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.class == "Gemling Legionnaire" && row.slot == "Jewel"),
+            "没有这件装备的职业不该凭空多出一行"
+        );
+    }
+
+    /// 详情里没写职业的角色只进全样本,不自己开一档。
+    ///
+    /// 空串是"全部"那一档的键:让一个无名职业也写空串,它就会和全样本行
+    /// 撞在一起,把全联赛的统计悄悄换成这几个人的。
+    #[test]
+    fn a_character_without_a_class_only_lands_in_the_whole_sample() {
+        let rows = aggregate_mods(&[as_class(alpha(), "Deadeye"), beta()]);
+
+        let mut classes: Vec<&str> = rows.iter().map(|row| row.class.as_str()).collect();
+        classes.sort_unstable();
+        classes.dedup();
+        assert_eq!(classes, vec!["", "Deadeye"]);
+
+        // 没有职业的那个人照样算进全样本。
+        let all = row(&rows, "Ring", "explicit", "base_maximum_life");
+        assert_eq!((all.characters, all.occurrences), (2, 3));
+        assert_eq!(all.sample_size, 2);
+    }
+
+    /// 全样本那一套排在最前面,后面每个职业各自成块 —— 界面照着往下画即可。
+    #[test]
+    fn the_whole_sample_comes_first_then_one_block_per_class() {
+        let rows = aggregate_mods(&[
+            as_class(alpha(), "Deadeye"),
+            as_class(beta(), "Gemling Legionnaire"),
+        ]);
+        let classes: Vec<&str> = rows.iter().map(|row| row.class.as_str()).collect();
+        let mut sorted = classes.clone();
+        sorted.sort_unstable();
+        assert_eq!(classes, sorted, "职业块之间不该交叉");
+        assert_eq!(classes[0], "", "全样本排最前");
+
+        // 一块之内还是老规矩:部位 → 稀有度 → 类型 → 人多的在前。
+        let block: Vec<(&str, &str, &str, u32)> = rows
+            .iter()
+            .filter(|row| row.class == "Deadeye")
+            .map(|row| {
+                (
+                    row.slot.as_str(),
+                    row.rarity.as_str(),
+                    row.mod_kind.as_str(),
+                    row.characters,
+                )
+            })
+            .collect();
+        assert_eq!(
+            block,
+            vec![
+                ("BodyArmour", "Unique", "explicit", 1),
+                ("Jewel", "Rare", "explicit", 1),
+                ("Ring", "Rare", "crafted", 1),
+                ("Ring", "Rare", "explicit", 1),
+                ("Ring", "Rare", "explicit", 1),
             ]
         );
     }
