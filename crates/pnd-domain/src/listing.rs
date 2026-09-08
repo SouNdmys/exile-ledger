@@ -58,6 +58,14 @@ pub struct ListingSummary {
     pub online: bool,
     pub afk: bool,
     pub indexed: String,
+    /// 交易站的索引里这条挂单**还对得上游戏里的实物**吗(`item.verified`)。
+    ///
+    /// 这是"它没了"的真正信号,而不是 `null`:2026-09-08 匿名抓了 20 条实测,
+    /// 卖掉的挂单照样整条回来,只是这一格变成 `false`,而 `listing.indexed`
+    /// 被顶到发现它不见了的那一趟索引;`null` 只出现在被彻底清掉的 id 上。
+    /// 主人的程序因此跑了六个小时 `gone = 0` —— 我们一直在等一个永远不来的
+    /// `null`。缺这个键时当 `true`:老响应里没有它,而"看不出没了"就该当还在。
+    pub verified: bool,
     pub whisper: String,
     pub whisper_token: Option<String>,
     pub hideout_token: Option<String>,
@@ -99,6 +107,7 @@ mod listing_tests {
             online: true,
             afk: false,
             indexed: "2026-09-06T12:00:00Z".to_string(),
+            verified: true,
             whisper: "@SomeChar Hi, I'd like to buy...".to_string(),
             whisper_token: None,
             hideout_token: None,

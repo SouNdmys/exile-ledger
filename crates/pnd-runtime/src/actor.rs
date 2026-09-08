@@ -37,14 +37,15 @@ use thiserror::Error;
 
 use crate::decide::{Decision, MatchedListing, coalesce, decide};
 use crate::gateway::{
-    GatewayError, GatewayEvent, GatewayHandle, GatewayReply, GatewayRequest, Priority, ReplyKind,
-    RequestKind, RequestTag, SearchOutcome, SessionCheckOutcome, TradeGateway, TradeTransport,
+    GatewayError, GatewayEvent, GatewayHandle, GatewayReply, GatewayRequest, LiveHandle, Priority,
+    ReplyKind, RequestKind, RequestTag, SearchOutcome, SessionCheckOutcome, TradeGateway,
+    TradeTransport,
 };
 use crate::live_worker::{
     LiveConnector, LiveEvent, LiveOffReason, LiveRunState, LiveTarget, LiveWorkerConfig,
     LiveWorkerHandle, TungsteniteConnector, spawn_live_worker,
 };
-use crate::observe::{ObserveScheduler, SWEEP_INTERVAL_SECS, fetch_listing_cap};
+use crate::observe::{BirthBudget, ObserveScheduler, SWEEP_INTERVAL_SECS, fetch_listing_cap};
 use crate::poll::{PollOutcome, PollScheduler, budget_floor_interval};
 use crate::{describe_token, now_secs};
 
@@ -73,6 +74,13 @@ const OBSERVE_SEARCH_LABEL: &str = "observe-discover";
 const OBSERVE_DISCOVER_FETCH_LABEL: &str = "observe-discover-fetch";
 const OBSERVE_LIVE_FETCH_LABEL: &str = "observe-live-fetch";
 const OBSERVE_RECHECK_LABEL: &str = "observe-recheck";
+
+/// live 推来的一张把手能活多久(秒)。
+///
+/// 2026-09-08 用 `live_probe` 量出来的:token 里的 `exp` 就是签发时刻 + 14。
+/// 排队排过这个数再发出去,换回来的一定是一次失败 —— 所以拿它当"这一条是
+/// 票过期了,不是网络坏了"的判据。
+const LIVE_HANDLE_TTL_SECS: i64 = 14;
 
 /// token 里没有 `exp` 时的兜底:拿到超过这么久就当它过期了。
 /// 2026-09-07 抓包证实 hideout_token 只活 300 秒,这里再减掉和
@@ -234,8 +242,17 @@ pub struct ObservationStatus {
     pub live: LiveRunState,
     /// 秒推一共推来过多少条挂单 id(采样掉的也算)。
     pub pushed_total: u64,
-    /// 其中按 `sample_every` 丢掉、没去抓详情的有多少条。
+    /// 其中**没去抓详情**的有多少条 —— 按 `sample_every` 抽掉的,加上抓取
+    /// 额度买不起、当场丢掉的(见 [`crate::observe::BirthBudget`])。
+    ///
+    /// 两种合成一个数:对使用者来说它们是同一件事 ——"这条推送我们没看"。
     pub sampled_out_total: u64,
+    /// 去抓了、可是票在路上就过期了的有多少条。
+    ///
+    /// live 推来的把手只活 14 秒。它单独一个数而不是混进 `sampled_out_total`:
+    /// 抽样是我们**主动**放弃的,而这个数一涨就说明队列排得太长(额度紧、
+    /// 网关在退避),是要动手调的信号。
+    pub expired_total: u64,
     pub last_discover_at: Option<i64>,
     pub last_recheck_at: Option<i64>,
     /// 下一次兜底 discover 的 unix 秒;不在排班(停用了、搜索 id 坏了)
@@ -560,6 +577,18 @@ struct ObservationRuntime {
     status: ObservationStatus,
 }
 
+/// 一张 live 把手已经发出去、还没回来。
+///
+/// 把手不是挂单 id,回信里的挂单带的是它们**自己**的 id —— 所以"这封回信是
+/// 替哪条观察问的""这张票是什么时候拿到的",只能记在这里等回信来认领。
+struct HandleFetch {
+    obs_id: ObservationId,
+    /// 换不回东西时拿它当挂单 id 记一笔。见 [`LiveHandle::synthetic_id`]。
+    synthetic_id: String,
+    /// 拿到这张票的时刻。失败时用它分辨"票过期了"和"网络坏了"。
+    issued_at: i64,
+}
+
 /// 一次"去藏身处"点击走到哪一步了。
 ///
 /// 一个 alert 同时只会有一条:第二次点击在这条还没走完时会被挡掉,
@@ -602,6 +631,11 @@ struct RuntimeActor {
     /// 哪条观察问的"只能记在这里。
     sweeps: BTreeMap<u64, Vec<DueListing>>,
     next_sweep_id: u64,
+    /// 已经发出去、还没回来的 live 把手:编号 → 它是替谁问的。
+    handles: BTreeMap<u64, HandleFetch>,
+    next_handle_id: u64,
+    /// 秒推来的新挂单还能花多少抓取额度。见 [`BirthBudget`]。
+    birth_budget: BirthBudget,
     /// 手上这个 POESESSID 还能用吗。服务端拒过一次就翻成 false,
     /// 直到用户粘一个新的进来 —— 不拿死会话反复试。
     session_ok: bool,
@@ -664,6 +698,12 @@ impl RuntimeActor {
             live_workers: BTreeMap::new(),
             sweeps: BTreeMap::new(),
             next_sweep_id: 0,
+            handles: BTreeMap::new(),
+            next_handle_id: 0,
+            birth_budget: BirthBudget::new(
+                budget.effective_limit(FETCH_LONG_WINDOW_REQUESTS),
+                FETCH_LONG_WINDOW_SECS,
+            ),
             session_ok: true,
             session_invalid_reported: false,
             no_session_reported: false,
@@ -808,6 +848,11 @@ impl RuntimeActor {
             );
             self.user_agent = user_agent;
             self.budget = budget;
+            // 出生登记那只桶是按额度算回票速度的,额度换了就得重算一只。
+            self.birth_budget = BirthBudget::new(
+                budget.effective_limit(FETCH_LONG_WINDOW_REQUESTS),
+                FETCH_LONG_WINDOW_SECS,
+            );
             self.emit(RuntimeEvent::Log(
                 "restarted the trade gateway (user agent or budget changed)".to_string(),
             ));
@@ -1097,7 +1142,7 @@ impl RuntimeActor {
             LiveEvent::State { target, state } => self.set_live_state(&target, state, now),
             LiveEvent::New { target, ids } => match target {
                 LiveTarget::Watch(watch_id) => self.on_live_push(&watch_id, ids, now),
-                LiveTarget::Observation(obs_id) => self.on_observation_push(&obs_id, ids),
+                LiveTarget::Observation(obs_id) => self.on_observation_push(&obs_id, ids, now),
             },
             LiveEvent::SessionInvalid { .. } => self.on_session_invalid(now),
             LiveEvent::Log(message) => self.emit(RuntimeEvent::Log(message)),
@@ -1208,49 +1253,85 @@ impl RuntimeActor {
     /// 所以一件挂上去一分钟就被买走的好价碑牌,十分钟一次的轮询永远看不见 ——
     /// 而那恰恰是我们最想量的那一件。秒推是在它**出生**的那一刻就知道它。
     ///
-    /// `sample_every` 在这里生效:每 N 条抓一条,抽剩下的直接丢掉(不排队
-    /// 等以后)。出生那一刻等距抽样是无偏的,而排队补抓会系统性地漏掉
-    /// 卖得最快的那些 —— 等轮到它,它早没了。
-    fn on_observation_push(&mut self, obs_id: &ObservationId, ids: Vec<String>) {
-        let (wanted, search_id) = {
-            let Some(runtime) = self.observations.get_mut(obs_id) else {
-                return;
+    /// 推来的每一条都是一张**把手**(整张 JWT),不是挂单 id:trade2 的
+    /// socket 推的是 `{"result":"<JWT>"}`,票里一个 id 都没有,票本身拿去
+    /// `fetch/<票>?query=<搜索id>` 才换得回那几件挂单(2026-09-08 实测)。
+    /// 所以这里**一张票一封请求**、按位置读回信,而不是像回查那样按 id 对号 ——
+    /// 按 id 对号的话,回来的挂单带的是它们自己的 id,和票永远对不上,
+    /// 每一条推送都会被记成"第一眼就没了"。
+    ///
+    /// (万一哪天服务端改回 poe1 那种 `{"new":[id]}`,这条路照样对:
+    /// `fetch/<id>` 一样能换回那条挂单,而它带的 id 就是它自己。)
+    ///
+    /// 优先级是 `LiveFetch`,和蹲价的秒推同一档:票只活 14 秒,排在队尾
+    /// 等着的话发出去的是一张废票 —— 花掉一次额度,换回一次失败。
+    ///
+    /// 两道闸决定哪些推送根本不去抓:
+    ///
+    /// 1. `sample_every` —— 用户自己填的"每 N 条抓一条";
+    /// 2. [`BirthBudget`] —— 抓取额度买不买得起。一张票一次 fetch,而
+    ///    6 小时只有 499 次(一半留给回查),主人那条搜索一分钟推 6 到 9 条:
+    ///    照单全收十分钟就把额度烧光了。
+    ///
+    /// 两道闸都是**当场丢掉**,不排队等以后:在挂单出生那一刻丢是无偏的,
+    /// 排队补抓则会系统性地漏掉卖得最快的那批货 —— 等轮到它,它早没了,
+    /// 而那正是我们要量的东西。
+    fn on_observation_push(&mut self, obs_id: &ObservationId, handles: Vec<String>, now: i64) {
+        let mut wanted: Vec<String> = Vec::new();
+        {
+            let every = match self.observations.get(obs_id) {
+                Some(runtime) if runtime.entry.enabled => {
+                    u64::from(runtime.entry.sample_every.max(1))
+                }
+                _ => return,
             };
-            if !runtime.entry.enabled {
-                return;
-            }
-            let every = u64::from(runtime.entry.sample_every.max(1));
-            let mut wanted: Vec<String> = Vec::new();
-            for id in ids {
-                runtime.pushed_seen += 1;
-                runtime.status.pushed_total += 1;
-                if runtime.pushed_seen % every == 0 {
-                    wanted.push(id);
-                } else {
+            for handle in handles {
+                // 先记账再判定:`pushed_total` 数的是"服务端推来过多少条",
+                // 抽掉的、买不起的都算。
+                let sampled_in = {
+                    let Some(runtime) = self.observations.get_mut(obs_id) else {
+                        return;
+                    };
+                    runtime.pushed_seen += 1;
+                    runtime.status.pushed_total += 1;
+                    runtime.pushed_seen % every == 0
+                };
+                // 抽样先判:用户说"每三条看一条"的时候,不该让被抽掉的那两条
+                // 也去花令牌 —— 那样桶会空得毫无道理。
+                let affordable = sampled_in && self.birth_budget.take(now);
+                if affordable {
+                    wanted.push(handle);
+                } else if let Some(runtime) = self.observations.get_mut(obs_id) {
                     runtime.status.sampled_out_total += 1;
                 }
             }
-            let search_id = if runtime.search_id.is_empty() {
-                runtime.entry.search_id.clone()
-            } else {
-                runtime.search_id.clone()
-            };
-            (wanted, search_id)
-        };
+        }
 
-        for chunk in wanted.chunks(self.fetch_batch()) {
+        let search_id = match self.observations.get(obs_id) {
+            Some(runtime) if !runtime.search_id.is_empty() => runtime.search_id.clone(),
+            Some(runtime) => runtime.entry.search_id.clone(),
+            None => return,
+        };
+        for handle in wanted {
+            let handle = LiveHandle(handle);
+            let handle_id = self.next_handle_id;
+            self.next_handle_id += 1;
+            self.handles.insert(
+                handle_id,
+                HandleFetch {
+                    obs_id: obs_id.clone(),
+                    synthetic_id: handle.synthetic_id(),
+                    issued_at: now,
+                },
+            );
             self.gateway.submit(GatewayRequest {
-                // 按 id 对号的那一种:抓回来的那一格是 `null` 就说明这条挂单
-                // 在我们看它第一眼之前就没了 —— 那是要单独记一笔的事。
-                kind: RequestKind::FetchByIds {
-                    ids: chunk.to_vec(),
+                kind: RequestKind::FetchHandle {
+                    handle,
                     search_id: search_id.clone(),
                 },
-                // 观察永远排在队列最后:攒数据的活晚十秒什么也不影响,
-                // 而蹲价晚十秒可能就错过一件好货。
-                priority: Priority::Background,
+                priority: Priority::LiveFetch,
                 reply: self.replies.clone(),
-                tag: RequestTag::observation(obs_id.clone(), OBSERVE_LIVE_FETCH_LABEL),
+                tag: RequestTag::handle(handle_id, OBSERVE_LIVE_FETCH_LABEL),
             });
         }
         self.emit_observation_status(obs_id);
@@ -1424,6 +1505,17 @@ impl RuntimeActor {
             self.on_hideout_reply(alert_id, kind, now);
             return;
         }
+        // 一张 live 把手换回来的东西和请求里那串对不上号(回来的挂单带的是
+        // 它们自己的 id),所以它认的是票号。
+        if let Some(handle_id) = tag.handle_id {
+            match kind {
+                ReplyKind::FetchSlots(Ok(slots)) => self.on_handle_fetch(handle_id, slots, now),
+                ReplyKind::FetchSlots(Err(error)) => self.on_handle_failed(handle_id, &error, now),
+                // 把手只发 FetchHandle,别的回信不会挂着票号。
+                _ => {}
+            }
+            return;
+        }
         // 一批回查可能横跨好几条观察,所以它认的是批次号,不是某一条观察。
         if let Some(sweep_id) = tag.sweep_id {
             match kind {
@@ -1437,7 +1529,7 @@ impl RuntimeActor {
         // 市场观察也走自己那条路:它和蹲价共用网关,但两边的时间表、
         // 状态、库表都是分开的。
         if let Some(obs_id) = tag.obs_id.clone() {
-            self.on_observe_reply(&obs_id, tag.label, kind, now);
+            self.on_observe_reply(&obs_id, kind, now);
             return;
         }
         let Some(watch_id) = tag.watch_id.clone() else {
@@ -1465,7 +1557,10 @@ impl RuntimeActor {
             // 走到这里的 whisper 一定带着 alert_id,会话检查更是上面就
             // 认掉了;按 id 对号的那种 fetch 只有市场观察在用,也带着自己的
             // obs_id —— 三种都轮不到这里。
-            ReplyKind::Whisper(_) | ReplyKind::SessionCheck(_) | ReplyKind::FetchByIds(_) => {}
+            ReplyKind::Whisper(_)
+            | ReplyKind::SessionCheck(_)
+            | ReplyKind::FetchByIds(_)
+            | ReplyKind::FetchSlots(_) => {}
         }
     }
 
@@ -1777,6 +1872,7 @@ impl RuntimeActor {
                     live: LiveRunState::Off,
                     pushed_total: 0,
                     sampled_out_total: 0,
+                    expired_total: 0,
                     last_discover_at: stored.as_ref().and_then(|run| run.last_discover_at),
                     last_recheck_at: stored.as_ref().and_then(|run| run.last_recheck_at),
                     next_discover_at,
@@ -1958,9 +2054,7 @@ impl RuntimeActor {
     ) {
         for (listing_id, listing) in pairs {
             match listing {
-                Some(listing) => {
-                    self.note(self.store.record_seen(obs_id, &listing, now), "record_seen");
-                }
+                Some(listing) => self.record_first_look(obs_id, &listing, now),
                 None => {
                     self.note(
                         self.store
@@ -1970,6 +2064,126 @@ impl RuntimeActor {
                 }
             }
         }
+    }
+
+    /// 头一回见到这条挂单:整条记下来。
+    ///
+    /// 除非它**一上来就已经卖掉了**(`item.verified == false`)。那种也要记 ——
+    /// 物品原文和词缀照存,聚合表要它;只是记完当场标成没了,时刻用服务端
+    /// 自己说的那个([`gone_moment`]),而不是"我们发现它"的此刻。
+    ///
+    /// 这不是罕见情况:2026-09-08 匿名量过一批 9 分钟前的挂单,10 条里已经
+    /// 有 1 条是 `false`。判定照常走 `classify_gone` —— 看得见的存活时间不到
+    /// 10 分钟,所以它多半会是 `Unknown`,而那是诚实的:我们确实不知道它挂了
+    /// 多久。
+    fn record_first_look(&mut self, obs_id: &ObservationId, listing: &ListingSummary, now: i64) {
+        self.note(self.store.record_seen(obs_id, listing, now), "record_seen");
+        if listing.verified {
+            return;
+        }
+        self.mark_verified_gone(obs_id, listing, now, now);
+    }
+
+    /// 服务端说这条挂单已经没了(`verified == false`):判一下,写在行上。
+    ///
+    /// `first_seen_at` 是我们第一次见到它的时刻 —— 判定和存活时间都从它算起。
+    fn mark_verified_gone(
+        &mut self,
+        obs_id: &ObservationId,
+        listing: &ListingSummary,
+        first_seen_at: i64,
+        now: i64,
+    ) {
+        let gone_at = gone_moment(listing, first_seen_at, now);
+        let history = self
+            .note(
+                self.store.price_history(obs_id, &listing.id),
+                "price_history",
+            )
+            .unwrap_or_default();
+        let points: Vec<(i64, i64)> = history
+            .iter()
+            .filter_map(|point| {
+                point
+                    .price
+                    .as_ref()
+                    .map(|price| (point.at, price.amount_milli))
+            })
+            .collect();
+        // 最后一次见到它 = 它走的那一刻:服务端已经告诉我们是什么时候了,
+        // 存活时间该按那个算。
+        let class = classify_gone(first_seen_at, gone_at, gone_at, &points);
+        self.note(
+            self.store.mark_gone_at(obs_id, &listing.id, gone_at, class),
+            "mark_gone_at",
+        );
+    }
+
+    /// 一张 live 把手换回来的东西。
+    ///
+    /// **按位置读**:非空的每一格都是一件真挂单,按它**自己**的 id 入库
+    /// (票里没有 id,回来的才有);空的那一格说明这张票对应的挂单在我们
+    /// 换它之前就没了 —— 那笔记在票的化名下([`LiveHandle::synthetic_id`]),
+    /// 绝不能拿 900 字符的票本身当挂单 id。
+    fn on_handle_fetch(&mut self, handle_id: u64, slots: Vec<Option<ListingSummary>>, now: i64) {
+        let Some(asked) = self.handles.remove(&handle_id) else {
+            // 关机时的迟到回信,或者同一张票被处理过两次。
+            return;
+        };
+        if !self.observations.contains_key(&asked.obs_id) {
+            // 这条观察在请求飞在路上的时候被删了。
+            return;
+        }
+        for (index, slot) in slots.into_iter().enumerate() {
+            match slot {
+                Some(listing) => self.record_first_look(&asked.obs_id, &listing, now),
+                None => {
+                    // 一张票最多换回三件,所以第二格起要另起一个化名,
+                    // 否则两笔会撞在同一行上、只记下一笔。
+                    let listing_id = if index == 0 {
+                        asked.synthetic_id.clone()
+                    } else {
+                        format!("{}-{index}", asked.synthetic_id)
+                    };
+                    self.note(
+                        self.store
+                            .record_gone_before_first_look(&asked.obs_id, &listing_id, now),
+                        "record_gone_before_first_look",
+                    );
+                }
+            }
+        }
+        self.observation_data_changed(&asked.obs_id, None);
+    }
+
+    /// 一张把手没换成。
+    ///
+    /// 票只活 14 秒,所以"发出去的时候它已经过期了"和"网络坏了"是两回事,
+    /// 得分开说:前者是**排队排太久**的信号(额度紧、网关在退避),调的是
+    /// 采样和优先级;后者下一条推送自己会再来一次。
+    fn on_handle_failed(&mut self, handle_id: u64, error: &GatewayError, now: i64) {
+        let Some(asked) = self.handles.remove(&handle_id) else {
+            return;
+        };
+        let label = self.observation_label(&asked.obs_id);
+        let age = now - asked.issued_at;
+        let expired = age > LIVE_HANDLE_TTL_SECS;
+        if expired && let Some(runtime) = self.observations.get_mut(&asked.obs_id) {
+            runtime.status.expired_total += 1;
+        }
+        if let Some(runtime) = self.observations.get_mut(&asked.obs_id) {
+            runtime.status.last_error = Some(error.to_string());
+        }
+        let message = if expired {
+            format!(
+                "observation {label}: handle expired before it could be fetched \
+                 ({age}s old, they live {LIVE_HANDLE_TTL_SECS}s): {error}"
+            )
+        } else {
+            format!("observation {label}: a live handle fetch failed: {error}")
+        };
+        self.emit(RuntimeEvent::Log(message));
+        self.emit_observation_status(&asked.obs_id);
     }
 
     /// 到点该回头看的挂单:捞出来,凑成 10 个一批发出去。
@@ -1984,6 +2198,10 @@ impl RuntimeActor {
         }
         // 已经发出去还没回来的那些不能再问一遍:它们的 `next_check_at` 要等
         // 回信才会往前挪,不挡一下就会每分钟重发一次同一批。
+        //
+        // 名单是**交给取数**的,不是取完再筛:先 `LIMIT` 后筛的话,万一有一批
+        // 回信丢了,那几条就会永远占着最前面几个名额,后面的挂单一条也轮不上,
+        // 整条回查线悄悄停摆。见 `WatchStore::due_listings`。
         let in_flight: BTreeSet<(ObservationId, String)> = self
             .sweeps
             .values()
@@ -1992,15 +2210,16 @@ impl RuntimeActor {
             .collect();
         let cap = self.observe_fetch_cap(SWEEP_INTERVAL_SECS);
         let due: Vec<DueListing> = self
-            .note(self.store.due_listings(now, cap), "due_listings")
+            .note(
+                self.store.due_listings(now, cap, &in_flight),
+                "due_listings",
+            )
             .unwrap_or_default()
             .into_iter()
             .filter(|due| {
-                !in_flight.contains(&(due.obs_id.clone(), due.listing_id.clone()))
-                    && self
-                        .observations
-                        .get(&due.obs_id)
-                        .is_some_and(|runtime| runtime.entry.enabled)
+                self.observations
+                    .get(&due.obs_id)
+                    .is_some_and(|runtime| runtime.entry.enabled)
             })
             .collect();
         if due.is_empty() {
@@ -2058,6 +2277,14 @@ impl RuntimeActor {
     }
 
     /// 一批回查回来了:还在的升一档,没了的判一下。
+    ///
+    /// **"没了"有两种形状**,而要紧的是第二种:
+    ///
+    /// 1. 那一格是 `null` —— 这个 id 被彻底清掉了。少见。
+    /// 2. 那一格有整条数据,但 `item.verified == false` —— 挂单卖掉/撤了,
+    ///    交易站的索引还留着它。**这才是常态**:2026-09-08 匿名回查了 20 条,
+    ///    一条 `null` 都没有,却有 4 条是 `false`。程序早先只认第一种,
+    ///    于是主人那六个小时里 `gone` 一直是 0。
     fn on_sweep_fetch(
         &mut self,
         sweep_id: u64,
@@ -2075,6 +2302,13 @@ impl RuntimeActor {
             for due in asked.iter().filter(|due| due.listing_id == listing_id) {
                 touched.insert(due.obs_id.clone());
                 match &listing {
+                    // 服务端顺手告诉了我们它是什么时候走的(`listing.indexed`
+                    // 被顶到发现它不见了的那一趟索引),所以这一笔不走
+                    // `on_listing_gone` 那条"就算此刻没的"的路。
+                    Some(listing) if !listing.verified => {
+                        let due = due.clone();
+                        self.mark_verified_gone(&due.obs_id, listing, due.first_seen_at, now);
+                    }
                     Some(listing) => {
                         self.note(
                             self.store.record_seen(&due.obs_id, listing, now),
@@ -2245,24 +2479,19 @@ impl RuntimeActor {
             .map_or_else(|| obs_id.to_string(), |runtime| runtime.entry.label.clone())
     }
 
-    fn on_observe_reply(&mut self, obs_id: &ObservationId, label: &str, kind: ReplyKind, now: i64) {
+    /// 挂着 `obs_id` 的回信**只剩兜底 discover 那一轮**了:秒推那一路发的是
+    /// `FetchHandle`,它认的是票号,`handle_reply` 上面就把它拦下来了。
+    fn on_observe_reply(&mut self, obs_id: &ObservationId, kind: ReplyKind, now: i64) {
         if !self.observations.contains_key(obs_id) {
             // 这条观察在请求飞在路上的时候被删了,回信直接丢掉。
             return;
         }
-        // 秒推抓回来的那一批不属于任何一轮 discover:它没有"这一轮跑完了"
-        // 这回事,记完账当场喊一声界面就行。
-        let from_live = label == OBSERVE_LIVE_FETCH_LABEL;
         match kind {
             ReplyKind::Search(Ok(outcome)) => self.on_discover_search(obs_id, outcome, now),
             ReplyKind::Search(Err(error)) => self.on_discover_failed(obs_id, &error),
             ReplyKind::FetchByIds(Ok(pairs)) => {
                 self.on_first_look_fetch(obs_id, pairs, now);
-                if from_live {
-                    self.observation_data_changed(obs_id, None);
-                } else {
-                    self.finish_discover_batch(obs_id, now);
-                }
+                self.finish_discover_batch(obs_id, now);
             }
             ReplyKind::FetchByIds(Err(error)) => {
                 let label = self.observation_label(obs_id);
@@ -2272,14 +2501,12 @@ impl RuntimeActor {
                 self.emit(RuntimeEvent::Log(format!(
                     "observation {label}: a first-look fetch failed: {error}"
                 )));
-                if from_live {
-                    self.emit_observation_status(obs_id);
-                } else {
-                    self.finish_discover_batch(obs_id, now);
-                }
+                self.finish_discover_batch(obs_id, now);
             }
-            // 观察这条路上只发 search 和 FetchByIds,别的回信不会挂着 obs_id。
-            ReplyKind::Fetch(_) | ReplyKind::Whisper(_) | ReplyKind::SessionCheck(_) => {}
+            ReplyKind::Fetch(_)
+            | ReplyKind::Whisper(_)
+            | ReplyKind::SessionCheck(_)
+            | ReplyKind::FetchSlots(_) => {}
         }
     }
 
@@ -2476,9 +2703,12 @@ impl RuntimeActor {
                 let outcome = hideout_failure(HideoutStep::Whisper, &listing_id, &error);
                 self.finish_hideout(alert_id, outcome);
             }
-            // 这条链路上不会有 search、不会有会话检查,也不会有按 id 对号的
-            // fetch(那是市场观察专用的)。
-            ReplyKind::Search(_) | ReplyKind::SessionCheck(_) | ReplyKind::FetchByIds(_) => {}
+            // 这条链路上不会有 search、不会有会话检查,也不会有市场观察专用的
+            // 那两种 fetch(按 id 对号的、按位置读的)。
+            ReplyKind::Search(_)
+            | ReplyKind::SessionCheck(_)
+            | ReplyKind::FetchByIds(_)
+            | ReplyKind::FetchSlots(_) => {}
         }
     }
 
@@ -2787,6 +3017,22 @@ fn usable_session(settings: &AppSettings, session_ok: bool) -> Option<String> {
 /// 可以调)和服务端每账号 20 条的硬顶(改不了,所以写在代码里)。
 fn live_connection_cap(settings: &AppSettings) -> usize {
     (settings.watcher.max_live_connections as usize).min(MAX_LIVE_CONNECTIONS_PER_ACCOUNT)
+}
+
+/// 服务端说这条挂单是**什么时候**不见的。
+///
+/// `item.verified` 一翻成 `false`,同一条响应里的 `listing.indexed` 就已经被
+/// 顶到"这一趟索引发现它不在了"的时刻 —— 那比"我们下一次回查恰好问到它"
+/// 精确得多(阶梯上一档可能隔六个小时)。
+///
+/// 两种情况退回 `now`:那串时间读不出来,以及它比我们第一次见到这条挂单还早。
+/// 后者说明这一格根本不是"它走的时刻"(挂单刚上架时 `indexed` 就是上架时间),
+/// 拿它当结局会算出负数的存活时间。
+fn gone_moment(listing: &ListingSummary, first_seen_at: i64, now: i64) -> i64 {
+    match chrono::DateTime::parse_from_rfc3339(&listing.indexed) {
+        Ok(at) if at.timestamp() > first_seen_at => at.timestamp(),
+        _ => now,
+    }
 }
 
 /// 一条正常在跑的搜索该显示哪一档:WS 连着就是 Live,否则 Polling。
@@ -3134,6 +3380,22 @@ mod actor_tests {
         /// 这些 id 在 fetch 的答复里是 `null` —— 它们已经没了。
         /// (2026-09-07 实测的形状:数组长度不变,查不到的那一格是 null。)
         gone_ids: BTreeSet<String>,
+        /// 这些 id 照常回整条数据,但 `item.verified` 是 `false`。
+        ///
+        /// **这才是卖掉的那一批真正的样子**(2026-09-08 匿名实测):`null`
+        /// 只留给被彻底清掉的 id,而卖掉的挂单在索引里还在,只是这一格翻了。
+        unverified_ids: BTreeSet<String>,
+        /// fetch 回来的挂单**带的是这些 id**,而不是请求里问的那几个。
+        ///
+        /// live 把手就是这个样子:你拿一张 900 字符的 JWT 去问,回来的挂单
+        /// 带的是它们自己的 64 位十六进制 id —— 两者永远对不上。不设的话
+        /// 假交易站照旧把问的 id 原样回给你(轮询和回查就是那样)。
+        answer_ids: Option<Vec<String>>,
+        /// `listing.indexed` 写什么。`None` = 那个写死的日期。
+        ///
+        /// verified 翻成 false 的同时,服务端会把它顶到"这一趟索引发现它
+        /// 不见了"的时刻 —— 观察拿它当 `gone_at`,所以测试要能指定它。
+        indexed: Option<String>,
         /// 每件货身上的显示词缀。市场观察按它们聚合。
         item_mods: Vec<String>,
     }
@@ -3175,12 +3437,15 @@ mod actor_tests {
     /// 词缀按**交易站真正回的形状**编:一格是个对象,显示文本在 `description`
     /// 里。早先这里编的是字符串数组(照 PoE1 写的),于是这个假交易站一路绿灯,
     /// 而真跑一趟一条词缀都记不进去 —— 假的和真的不一样,测试就白测了。
+    #[allow(clippy::too_many_arguments)]
     fn listings_json(
         ids: &[String],
         token: Option<&str>,
         online: bool,
         price_divine: Option<i64>,
         gone: &BTreeSet<String>,
+        unverified: &BTreeSet<String>,
+        indexed: &str,
         mods: &[String],
     ) -> String {
         let mod_lines: Vec<String> = mods
@@ -3207,12 +3472,18 @@ mod actor_tests {
                 } else {
                     ""
                 };
+                // 卖掉的那种照常回整条数据,只是 `verified` 翻成 false。
+                let verified = if unverified.contains(id) {
+                    r#","verified":false"#
+                } else {
+                    ""
+                };
                 format!(
-                    r#"{{"id":"{id}","listing":{{"indexed":"2026-09-06T10:00:00Z",
+                    r#"{{"id":"{id}","listing":{{"indexed":"{indexed}",
                         "whisper":"@{id} hi",{hideout}
                         "price":{{"type":"~price","amount":{},"currency":"divine"}},
                         "account":{{"name":"Seller{id}","lastCharacterName":"Char{id}"{presence}}}}},
-                     "item":{{"name":"Choir of the Storm","typeLine":"Lapis Amulet",
+                     "item":{{"name":"Choir of the Storm","typeLine":"Lapis Amulet"{verified},
                        "explicitMods":[{}]}}}}"#,
                     price_divine.unwrap_or((18 - index as i64).max(1)),
                     mod_lines.join(",")
@@ -3274,7 +3545,18 @@ mod actor_tests {
             _search_id: &str,
             _session: Option<&str>,
         ) -> Result<TradeResponse, pnd_trade::TransportError> {
-            let (token, offline, nothing, price, gone, mods, error) = {
+            let (
+                token,
+                offline,
+                nothing,
+                price,
+                gone,
+                unverified,
+                answer_ids,
+                indexed,
+                mods,
+                error,
+            ) = {
                 let mut log = self.log.lock().unwrap();
                 log.fetches.push(ids.to_vec());
                 (
@@ -3283,6 +3565,9 @@ mod actor_tests {
                     log.fetch_returns_nothing,
                     log.price_divine,
                     log.gone_ids.clone(),
+                    log.unverified_ids.clone(),
+                    log.answer_ids.clone(),
+                    log.indexed.clone(),
                     log.item_mods.clone(),
                     log.fetch_error.clone(),
                 )
@@ -3294,11 +3579,13 @@ mod actor_tests {
                 return ok(r#"{"result":[]}"#);
             }
             ok(&listings_json(
-                ids,
+                answer_ids.as_deref().unwrap_or(ids),
                 token.as_deref(),
                 !offline,
                 price,
                 &gone,
+                &unverified,
+                indexed.as_deref().unwrap_or("2026-09-06T10:00:00Z"),
                 &mods,
             ))
         }
@@ -3737,6 +4024,75 @@ mod actor_tests {
         );
         let flat: Vec<String> = batches.concat();
         assert_eq!(flat, ids, "25 个 id 一个不能少、顺序也别乱");
+    }
+
+    /// **蹲价那条秒推路上推来的也是把手**,而它照样走得通。
+    ///
+    /// trade2 的 socket 推的是 `{"result":"<JWT>"}`,一帧一张票,票里没有
+    /// 挂单 id。蹲价不需要为此改什么:一帧一张票,所以那条"十个一批"的分批
+    /// 永远只会切出一批一张 —— 不会把十张 900 字符的票拼成一个 9KB 的 URL;
+    /// 而判定、去重、卡片认的一直是**回信里那条挂单自己的 id**,不是我们
+    /// 发出去的那串。token(私聊、去藏身处)也照常跟着回来。
+    ///
+    /// 这一条钉的就是这几件事,免得哪天有人"顺手"把观察那边的按位置读法
+    /// 搬过来,或者把票也拿去当 id 用。
+    #[test]
+    fn a_watch_live_push_carrying_a_handle_alerts_on_the_returned_listing_id() {
+        let (transport, log) = FakeTrade::new();
+        // 轮询这一轮什么都别找到:这个测试要看的是秒推那条路,而两条路
+        // 抓回来的是同一条挂单 —— 轮询先到的话,秒推那一条会被去重挡掉。
+        log.lock().unwrap().search_ids = Some(Vec::new());
+        // 一张票 → 一件挂单,而那件挂单带的是它自己的 id。
+        log.lock().unwrap().answer_ids = Some(vec!["real-listing-id".to_string()]);
+        log.lock().unwrap().hideout_token = Some("eyJoaWRlb3V0".to_string());
+        let handle_token = format!("eyJhbGciOiJIUzI1NiJ9.{}.sig", "d".repeat(880));
+
+        let connector = Arc::new(ScriptedConnector::new());
+        connector.push(Step::New(vec![handle_token.clone()]));
+        let runtime = RuntimeHandle::start_offline_with_connector(
+            live_settings(),
+            RuntimePaths::in_memory(),
+            transport,
+            connector,
+        )
+        .unwrap();
+
+        let mut seen = Vec::new();
+        let event = wait_for(
+            &runtime,
+            &mut seen,
+            |event| {
+                matches!(event, RuntimeEvent::ListingMatched(matched)
+                    if matched.source == AlertSource::Live)
+            },
+            "a live ListingMatched from a handle push",
+        );
+        let RuntimeEvent::ListingMatched(matched) = event else {
+            unreachable!()
+        };
+        assert_eq!(
+            matched.headline.id, "real-listing-id",
+            "认的是回信里那条挂单自己的 id,不是我们发出去的那张票"
+        );
+        assert_eq!(
+            matched.headline.hideout_token.as_deref(),
+            Some("eyJoaWRlb3V0"),
+            "去藏身处那张 token 照常跟着回来"
+        );
+
+        let handle_batches: Vec<Vec<String>> = log
+            .lock()
+            .unwrap()
+            .fetches
+            .iter()
+            .filter(|batch| batch.iter().any(|id| id.starts_with("eyJhbGci")))
+            .cloned()
+            .collect();
+        assert_eq!(
+            handle_batches,
+            vec![vec![handle_token]],
+            "一帧一张票,所以永远只有一张票一封请求"
+        );
     }
 
     /// 带着 cookie 被拒 = 会话没了:只喊一次,而且所有 live 都得停。
@@ -5219,6 +5575,7 @@ mod actor_tests {
             online: true,
             afk: false,
             indexed: "2026-09-06T10:00:00Z".to_string(),
+            verified: true,
             whisper: "@Char hi".to_string(),
             whisper_token: None,
             hideout_token: None,
@@ -5242,11 +5599,14 @@ mod actor_tests {
             .collect()
     }
 
-    /// 秒推是观察知道新挂单的**主要**途径:推来的 id 当场就去抓详情,
-    /// 抓到的整条入库,抓不到(那一格是 null)的记成"第一眼就没了"。
+    /// 秒推是观察知道新挂单的**主要**途径:推来的每一张把手当场换一次 fetch,
+    /// 换回来的整条入库,换不回来(那一格是 null)的记成"第一眼就没了"。
     ///
     /// 后者才是这一整步的理由:一件挂上去一分钟就被买走的好价碑牌,
     /// 十分钟一次的搜索永远看不见 —— 搜索只回还活着的挂单。
+    ///
+    /// **两张票 = 两封请求**,而且入库的名字是**回信里那条挂单自己的 id**,
+    /// 不是我们发出去的那串:票是一张 900 字符的 JWT,里面一个 id 都没有。
     #[test]
     fn a_live_push_on_an_observation_is_fetched_and_stored() {
         let (transport, log) = FakeTrade::new();
@@ -5269,13 +5629,13 @@ mod actor_tests {
         .unwrap();
 
         let mut seen = Vec::new();
-        wait_for_fetches(&handle, &mut seen, &log, 1);
+        wait_for_fetches(&handle, &mut seen, &log, 2);
         drop(handle);
 
         assert_eq!(
             batches_with_prefix(&log, "live-"),
-            vec![vec!["live-1".to_string(), "live-2".to_string()]],
-            "推来的两个 id 要在同一次 fetch 里问掉"
+            vec![vec!["live-1".to_string()], vec!["live-2".to_string()]],
+            "一张票一封请求 —— 十张票拼成一个 9KB 的 URL 没有人验过"
         );
 
         let store = WatchStore::open(&db).expect("open");
@@ -5291,17 +5651,20 @@ mod actor_tests {
         );
         assert_eq!(store.observed_mods(&obs_id, "live-1").unwrap().len(), 1);
 
-        // 没抓到的那条:空壳一行,判定档写死"第一眼就没了"。
+        // 没换回东西的那张票:空壳一行,判定档写死"第一眼就没了"。
+        // 记在票的**化名**下 —— 票本身是凭证,不能当挂单 id 存进库。
+        let alias = LiveHandle("live-2".to_string()).synthetic_id();
+        assert!(alias.starts_with("handle-"), "{alias}");
         let quick = store
-            .observed_listing(&obs_id, "live-2")
+            .observed_listing(&obs_id, &alias)
             .unwrap()
-            .expect("live-2");
+            .expect("the alias row for the handle that came back empty");
         assert_eq!(quick.status, pnd_storage::ObservedStatus::Gone);
         assert_eq!(
             quick.gone_class,
             Some(pnd_domain::GoneClass::GoneBeforeFirstLook)
         );
-        assert!(store.observed_mods(&obs_id, "live-2").unwrap().is_empty());
+        assert!(store.observed_mods(&obs_id, &alias).unwrap().is_empty());
 
         let summary = store.observation_summary(&obs_id).unwrap();
         assert_eq!(summary.active, 1);
@@ -5355,9 +5718,181 @@ mod actor_tests {
 
         assert_eq!(
             batches_with_prefix(&log, "s-"),
-            vec![vec!["s-3".to_string(), "s-6".to_string()]],
-            "每第三条抓一条"
+            vec![vec!["s-3".to_string()], vec!["s-6".to_string()]],
+            "每第三条抓一条,而且一张票一封请求"
         );
+    }
+
+    /// 一张把手换回来的挂单,入库的名字是**回信里那条挂单自己的 id**。
+    ///
+    /// 票是一张 900 字符的 JWT,里面一个 id 都没有 —— 拿它当挂单 id 存,
+    /// 库里就会堆满一次性的假 id,而且下一轮回查拿它去问什么都问不到:
+    /// 这条观察记下的每一条都会烂在"永远查不到"里。所以这里让假交易站
+    /// 回一个和请求完全不同的 id,看 actor 认哪一个。
+    #[test]
+    fn a_handle_stores_the_listing_under_the_id_the_response_carries() {
+        let (transport, log) = FakeTrade::new();
+        log.lock().unwrap().search_ids = Some(Vec::new());
+        // 一张票换回两件挂单 —— token 长度会跳,对应的就是一帧里 1 到 3 件。
+        log.lock().unwrap().answer_ids = Some(vec!["real-a".to_string(), "real-b".to_string()]);
+
+        let connector = Arc::new(ScriptedConnector::new());
+        let token = format!("eyJhbGciOiJIUzI1NiJ9.{}.sig", "d".repeat(880));
+        connector.push(Step::New(vec![token.clone()]));
+        let (settings, obs_id) = observe_live_settings("Choir of the Storm");
+        let db = temp_db("handle-ids");
+        let runtime = RuntimeHandle::start_offline_with_connector(
+            settings,
+            RuntimePaths::new(db.clone()),
+            transport,
+            shared(&connector),
+        )
+        .unwrap();
+
+        let mut seen = Vec::new();
+        wait_for_fetches(&runtime, &mut seen, &log, 1);
+        drop(runtime);
+
+        assert_eq!(
+            log.lock().unwrap().fetches[0],
+            vec![token],
+            "问出去的是整张票"
+        );
+        let store = WatchStore::open(&db).expect("open");
+        assert_eq!(
+            store.active_listing_ids(&obs_id).unwrap(),
+            ["real-a", "real-b"],
+            "记下的是回信里那两条挂单自己的 id"
+        );
+        remove_db(&db);
+    }
+
+    /// 抓取额度买不起的推送**当场丢掉**,不排队。
+    ///
+    /// 一张把手换一次 fetch,而 6 小时只有 499 次(一半还要留给回查),
+    /// 主人那条碑牌搜索一分钟推 6 到 9 条。照单全收的话不出十分钟额度就见底,
+    /// 然后所有请求一起排队,排到票 14 秒的有效期过完 —— 花光了额度,
+    /// 一条挂单也没记下来。
+    ///
+    /// 桶满是五张,所以一口气推八条只抓得动五条,剩下三条记在"没去看"那一栏
+    /// (和 `sample_every` 抽掉的算在一起:对使用者来说是同一件事)。
+    #[test]
+    fn pushes_the_fetch_budget_cannot_afford_are_dropped_on_the_spot() {
+        let (transport, log) = FakeTrade::new();
+        log.lock().unwrap().search_ids = Some(Vec::new());
+
+        let connector = Arc::new(ScriptedConnector::new());
+        let ids: Vec<String> = (1..=8).map(|index| format!("b-{index}")).collect();
+        connector.push(Step::New(ids));
+        let (settings, obs_id) = observe_live_settings("Choir of the Storm");
+        let handle = RuntimeHandle::start_offline_with_connector(
+            settings,
+            RuntimePaths::in_memory(),
+            transport,
+            shared(&connector),
+        )
+        .unwrap();
+
+        let mut seen = Vec::new();
+        let status = wait_for(
+            &handle,
+            &mut seen,
+            |event| {
+                matches!(event, RuntimeEvent::ObservationStatus { obs_id: id, status }
+                    if *id == obs_id && status.pushed_total == 8)
+            },
+            "an observation status counting all eight pushes",
+        );
+        let RuntimeEvent::ObservationStatus { status, .. } = status else {
+            unreachable!()
+        };
+        assert_eq!(
+            status.sampled_out_total, 3,
+            "桶里只有五张票,第六条起就买不起了"
+        );
+        thread::sleep(Duration::from_millis(200));
+        drop(handle);
+
+        assert_eq!(
+            batches_with_prefix(&log, "b-").len(),
+            5,
+            "买得起几条就抓几条"
+        );
+    }
+
+    /// 票在路上就过期了要单独说一句,也单独记一笔。
+    ///
+    /// 把手只活 14 秒。"发出去的时候它已经废了"和"网络坏了"是两回事:
+    /// 前者说明队列排得太长(额度紧、网关在退避),该动的是采样和优先级;
+    /// 后者下一条推送自己会再来一次。混成一个数就分不出该调哪个。
+    ///
+    /// 直接摆弄 actor 而不是等真的过 14 秒:一个测试不该坐等一刻钟。
+    #[test]
+    fn a_handle_that_expired_in_the_queue_is_counted_and_named() {
+        let (transport, _log) = FakeTrade::new();
+        let (settings, obs_id) = observe_settings("Choir of the Storm");
+        let (events, event_rx) = channel();
+        let (inbox, _inbox_rx) = channel();
+        let connector = Arc::new(ScriptedConnector::new());
+        let mut actor = RuntimeActor::new(
+            settings,
+            RuntimePaths::in_memory().open().expect("store"),
+            transport,
+            shared(&connector),
+            None,
+            events,
+            inbox,
+        );
+        actor.apply_initial_settings();
+
+        // 一张 20 秒前拿到的票,现在才轮到它 —— 早废了。
+        let now = now_secs();
+        actor.handles.insert(
+            7,
+            HandleFetch {
+                obs_id: obs_id.clone(),
+                synthetic_id: "handle-deadbeefdeadbeef".to_string(),
+                issued_at: now - 20,
+            },
+        );
+        actor.on_handle_failed(
+            7,
+            &GatewayError::Transport("connection reset".to_string()),
+            now,
+        );
+
+        assert_eq!(
+            actor.observations[&obs_id].status.expired_total, 1,
+            "过期的票要单独记一笔"
+        );
+        let logs: Vec<String> = event_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::Log(message) => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("handle expired before it could be fetched")),
+            "过期要在日志里说清楚:{logs:#?}"
+        );
+
+        // 而一张刚拿到的票失败了就是普通的失败,不算过期。
+        actor.handles.insert(
+            8,
+            HandleFetch {
+                obs_id: obs_id.clone(),
+                synthetic_id: "handle-0000000000000000".to_string(),
+                issued_at: now,
+            },
+        );
+        actor.on_handle_failed(
+            8,
+            &GatewayError::Transport("connection reset".to_string()),
+            now,
+        );
+        assert_eq!(actor.observations[&obs_id].status.expired_total, 1);
     }
 
     /// 秒推记下的挂单,兜底那一轮再看见它时**不该**重抓一次。
@@ -5496,6 +6031,107 @@ mod actor_tests {
         assert_eq!(row.check_rung, 1);
         assert_eq!(row.next_check_at, first_seen + 1_800);
         assert_eq!(row.status, pnd_storage::ObservedStatus::Active);
+        remove_db(&db);
+    }
+
+    /// **卖掉的挂单不是 `null`,是 `item.verified == false`。**
+    ///
+    /// 2026-09-08 匿名量了 20 个 id:5.8 小时前记下的那 10 条一条 `null` 都
+    /// 没有,却有 3 条 `verified: false`,而且 `listing.indexed` 已经被顶到
+    /// "这一趟索引发现它不见了"的时刻。程序早先只认 `null`,于是主人开着它
+    /// 跑了六个小时,`gone` 一直是 0 —— 我们在等一个几乎不会来的信号。
+    ///
+    /// 三件事一起钉:回查真的把它判成没了;`gone_at` 用的是**服务端说的
+    /// 那一刻**而不是"我们发现它"的此刻;`last_seen_at` 跟着拉回去,
+    /// 所以存活时间是 `gone_at − first_seen_at`,不多不少。
+    #[test]
+    fn a_sold_listing_on_a_recheck_is_gone_at_the_moment_the_site_says() {
+        let (transport, log) = FakeTrade::new();
+        log.lock().unwrap().search_ids = Some(Vec::new());
+        // 一分钟前那一趟索引发现它不见了。
+        let gone_at = now_secs() - 60;
+        let gone_iso = chrono::DateTime::from_timestamp(gone_at, 0)
+            .expect("a timestamp")
+            .to_rfc3339();
+        log.lock().unwrap().indexed = Some(gone_iso);
+        log.lock()
+            .unwrap()
+            .unverified_ids
+            .insert("sold".to_string());
+
+        let (settings, obs_id) = observe_settings("Choir of the Storm");
+        let db = temp_db("verified-false");
+        // 三小时前第一次见到它,所以第一档(+600 秒)早就该查了。
+        let first_seen = gone_at - 3 * 3_600;
+        {
+            let store = WatchStore::open(&db).expect("open");
+            seed_listing(&store, &obs_id, "sold", first_seen);
+        }
+
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::new(db.clone()), transport)
+                .unwrap();
+        let mut seen = Vec::new();
+        wait_for_fetches(&handle, &mut seen, &log, 1);
+        drop(handle);
+
+        assert_eq!(log.lock().unwrap().fetches[0], ["sold"], "到点的那条被查了");
+        let store = WatchStore::open(&db).expect("open");
+        let row = store
+            .observed_listing(&obs_id, "sold")
+            .unwrap()
+            .expect("row");
+        assert_eq!(
+            row.status,
+            pnd_storage::ObservedStatus::Gone,
+            "verified = false 就是没了"
+        );
+        assert_eq!(row.gone_at, Some(gone_at), "用服务端说的那一刻");
+        assert_eq!(row.last_seen_at, gone_at, "最后一次见到 = 它走的那一刻");
+        assert_eq!(row.observed_lifetime_secs(), 3 * 3_600);
+        // 挂了三小时、没降过价:判成"看着像卖掉了"。
+        assert_eq!(row.gone_class, Some(pnd_domain::GoneClass::SoldLikely));
+        assert_eq!(store.observation_summary(&obs_id).unwrap().gone, 1);
+        remove_db(&db);
+    }
+
+    /// 第一眼看见它的时候它**已经**卖掉了(`verified == false`)。
+    ///
+    /// 照样整条存下来 —— 物品原文、词缀都要,聚合表的分母靠它们;存完当场
+    /// 标成没了。判定会是 `Unknown`,而那是诚实的:看得见的存活时间是 0,
+    /// 我们确实答不出"它挂了多久"。
+    ///
+    /// 不是罕见情况:同一次实测里,9 分钟前的 10 条里已经有 1 条是 false。
+    #[test]
+    fn a_listing_that_is_already_sold_on_the_first_look_is_stored_then_marked_gone() {
+        let (transport, log) = FakeTrade::new();
+        log.lock().unwrap().search_ids = Some(vec!["one".to_string()]);
+        log.lock().unwrap().unverified_ids.insert("one".to_string());
+        log.lock().unwrap().item_mods = vec!["+115 to maximum Life".to_string()];
+
+        let (settings, obs_id) = observe_settings("Choir of the Storm");
+        let db = temp_db("sold-on-arrival");
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::new(db.clone()), transport)
+                .unwrap();
+        let mut seen = Vec::new();
+        wait_for_fetches(&handle, &mut seen, &log, 1);
+        drop(handle);
+
+        let store = WatchStore::open(&db).expect("open");
+        let row = store
+            .observed_listing(&obs_id, "one")
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.status, pnd_storage::ObservedStatus::Gone);
+        assert_eq!(row.gone_class, Some(pnd_domain::GoneClass::Unknown));
+        // 物品原文和词缀留着 —— 这一条要进聚合表。
+        assert!(row.item_json.contains("Choir of the Storm"));
+        assert_eq!(store.observed_mods(&obs_id, "one").unwrap().len(), 1);
+        let summary = store.observation_summary(&obs_id).unwrap();
+        assert_eq!((summary.active, summary.gone, summary.unknown), (0, 1, 1));
+        // 空壳那一档是留给 `null` 的,这一条有血有肉。
+        assert_eq!(summary.gone_before_first_look, 0);
         remove_db(&db);
     }
 

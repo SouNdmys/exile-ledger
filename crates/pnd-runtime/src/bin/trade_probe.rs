@@ -63,6 +63,11 @@
 //! 起一个 [`RuntimeHandle`],然后把收到的事件翻译成人话。界面将来做的事和
 //! 这里一模一样,所以这个模式跑通,界面接线就只剩画画面了。
 //!
+//! `--session-from-settings` 在**进程里面**从 `settings.json` 读 POESESSID
+//! (环境变量 `POESESSID` 优先),这样 cookie 不用打在命令行上 —— 命令行会
+//! 留在 shell 历史和进程列表里,而设置文件本来就在旁边。走的是
+//! `live_probe --session` 同一条路(`pnd_settings::SettingsStore`)。
+//!
 //! `--session` 里的 POESESSID **永远不会被打印出来**,只会以"带会话/匿名"
 //! 一个词的形式出现在输出里。
 
@@ -84,7 +89,7 @@ use pnd_runtime::actor::{
 };
 use pnd_runtime::live_worker::{LiveOffReason, LiveRunState};
 use pnd_runtime::{describe_token, now_secs};
-use pnd_settings::{AppSettings, ObservationEntry, WatchEntry};
+use pnd_settings::{AppSettings, ObservationEntry, SettingsStore, WatchEntry};
 use pnd_storage::{ObservedListingRow, WatchStore};
 use pnd_trade::client::{
     MAX_FETCH_IDS, SearchResponse, TradeClient, TradeResponse, ggg_error, parse_search_response,
@@ -113,7 +118,7 @@ trade_probe --watch --minutes 3 [--poll-seconds 60] --search <url|id> [--search 
 [--cap 20] [--currency divine] [--session <POESESSID>] [--hideout <alert_id>]\n       \
 trade_probe --observe --search <url|id> [--league \"Forbidden Rites\"]\n       \
 trade_probe --observe-run --search <url|id> [--minutes 1] \
-[--live --session <POESESSID>] [--sample-every 1] \
+[--live --session-from-settings|--session <POESESSID>] [--sample-every 1] \
 [--discover-seconds 300] [--recheck-seconds 3600] [--recheck-after-secs 0]";
 
 /// 蹲价模式里多久抽一次事件。事件通道是无界的,抽得慢只是屏幕上晚一点看到,
@@ -723,8 +728,14 @@ fn observation_report(db_path: &Path, obs_id: &ObservationId) -> Result<(), Stri
         .map_err(|error| error.to_string())?;
     println!(
         "\n=========== what this observation has on file ===========\n\
-         active {}   gone {}   (sold_likely {} · sold_after_cuts {} · unknown {})",
-        summary.active, summary.gone, summary.sold_likely, summary.sold_after_cuts, summary.unknown
+         active {}   gone {}   (sold_likely {} · sold_after_cuts {} · unknown {} · \
+         gone_before_first_look {})",
+        summary.active,
+        summary.gone,
+        summary.sold_likely,
+        summary.sold_after_cuts,
+        summary.unknown,
+        summary.gone_before_first_look
     );
 
     let gone = store
@@ -1081,12 +1092,22 @@ fn live_reason(reason: LiveOffReason) -> &'static str {
 }
 
 /// 一条观察的状态行。两条时间线各说各的,所以两个"还有多久"都要印。
+///
+/// 秒推那三个数只在真的推来过东西时才印:`--live` 没开的时候它们恒等于 0,
+/// 而三个恒零的数字只会把真正在动的那几个挤出视线。
 fn describe_observation(status: &ObservationStatus) -> String {
     let now = now_secs();
     let mut parts = vec![
         format!("{} active", status.active),
         format!("{} gone", status.gone),
     ];
+    if status.pushed_total > 0 {
+        // "没去看"= 按 sample_every 抽掉的 + 抓取额度买不起当场丢掉的;
+        // "过期"= 去抓了,可票在队列里就废了(它只活 14 秒)。
+        parts.push(format!("{} pushed", status.pushed_total));
+        parts.push(format!("{} not looked at", status.sampled_out_total));
+        parts.push(format!("{} expired", status.expired_total));
+    }
     if let Some(at) = status.next_discover_at {
         parts.push(format!("discover in {}s", (at - now).max(0)));
     }
@@ -1498,6 +1519,7 @@ impl Args {
         let mut currency = Currency::Divine.code().to_string();
         let mut rounds: u32 = 1;
         let mut session: Option<String> = None;
+        let mut session_from_settings = false;
         let mut rates: Option<CurrencyRates> = None;
         let mut watch = false;
         let mut observe = false;
@@ -1585,6 +1607,7 @@ impl Args {
                     );
                 }
                 "--session" => session = Some(value()?),
+                "--session-from-settings" => session_from_settings = true,
                 "--rates" => rates = Some(parse_rates(&value()?)?),
                 "-h" | "--help" => return Err("help".to_string()),
                 other => return Err(format!("unknown flag {other:?}")),
@@ -1594,10 +1617,17 @@ impl Args {
         if searches.is_empty() {
             return Err("--search is required".to_string());
         }
+        // 命令行上那串优先:两个都给了的时候,当场打的那个才是这次想试的。
+        if session_from_settings && session.is_none() {
+            session = Some(session_from_settings_file()?);
+        }
         // live 接口不接待匿名连接:没有会话一条也连不上。与其跑满一分钟再报
         // "连不上",不如现在就说清楚缺什么。
         if live && session.as_deref().unwrap_or_default().trim().is_empty() {
-            return Err("--live needs --session <POESESSID>".to_string());
+            return Err(
+                "--live needs a session: pass --session-from-settings (reads settings.json                  inside this process) or --session <POESESSID>"
+                    .to_string(),
+            );
         }
         Ok(Args {
             league,
@@ -1622,6 +1652,32 @@ impl Args {
             hideout,
         })
     }
+}
+
+/// `--session-from-settings`:在**进程里面**把 POESESSID 读出来。
+///
+/// 为什么要有它:`--session <值>` 得把 cookie 打在命令行上,于是它会留在
+/// shell 历史、任务管理器的命令行列、以及任何抄了这条命令的地方。而这个
+/// 探针本来就是在主人自己的机器上跑的,设置文件就在旁边 —— 读一次、
+/// 塞进设置结构体、**永远不打印**,和 `live_probe --session` 走的是同一条路
+/// (`pnd_settings::SettingsStore::release_default`,也就是生产代码那条)。
+///
+/// 环境变量排第一,理由同 `live_probe`:不动设置文件也能试一把。
+fn session_from_settings_file() -> Result<String, String> {
+    if let Ok(value) = std::env::var("POESESSID")
+        && !value.trim().is_empty()
+    {
+        return Ok(value.trim().to_string());
+    }
+    let store = SettingsStore::release_default();
+    let poesessid = store.load().settings.poesessid.trim().to_string();
+    if poesessid.is_empty() {
+        return Err(format!(
+            "--session-from-settings found no POESESSID: {} has an empty one",
+            store.path().display()
+        ));
+    }
+    Ok(poesessid)
 }
 
 /// `chaos=25.21,exalted=83.42` —— 每 1 divine 换多少个它,和 ninja 的口径一致。
@@ -1687,7 +1743,10 @@ mod trade_probe_tests {
             Ok(_) => panic!("--live without --session must not be accepted"),
             Err(error) => error,
         };
-        assert!(error.contains("--live needs --session"), "{error}");
+        // 报错要把**两条路**都说出来:命令行给一个,或者让探针自己去读
+        // 设置文件(那样 cookie 就不用打在命令行上了)。
+        assert!(error.contains("--live needs a session"), "{error}");
+        assert!(error.contains("--session-from-settings"), "{error}");
         // 空串的 cookie 也一样不算数。
         assert!(
             parse(&[

@@ -51,6 +51,24 @@ pub fn parse_fetch_response_by_id(
         .collect())
 }
 
+/// 同一次 fetch,但**按位置**回话:数组里第几格就是回信里第几格,
+/// `null` 那一格是 `None`。
+///
+/// 给 live 推来的"把手"用。把手是一整张 JWT,不是挂单 id —— 回信里那几条
+/// 挂单带的是它们**自己**的 id,和请求里那串对不上号,所以
+/// [`parse_fetch_response_by_id`] 那种按 id 对号的做法在这里一条也认不出来。
+/// 而一张把手可能换回 1 到 3 条挂单(token 长度会跟着跳),所以也不能假定
+/// "一格对一条"。位置是这里唯一还站得住的东西。
+pub fn parse_fetch_response_slots(body: &[u8]) -> Result<Vec<Option<ListingSummary>>, ParseError> {
+    let root: Value =
+        serde_json::from_slice(body).map_err(|e| ParseError::NotJson(e.to_string()))?;
+    let entries = root
+        .get("result")
+        .and_then(Value::as_array)
+        .ok_or(ParseError::Missing("result"))?;
+    Ok(entries.iter().map(summarize).collect())
+}
+
 /// 一条挂单 → 一份摘要。返回 `None` 就是"这条不要了"(null、或者连 id 都没有)。
 fn summarize(entry: &Value) -> Option<ListingSummary> {
     // 过期的 id 在 result 里是 null;没有 id 的条目我们也没法去重,一并跳过。
@@ -84,6 +102,11 @@ fn summarize(entry: &Value) -> Option<ListingSummary> {
         online: is_online,
         afk,
         indexed: text(listing, "indexed"),
+        // 缺这个键的响应当"还在":老形状里没有它,而凭空判一条挂单没了
+        // 比漏判一条贵得多。
+        verified: child(item, "verified")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
         whisper: text(listing, "whisper"),
         whisper_token: optional_text(listing, "whisper_token"),
         hideout_token: optional_text(listing, "hideout_token"),
@@ -189,7 +212,8 @@ mod listing_tests {
             "account": {"name": "Offline#9", "lastCharacterName": "Gone"},
             "whisper": "@Gone Hi"
           },
-          "item": {"name": "", "typeLine": "Sapphire Ring", "icon": "https://web.poecdn.com/ring.png"}
+          "item": {"name": "", "typeLine": "Sapphire Ring", "icon": "https://web.poecdn.com/ring.png",
+                   "verified": false}
         }
       ]
     }"#;
@@ -246,6 +270,26 @@ mod listing_tests {
     #[test]
     fn missing_price_becomes_none() {
         assert_eq!(parsed()[1].price, None);
+    }
+
+    /// **卖掉的挂单不是 `null`,是 `item.verified == false`。**
+    ///
+    /// 2026-09-08 拿主人的程序观察过的 20 个 id 匿名 fetch 了两次:5.8 小时前
+    /// 第一次见到的那 10 条一条 `null` 都没有,却有 3 条带着 `"verified": false`,
+    /// 而且 `listing.indexed` 被顶到"这一趟索引发现它不见了"的时刻;9 分钟前
+    /// 的那 10 条里也已经有 1 条是 false。`null` 只留给被彻底清掉的 id。
+    ///
+    /// 没有这一格,市场观察就在等一个几乎不会来的 `null` —— 那正是主人那六个
+    /// 小时里 gone 一直是 0 的原因。
+    #[test]
+    fn a_sold_listing_says_so_with_verified_false() {
+        let listings = parsed();
+        assert!(listings[0].verified, "没有 verified 这个键就当它还在");
+        assert!(listings[1].verified);
+        assert!(
+            !listings[2].verified,
+            "item.verified = false 就是这条挂单已经没了"
+        );
     }
 
     #[test]
@@ -347,6 +391,19 @@ mod listing_tests {
         // 没有 `item` 那一块的条目留空串,而不是塞一个 "null" 进去。
         let body = br#"{"result":[{"id":"aaa","listing":{"indexed":"x"}}]}"#;
         assert_eq!(parse_fetch_response(body).unwrap()[0].item_json, "");
+    }
+
+    /// 把手换回来的那几条挂单带的是它们自己的 id,和请求里那张 token 对不上号,
+    /// 所以只能按位置读:第三格是 `null`,那一格就是"这一件在我们看它第一眼
+    /// 之前就没了"。
+    #[test]
+    fn the_slot_view_keeps_the_nulls_in_place() {
+        let slots = parse_fetch_response_slots(FETCH_JSON.as_bytes()).unwrap();
+        assert_eq!(slots.len(), 4, "四格一格不少");
+        assert_eq!(slots[0].as_ref().unwrap().id, "aaa111");
+        assert_eq!(slots[1].as_ref().unwrap().id, "bbb222");
+        assert!(slots[2].is_none(), "第三格是 null");
+        assert_eq!(slots[3].as_ref().unwrap().id, "ccc333");
     }
 
     #[test]

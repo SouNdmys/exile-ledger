@@ -229,6 +229,9 @@ catalogue! {
     obs_next_check_in,
     /// "出错:{}"
     obs_status_error,
+    /// "过期 {}" —— 秒推来的把手只活 14 秒,排队排过头就换不回挂单了。
+    /// 这个数一涨就说明额度紧或者网关在退避,是要动手调的信号。
+    obs_expired,
     /// 没有会话时秒推连不上,而观察最要紧的那批货正是一分钟内卖掉的那些。
     obs_no_live_session,
     /// 判定要么等挂单消失,要么等它挂满 72 小时 —— 头几个小时表是空的很正常。
@@ -710,6 +713,7 @@ pub static ENGLISH: Text = Text {
     obs_next_discover_in: "new listings in {}",
     obs_next_check_in: "next check in {}",
     obs_status_error: "error: {}",
+    obs_expired: "{} expired",
     obs_no_live_session: "Not logged in: new listings can only be found by polling, so anything sold within a minute is missed. Paste a POESESSID on the Settings page.",
     obs_no_data: "Still collecting: the first verdicts wait for a listing to disappear, or for it to sit there a full 72 hours.",
     obs_gone_before_first_look: "{} were already sold when they were pushed to us (no modifiers recorded)",
@@ -1067,6 +1071,7 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     obs_next_discover_in: "{} 后再找新的",
     obs_next_check_in: "{} 后回查",
     obs_status_error: "出错:{}",
+    obs_expired: "过期 {}",
     obs_no_live_session: "未登录:只能靠轮询发现,会漏掉一分钟内卖掉的单。去设置页粘一个 POESESSID。",
     obs_no_data: "还在攒数据:第一批判定要等挂单消失或满 72 小时。",
     obs_gone_before_first_look: "{} 条推来时已售出(未拿到词缀)",

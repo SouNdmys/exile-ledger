@@ -349,6 +349,14 @@ fn status_text(
             &[&countdown_mmss(at - now)],
         ));
     }
+    // 秒推的把手只活 14 秒:排队排过头就换不回挂单了。一条都没过期时不写
+    // 这一段 —— 常态是 0,而写着"过期 0"只会让人以为这里有毛病。
+    if status.expired_total > 0 {
+        parts.push(i18n::fill(
+            text.obs_expired,
+            &[&status.expired_total.to_string()],
+        ));
+    }
     if let Some(error) = &status.last_error {
         parts.push(i18n::fill(text.obs_status_error, &[error]));
     }
@@ -1535,6 +1543,33 @@ mod observations_page_tests {
         let rows = observation_rows(&settings(), &status, &i18n::ENGLISH, NOW);
         assert_eq!(rows[0][5].text(), "live off · new listings in 01:00");
         assert!(!rows[0][5].text().contains("next check"));
+    }
+
+    /// 票在路上过期的条数要摆在状态格里 —— 它一涨就说明请求排队排得太久
+    /// (额度紧、网关在退避),而那是要动手调的事,不是"等等就好"。
+    /// 一条都没过期时不写这一段:常态是 0,写着"0 expired"只会让人误会。
+    #[test]
+    fn expired_handles_show_up_in_the_status_cell() {
+        let mut status = status();
+        let rows = observation_rows(&settings(), &status, &i18n::ENGLISH, NOW);
+        assert!(!rows[0][5].text().contains("expired"), "常态不写这一段");
+
+        status
+            .get_mut(&ObservationId("o-1".to_string()))
+            .expect("the first observation")
+            .expired_total = 3;
+        let rows = observation_rows(&settings(), &status, &i18n::ENGLISH, NOW);
+        assert!(
+            rows[0][5].text().contains("3 expired"),
+            "{}",
+            rows[0][5].text()
+        );
+        let rows = observation_rows(&settings(), &status, &i18n::SIMPLIFIED_CHINESE, NOW);
+        assert!(
+            rows[0][5].text().contains("过期 3"),
+            "{}",
+            rows[0][5].text()
+        );
     }
 
     /// 词缀表按**卖掉几件**排,不按见过几件:这一页要回答的是"什么样的货

@@ -18,7 +18,7 @@
 //! `observed_price_history` 里追加一行 → 某次 recheck 查不到了,调用方拿
 //! `classify_gone` 判一下,`mark_gone` 把结论写在行上。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pnd_domain::{GoneClass, ListingSummary, ObservationId, Price, next_check_after};
 use pnd_ninja::character::{line_numbers, mod_template};
@@ -506,14 +506,28 @@ impl WatchStore {
     ///
     /// 跨观察是有意的:一次 fetch 最多带 10 个 id,凑不满就白花一次额度。
     /// 两条观察各有三条到期的挂单,拼成一批发出去就只花一次。
-    pub fn due_listings(&self, now: i64, limit: usize) -> Result<Vec<DueListing>, StorageError> {
+    /// `in_flight` 是**已经问出去、还没回来**的那些 `(观察, 挂单)`,它们要跳过:
+    /// 它们的 `next_check_at` 要等回信才会往前挪,不跳的话每一轮扫描都会把
+    /// 同一批重发一遍。
+    ///
+    /// 跳过是在 SQL **里面**做的(多取 `in_flight.len()` 行再筛),不是取完
+    /// 再筛:先 `LIMIT` 后筛的话,万一有一批回信丢了(网关关掉、回信路上
+    /// actor 走了),那几条就永远占着最前面 `limit` 个名额,后面的挂单一条
+    /// 也轮不上 —— 整条回查线就此停摆,而界面上什么都看不出来。
+    pub fn due_listings(
+        &self,
+        now: i64,
+        limit: usize,
+        in_flight: &BTreeSet<(ObservationId, String)>,
+    ) -> Result<Vec<DueListing>, StorageError> {
         let mut statement = self.conn.prepare(
             "SELECT obs_id, listing_id, first_seen_at, check_rung FROM observed_listings
              WHERE status = 'active' AND next_check_at <= ?1
              ORDER BY next_check_at ASC, obs_id ASC, listing_id ASC
              LIMIT ?2",
         )?;
-        let rows = statement.query_map(params![now, limit as i64], |row| {
+        let fetch = limit.saturating_add(in_flight.len());
+        let rows = statement.query_map(params![now, fetch as i64], |row| {
             let rung: i64 = row.get(3)?;
             Ok(DueListing {
                 obs_id: ObservationId(row.get(0)?),
@@ -524,7 +538,14 @@ impl WatchStore {
         })?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            let row = row?;
+            if in_flight.contains(&(row.obs_id.clone(), row.listing_id.clone())) {
+                continue;
+            }
+            out.push(row);
+            if out.len() == limit {
+                break;
+            }
         }
         Ok(out)
     }
@@ -628,6 +649,33 @@ impl WatchStore {
              SET status = 'gone', gone_at = ?3, gone_class = ?4
              WHERE obs_id = ?1 AND listing_id = ?2 AND status = 'active'",
             params![obs_id.as_str(), listing_id, now, class.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// 这条挂单在**某个已知的时刻**就没了 —— 而那个时刻比我们发现它早。
+    ///
+    /// 和 [`WatchStore::mark_gone`] 的差别只有一处:`last_seen_at` 也被拉回
+    /// `gone_at`,而不是留在"上一次回查看见它"那一刻。
+    ///
+    /// 为什么要这一版:交易站告诉我们一条挂单没了的方式是 `item.verified`
+    /// 变成 `false`,同一条响应里 `listing.indexed` 已经被顶到"发现它不见了"
+    /// 的那一趟索引 —— 也就是说服务端顺手告诉了我们它大概什么时候走的。
+    /// 拿那个时刻当 `gone_at`,存活时间就是 `gone_at − first_seen_at`;
+    /// 而 `last_seen_at` 要是还停在六小时前的那次回查,存活时间会被算成
+    /// "从第一次见到到最后一次看见它还在",两头都不对。
+    pub fn mark_gone_at(
+        &self,
+        obs_id: &ObservationId,
+        listing_id: &str,
+        gone_at: i64,
+        class: GoneClass,
+    ) -> Result<(), StorageError> {
+        self.conn.execute(
+            "UPDATE observed_listings
+             SET status = 'gone', gone_at = ?3, last_seen_at = ?3, gone_class = ?4
+             WHERE obs_id = ?1 AND listing_id = ?2 AND status = 'active'",
+            params![obs_id.as_str(), listing_id, gone_at, class.as_str()],
         )?;
         Ok(())
     }
@@ -1108,6 +1156,7 @@ mod observe_tests {
             online: true,
             afk: false,
             indexed: "2026-09-07T12:00:00Z".to_string(),
+            verified: true,
             whisper: "@SomeChar hi".to_string(),
             whisper_token: None,
             hideout_token: None,
@@ -1358,6 +1407,49 @@ mod observe_tests {
         assert_eq!(row.last_price, divine(20_000));
         assert_eq!(row.price_changes, 0);
         assert_eq!(store.price_history(&id, "aaa").expect("history").len(), 1);
+    }
+
+    /// 服务端顺手告诉了我们它是什么时候走的:那一刻既是 `gone_at`,
+    /// 也是我们该认的 `last_seen_at`。
+    ///
+    /// 交易站说一条挂单没了的方式是 `item.verified` 变成 `false`,而同一条
+    /// 响应里 `listing.indexed` 已经被顶到"这一趟索引发现它不见了"的时刻。
+    /// 存活时间因此是 `gone_at − first_seen_at`;`last_seen_at` 要是还停在
+    /// 上一次回查那一刻,同一条挂单的存活时间会短掉整整一个回查间隔。
+    #[test]
+    fn marking_gone_at_a_known_moment_pulls_last_seen_back_to_it() {
+        let store = store();
+        let id = obs("o-1");
+        let item = listing("aaa", divine(20_000), &[]);
+        store.record_seen(&id, &item, 1_000).expect("record");
+        // 中间回查过一次,它还在。
+        store
+            .touch_listings(&id, &["aaa".to_string()], 5_000)
+            .expect("touch");
+
+        // 下一次回查:verified = false,而服务端说它 6_200 那一刻就不见了。
+        store
+            .mark_gone_at(&id, "aaa", 6_200, GoneClass::SoldLikely)
+            .expect("gone");
+        let row = store
+            .observed_listing(&id, "aaa")
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.status, ObservedStatus::Gone);
+        assert_eq!(row.gone_at, Some(6_200));
+        assert_eq!(row.last_seen_at, 6_200, "最后一次见到 = 它走的那一刻");
+        assert_eq!(row.observed_lifetime_secs(), 5_200);
+
+        // 已经标成没了的行不该被第二次改写(和 `mark_gone` 同一条纪律)。
+        store
+            .mark_gone_at(&id, "aaa", 9_000, GoneClass::Unknown)
+            .expect("gone");
+        let row = store
+            .observed_listing(&id, "aaa")
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.gone_at, Some(6_200));
+        assert_eq!(row.gone_class, Some(GoneClass::SoldLikely));
     }
 
     /// 标成没了之后,再看见它就得复活 —— "它还在"是眼见为实的事。
@@ -1692,7 +1784,9 @@ mod observe_tests {
             .record_seen(&one, &listing("c", divine(1_000), &[]), 5_000)
             .expect("record");
 
-        let due = store.due_listings(1_600, 10).expect("due");
+        let due = store
+            .due_listings(1_600, 10, &BTreeSet::new())
+            .expect("due");
         assert_eq!(
             due.iter()
                 .map(|entry| (entry.obs_id.to_string(), entry.listing_id.as_str()))
@@ -1704,19 +1798,61 @@ mod observe_tests {
         assert_eq!(due[0].check_rung, 0);
 
         // 上限砍掉尾巴,留下的是最该查的那条。
-        assert_eq!(store.due_listings(1_600, 1).expect("due").len(), 1);
+        assert_eq!(
+            store
+                .due_listings(1_600, 1, &BTreeSet::new())
+                .expect("due")
+                .len(),
+            1
+        );
         // 已经没了的挂单不再花额度。
         store
             .mark_gone(&two, "b", 1_500, GoneClass::SoldLikely)
             .expect("gone");
         assert_eq!(
             store
-                .due_listings(1_600, 10)
+                .due_listings(1_600, 10, &BTreeSet::new())
                 .expect("due")
                 .iter()
                 .map(|entry| entry.listing_id.clone())
                 .collect::<Vec<_>>(),
             vec!["a".to_string()]
+        );
+    }
+
+    /// **在途的那几条不能把名额占死。**
+    ///
+    /// 一批回查发出去之后,那几条挂单的 `next_check_at` 要等回信才往前挪。
+    /// 万一那封回信丢了(关机、actor 先走一步),它们会永远排在"最早该查"
+    /// 的最前面 —— 先 `LIMIT` 后筛的话,每一轮扫描捞上来的正好是这几条,
+    /// 筛完一条不剩,后面的挂单一辈子轮不上,整条回查线就此停摆。
+    ///
+    /// 所以跳过要在取数**里面**做:多取几行,再把在途的挑出去。
+    #[test]
+    fn in_flight_listings_do_not_starve_the_ones_behind_them() {
+        let store = store();
+        let id = obs("o-1");
+        for (listing_id, at) in [("a", 1_000), ("b", 1_100), ("c", 1_200)] {
+            store
+                .record_seen(&id, &listing(listing_id, divine(1_000), &[]), at)
+                .expect("record");
+        }
+        // 三条都到点了(第一档是 +600 秒)。
+        let none = BTreeSet::new();
+        assert_eq!(store.due_listings(2_000, 3, &none).expect("due").len(), 3);
+
+        // "a" 那一批还在路上,而这一轮只问得起两条:该问的是 b 和 c,
+        // 不是"捞出 a、b 再把 a 筛掉"剩下的那一条。
+        let in_flight: BTreeSet<(ObservationId, String)> =
+            [(id.clone(), "a".to_string())].into_iter().collect();
+        assert_eq!(
+            store
+                .due_listings(2_000, 2, &in_flight)
+                .expect("due")
+                .iter()
+                .map(|entry| entry.listing_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["b".to_string(), "c".to_string()]
         );
     }
 
@@ -1737,8 +1873,19 @@ mod observe_tests {
             .expect("read")
             .expect("row");
         assert_eq!((row.check_rung, row.next_check_at), (1, 2_800));
-        assert!(store.due_listings(2_000, 10).expect("due").is_empty());
-        assert_eq!(store.due_listings(2_800, 10).expect("due").len(), 1);
+        assert!(
+            store
+                .due_listings(2_000, 10, &BTreeSet::new())
+                .expect("due")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .due_listings(2_800, 10, &BTreeSet::new())
+                .expect("due")
+                .len(),
+            1
+        );
 
         // 七天到了:`None` = 不再回查,哪怕过一年再问也不该冒出来。
         store.advance_rung(&id, "aaa", 9, None).expect("advance");
@@ -1752,7 +1899,7 @@ mod observe_tests {
         );
         assert!(
             store
-                .due_listings(i64::MAX - 1, 10)
+                .due_listings(i64::MAX - 1, 10, &BTreeSet::new())
                 .expect("due")
                 .is_empty()
         );
@@ -1830,7 +1977,9 @@ mod observe_tests {
         store.mark_gone(&one, "b", 1_100, GoneClass::Unknown).ok();
 
         assert_eq!(store.mark_all_due(&one, 1_200).expect("due"), 1);
-        let due = store.due_listings(1_200, 10).expect("due");
+        let due = store
+            .due_listings(1_200, 10, &BTreeSet::new())
+            .expect("due");
         assert_eq!(
             due.iter()
                 .map(|entry| entry.listing_id.clone())

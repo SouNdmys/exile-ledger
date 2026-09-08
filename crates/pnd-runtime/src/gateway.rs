@@ -20,7 +20,7 @@ use pnd_domain::{ListingSummary, ObservationId, WatchId};
 use pnd_trade::{
     BucketUsage, Budget, FETCH_POLICY, RateLimiter, SEARCH_POLICY, TradeClient, TradeResponse,
     TransportError, backoff_after_429, parse_fetch_response, parse_fetch_response_by_id,
-    parse_search_response,
+    parse_fetch_response_slots, parse_search_response,
 };
 use thiserror::Error;
 
@@ -142,6 +142,9 @@ pub struct RequestTag {
     pub obs_id: Option<ObservationId>,
     pub alert_id: Option<i64>,
     pub sweep_id: Option<u64>,
+    /// 一张 live 把手的编号。一张票一封请求,而回信里的挂单带的是它们自己的
+    /// id —— 和请求对不上号,所以"这封回信是替哪张票问的"只能记在这里。
+    pub handle_id: Option<u64>,
     pub label: &'static str,
 }
 
@@ -154,6 +157,7 @@ impl RequestTag {
             obs_id: None,
             alert_id: None,
             sweep_id: None,
+            handle_id: None,
             label,
         }
     }
@@ -166,6 +170,7 @@ impl RequestTag {
             obs_id: Some(obs_id),
             alert_id: None,
             sweep_id: None,
+            handle_id: None,
             label,
         }
     }
@@ -178,6 +183,20 @@ impl RequestTag {
             obs_id: None,
             alert_id: None,
             sweep_id: Some(sweep_id),
+            handle_id: None,
+            label,
+        }
+    }
+
+    /// 一张 live 把手换回来的那一封。
+    #[must_use]
+    pub fn handle(handle_id: u64, label: &'static str) -> RequestTag {
+        RequestTag {
+            watch_id: None,
+            obs_id: None,
+            alert_id: None,
+            sweep_id: None,
+            handle_id: Some(handle_id),
             label,
         }
     }
@@ -190,6 +209,7 @@ impl RequestTag {
             obs_id: None,
             alert_id: Some(alert_id),
             sweep_id: None,
+            handle_id: None,
             label,
         }
     }
@@ -202,12 +222,48 @@ impl RequestTag {
             obs_id: None,
             alert_id: None,
             sweep_id: None,
+            handle_id: None,
             label,
         }
     }
 }
 
-/// 四种请求。请求体已经拼好了:网关不认识查询 JSON 长什么样。
+/// live 推来的一张"把手"(整张 JWT),原样填进 fetch 的路径里换挂单。
+///
+/// 包一层只为一件事:**它绝不能进日志**。这串东西代表这次订阅,和挂单 id
+/// 那种公开信息不是一回事,而 [`RequestKind`] 是会被 `{:?}` 打出来的
+/// (测试失败、以后加的调试行)。所以 `Debug` 只说它有多长。
+/// 同一条纪律在 `pnd_trade::live::LiveMessage` 上也有一份。
+#[derive(Clone, PartialEq, Eq)]
+pub struct LiveHandle(pub String);
+
+impl LiveHandle {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// 这张把手换不回东西时,拿什么名字把这一笔记在库里。
+    ///
+    /// 不能拿 token 本身当挂单 id:它有 900 个字符、14 秒后就没意义了,而且
+    /// 是凭证。哈希取前 16 位十六进制 —— 同一张票永远算出同一个名字(同一帧
+    /// 重放不会记成两条),而两张不同的票撞名的可能性可以忽略。
+    #[must_use]
+    pub fn synthetic_id(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.0.hash(&mut hasher);
+        format!("handle-{:016x}", hasher.finish())
+    }
+}
+
+impl std::fmt::Debug for LiveHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<live handle, {} chars>", self.0.chars().count())
+    }
+}
+
+/// 五种请求。请求体已经拼好了:网关不认识查询 JSON 长什么样。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestKind {
     Search {
@@ -237,6 +293,20 @@ pub enum RequestKind {
     /// 都拖着一份 id 清单。
     FetchByIds {
         ids: Vec<String>,
+        search_id: String,
+    },
+    /// live 推来的一张把手换一次 fetch。
+    ///
+    /// 发出去的 HTTP 请求和 `Fetch` 一模一样(把手填在 id 的位置上),
+    /// **要的答案又不一样**:回信按位置读,`null` 那一格也留着。
+    ///
+    /// 为什么不能按 id 对号:把手是一张 JWT,而回来的挂单带的是它们自己的
+    /// 64 位十六进制 id,两者永远对不上 —— 按 id 对号的话每一条推送都会被
+    /// 记成"第一眼就没了"。为什么不能一次塞十张:一张就有 900 多个字符,
+    /// 十张拼进一个 URL 是 9KB,没有人验过服务端认不认;而且票只活 14 秒,
+    /// 攒一批的功夫它就废了。**一张一封。**
+    FetchHandle {
+        handle: LiveHandle,
         search_id: String,
     },
     Whisper {
@@ -307,6 +377,23 @@ pub enum GatewayError {
     Cancelled,
 }
 
+/// 一次传输层失败 → 一封回信里的错误。
+///
+/// 存在的理由只有一个:[`TransportError::Unreachable`] 的 `Display` **已经**
+/// 是"could not reach the trade site: …",而 [`GatewayError::Transport`] 自己
+/// 又要加一遍同样的开头。直接 `Transport(error.to_string())` 的结果是状态栏上
+/// 那句 `could not reach the trade site: could not reach the trade site: io: …`,
+/// 一句话说两遍,真正的原因被挤到了后面。
+///
+/// 所以这里只取里面那句细节,前缀留给 `GatewayError` 加一次;别的几种传输
+/// 错误自己没有这个开头,照旧整句带上。
+fn transport_error(error: &TransportError) -> GatewayError {
+    match error {
+        TransportError::Unreachable(detail) => GatewayError::Transport(detail.clone()),
+        other => GatewayError::Transport(other.to_string()),
+    }
+}
+
 /// `Status` 的 `Display` 后缀:body 有话说才带上,空的就只报状态码。
 fn excerpt_suffix(excerpt: &str) -> String {
     if excerpt.is_empty() {
@@ -325,6 +412,9 @@ pub enum ReplyKind {
     /// 按请求时的 id 顺序逐个对号,`None` = 那条挂单没了。见
     /// [`RequestKind::FetchByIds`]。
     FetchByIds(Result<Vec<(String, Option<ListingSummary>)>, GatewayError>),
+    /// 一张把手换回来的东西,**按位置**读:一格一件,`null` 那一格是 `None`。
+    /// 一张票可能换回 1 到 3 件。见 [`RequestKind::FetchHandle`]。
+    FetchSlots(Result<Vec<Option<ListingSummary>>, GatewayError>),
     /// whisper 只回一个状态码:200 = 发出去了,503 多半是 token 过期。
     Whisper(Result<u16, GatewayError>),
 }
@@ -462,7 +552,9 @@ fn policy_for(kind: &RequestKind) -> &'static str {
     match kind {
         // 会话检查发的就是一次 search,它当然要从 search 的预算里出。
         RequestKind::Search { .. } | RequestKind::SessionCheck { .. } => SEARCH_POLICY,
-        RequestKind::Fetch { .. } | RequestKind::FetchByIds { .. } => FETCH_POLICY,
+        RequestKind::Fetch { .. }
+        | RequestKind::FetchByIds { .. }
+        | RequestKind::FetchHandle { .. } => FETCH_POLICY,
         RequestKind::Whisper { .. } => WHISPER_POLICY_PLACEHOLDER,
     }
 }
@@ -692,6 +784,12 @@ impl TradeGateway {
             RequestKind::Fetch { ids, search_id } | RequestKind::FetchByIds { ids, search_id } => {
                 self.transport.fetch(ids, search_id, session.as_deref())
             }
+            // 把手就填在 id 的位置上 —— 发出去的请求和上面那两种一模一样。
+            RequestKind::FetchHandle { handle, search_id } => self.transport.fetch(
+                std::slice::from_ref(&handle.0),
+                search_id,
+                session.as_deref(),
+            ),
             // 上面那道闸已经保证了这里一定有会话。
             RequestKind::Whisper { token, referer } => {
                 self.transport
@@ -717,7 +815,7 @@ impl TradeGateway {
                     self.queue.push(pending);
                     return;
                 }
-                self.reply(pending, GatewayError::Transport(error.to_string()));
+                self.reply(pending, transport_error(&error));
                 return;
             }
         };
@@ -870,6 +968,10 @@ fn success_reply(kind: &RequestKind, response: &TradeResponse) -> ReplyKind {
             parse_fetch_response_by_id(ids, &response.body)
                 .map_err(|error| GatewayError::Parse(error.to_string())),
         ),
+        RequestKind::FetchHandle { .. } => ReplyKind::FetchSlots(
+            parse_fetch_response_slots(&response.body)
+                .map_err(|error| GatewayError::Parse(error.to_string())),
+        ),
         RequestKind::Whisper { .. } => ReplyKind::Whisper(Ok(response.status)),
     }
 }
@@ -880,6 +982,7 @@ fn error_reply(kind: &RequestKind, error: GatewayError) -> ReplyKind {
         RequestKind::SessionCheck { .. } => ReplyKind::SessionCheck(Err(error)),
         RequestKind::Fetch { .. } => ReplyKind::Fetch(Err(error)),
         RequestKind::FetchByIds { .. } => ReplyKind::FetchByIds(Err(error)),
+        RequestKind::FetchHandle { .. } => ReplyKind::FetchSlots(Err(error)),
         RequestKind::Whisper { .. } => ReplyKind::Whisper(Err(error)),
     }
 }
@@ -1055,6 +1158,35 @@ mod gateway_tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// "连不上交易站"这句话只该说一遍。
+    ///
+    /// `TransportError::Unreachable` 的 `Display` 已经带着这个开头,而
+    /// `GatewayError::Transport` 自己也要加一个 —— 于是观察页那一格里写的是
+    /// `could not reach the trade site: could not reach the trade site: io: …`,
+    /// 真正的原因(`io: unexpected end of file`)被挤到了句子最后面。
+    #[test]
+    fn the_unreachable_sentence_is_only_said_once() {
+        let (transport, _calls) = FlakyTrade::new(9);
+        let (mut gateway, _events) = offline_gateway(transport);
+        let (pending, replies) = queued(RequestKind::FetchByIds {
+            ids: vec!["a".to_string()],
+            search_id: "q".to_string(),
+        });
+
+        gateway.execute(pending, 1_000);
+        let retry = gateway.queue.remove(0);
+        gateway.execute(retry, 1_001);
+
+        let reply = replies.try_recv().expect("该回一封失败的信");
+        let ReplyKind::FetchByIds(Err(error)) = reply.kind else {
+            panic!("{:?}", reply.kind)
+        };
+        assert_eq!(
+            error.to_string(),
+            "could not reach the trade site: io: unexpected end of file"
+        );
     }
 
     /// whisper 不重试。它是唯一一个会在**游戏里**留下痕迹的请求(传送邀请),

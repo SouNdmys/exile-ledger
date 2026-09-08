@@ -107,6 +107,7 @@ mod decide_tests {
             online: true,
             afk: false,
             indexed: "2026-09-06T12:00:00Z".to_string(),
+            verified: true,
             whisper: "@Char hi".to_string(),
             whisper_token: None,
             hideout_token: None,

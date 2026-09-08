@@ -220,6 +220,74 @@ pub fn fetch_listing_cap(
     (per_cycle * fetch_batch as u64) as usize
 }
 
+/// 出生登记的令牌桶最多攒几张票。
+///
+/// 五张而不是一张:秒推是一阵一阵来的(同一秒里推三条很常见),桶空着的时候
+/// 一条也接不住就太笨了。也不能更大 —— 攒得越多,一阵爆发就能把半个窗口的
+/// 抓取额度一次性烧光,而那份额度还要养着回查扫描。
+pub const BIRTH_BUCKET_CAPACITY: f64 = 5.0;
+
+/// 秒推来的新挂单能花掉多少抓取额度。
+///
+/// 为什么非要有这道闸:一张 live 把手换一次 fetch,而 6 小时 1000 次的一半
+/// 只有 499 次 —— 平摊下来**每分钟 1.4 次**,还要和所有蹲价、所有 discover、
+/// 所有回查扫描分。主人那条碑牌搜索一分钟推 6 到 9 条。照单全收的话,不出
+/// 十分钟额度就见底,然后所有请求一起排队,排到把手 14 秒的有效期过完 ——
+/// 花光了额度,一条挂单也没记下来。
+///
+/// 所以接不住的那些**当场丢掉**,不排队:在挂单出生那一刻丢是无偏的
+/// (`sample_every` 同理),而排队补抓会系统性地漏掉卖得最快的那批货 ——
+/// 等轮到它,它早没了,而那正是我们要量的东西。
+///
+/// 一半给出生登记,另一半留给回查扫描:少了哪一边这条观察都不成立
+/// (一边记下新货,一边看它们最后怎么样了)。
+///
+/// 纯逻辑,不碰时钟:`now` 一律由调用方传进来。
+#[derive(Debug, Clone)]
+pub struct BirthBudget {
+    tokens: f64,
+    capacity: f64,
+    /// 每秒回多少张票 = 窗口额度的一半 ÷ 窗口秒数。
+    refill_per_sec: f64,
+    /// 上一次算到哪一刻。`None` = 还没花过,第一次 `take` 时对表。
+    last_at: Option<i64>,
+}
+
+impl BirthBudget {
+    /// `fetch_budget_per_window` 是我们自己那份额度(已经打过 50% 折的那个数),
+    /// `window_secs` 是它对应的窗口。桶是满的:开机头几条推送该接得住。
+    #[must_use]
+    pub fn new(fetch_budget_per_window: u32, window_secs: u32) -> BirthBudget {
+        let window = f64::from(window_secs.max(1));
+        BirthBudget {
+            tokens: BIRTH_BUCKET_CAPACITY,
+            capacity: BIRTH_BUCKET_CAPACITY,
+            refill_per_sec: f64::from(fetch_budget_per_window) / 2.0 / window,
+            last_at: None,
+        }
+    }
+
+    /// 花掉一张票。`false` = 这一条推送买不起,丢掉它。
+    pub fn take(&mut self, now: i64) -> bool {
+        let last = self.last_at.unwrap_or(now);
+        // 时钟往回跳(改过系统时间)时不倒扣:`max(0)`。
+        let elapsed = (now - last).max(0) as f64;
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        self.last_at = Some(now);
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+
+    /// 桶里还剩几张(给日志和测试看)。
+    #[must_use]
+    pub fn tokens(&self) -> f64 {
+        self.tokens
+    }
+}
+
 #[cfg(test)]
 mod observe_tests {
     use super::*;
@@ -345,6 +413,64 @@ mod observe_tests {
         // 不在表上的观察做什么都不该 panic。
         scheduler.defer(&obs("a"), 0);
         scheduler.run_now(&obs("a"), 0);
+    }
+
+    /// 一阵爆发最多接住五条,第六条当场丢掉。
+    ///
+    /// 主人那条搜索一分钟推 6 到 9 条,而一张把手就是一次 fetch —— 照单全收
+    /// 十分钟就能把 6 小时的额度烧光,然后所有请求一起排队,排到把手 14 秒的
+    /// 有效期过完:额度花光了,一条挂单也没记下来。
+    #[test]
+    fn a_burst_of_pushes_is_capped_at_the_bucket_size() {
+        let mut budget = BirthBudget::new(499, 21_600);
+        for index in 0..5 {
+            assert!(budget.take(1_000), "第 {index} 条该接住");
+        }
+        assert!(!budget.take(1_000), "同一秒里第六条买不起了");
+    }
+
+    /// 票是按"抓取额度的一半"慢慢回的。
+    ///
+    /// 6 小时 499 次的一半 = 249.5 次,摊到 21600 秒 = 每 86.6 秒一张。
+    /// 也就是说秒推那条路平均一分半才抓得起一条 —— 剩下那一半额度是留给
+    /// 回查扫描的,两边谁也不能把对方饿死。
+    #[test]
+    fn the_bucket_refills_at_half_the_fetch_budget() {
+        let mut budget = BirthBudget::new(499, 21_600);
+        for _ in 0..5 {
+            assert!(budget.take(1_000));
+        }
+        assert!(!budget.take(1_086), "86 秒还差一点点");
+        assert!(budget.take(1_087), "87 秒攒够一张");
+        assert!(!budget.take(1_087), "花掉了就又空了");
+    }
+
+    /// 攒不过头:离开三个小时再回来,桶也只有五张。
+    ///
+    /// 没有这个上限的话,程序在后台挂一夜,早上第一阵推送就能把整个窗口的
+    /// 抓取额度一次性烧光。
+    #[test]
+    fn a_long_quiet_spell_does_not_bank_more_than_the_capacity() {
+        let mut budget = BirthBudget::new(499, 21_600);
+        for _ in 0..5 {
+            assert!(budget.take(1_000));
+        }
+        for index in 0..5 {
+            assert!(budget.take(1_000_000), "睡醒之后第 {index} 条");
+        }
+        assert!(!budget.take(1_000_000), "最多还是五张");
+        assert!(budget.tokens() < 1.0);
+    }
+
+    /// 额度小到回票比一次推送还慢也不该 panic 或者除零。
+    #[test]
+    fn a_tiny_budget_just_means_almost_everything_is_dropped() {
+        let mut budget = BirthBudget::new(1, 0);
+        assert!(budget.take(0), "开机那一桶还是满的");
+        for _ in 0..4 {
+            assert!(budget.take(0));
+        }
+        assert!(!budget.take(0));
     }
 
     /// 抓取额度的分账。默认配置下这条上限碰不到,它是给"十条观察"那天兜底的。
