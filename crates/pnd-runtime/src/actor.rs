@@ -805,8 +805,12 @@ impl RuntimeActor {
                 self.travel_to_hideout(alert_id, now);
             }
             RuntimeCommand::TestSession => self.test_session(),
+            // 用户自己按的那一下:秒推连着也照发一轮,所以走的是**不让路**的
+            // 那条路。`run_now` 照旧留着 —— 上一轮正卡在路上的时候这一下发不
+            // 出去,把时间表停在此刻,主循环下一圈还能替他再试一次。
             RuntimeCommand::DiscoverNow { obs_id } => {
                 self.observe_scheduler.run_now(&obs_id, now);
+                self.discover_now(&obs_id, now);
             }
             // "立刻回查一次" = 把这条观察在册的挂单全部推到此刻到期,
             // 然后照常走那一条扫描的路(同一份额度、同样分批)。
@@ -1917,11 +1921,41 @@ impl RuntimeActor {
         );
     }
 
-    /// 兜底那一轮的第一步:一次 search,按上架时间倒序拿最新的一批 id。
+    /// 到点了的那一轮兜底 discover。**秒推连着的时候它什么都不做。**
     ///
-    /// 秒推连着的时候这一轮基本上什么都抓不到(该知道的早知道了),那正是
-    /// 它该有的样子 —— 它补的是 WebSocket 断线重连那几十秒里上架的挂单。
+    /// 让路的理由是统计,不是省额度(虽然也省):这条观察要回答的是"什么样的
+    /// 货卖得掉",而那要的是挂单**出生**那一刻的样本 —— 秒推是在它上架那一秒
+    /// 知道它的,所以卖 30 秒的和挂一周的被抽中的机会一样大。搜索只回**还活着**
+    /// 的挂单,轮询捞到的那一批天生偏向卖不掉的那些(十分钟一次算轻的,但偏
+    /// 是真的偏)。两条路都往同一张表里写,统计就掺了两种样本。
+    ///
+    /// 判断只看**这一刻**这条观察的 live 档位:连着就让开,别的档(没开、
+    /// 没会话、退避重连中、还没连上)都照跑。所以断线那一轮自然就把缺口补上了,
+    /// 连回来的下一轮又让开 —— 不需要记"刚才断过没有",一个状态机都不用加。
+    ///
+    /// 让开的那一轮照样把自己往后排一轮:界面上"新挂单 mm:ss"那个倒计时
+    /// 还得走得下去。
     fn start_discover(&mut self, obs_id: &ObservationId, now: i64) {
+        let live_covered = self
+            .observations
+            .get(obs_id)
+            .is_some_and(|runtime| runtime.status.live.is_connected());
+        if live_covered {
+            self.observe_scheduler.defer(obs_id, now);
+            self.refresh_observe_schedule(obs_id);
+            // 不写日志:这是十分钟一次、永远重复的常态,而这个程序只有一档
+            // 给用户看的日志 —— 把它填满,真出事那一行就没人看得见了。
+            self.emit_observation_status(obs_id);
+            return;
+        }
+        self.discover_now(obs_id, now);
+    }
+
+    /// 真发那一轮 discover 的第一步:一次 search,按上架时间倒序拿最新的一批 id。
+    ///
+    /// 和上面那一层分开,是因为"立刻找一次新的"那个按钮不受秒推让路的管:
+    /// 那是用户自己按的一下,他要的就是现在去看一眼。
+    fn discover_now(&mut self, obs_id: &ObservationId, now: i64) {
         let Some(runtime) = self.observations.get_mut(obs_id) else {
             return;
         };
@@ -5994,6 +6028,170 @@ mod actor_tests {
             logged(&seen, &["observation", "no live connection left"]),
             "被挤下来要说一句为什么:{seen:#?}"
         );
+    }
+
+    // ---- 秒推连着的时候兜底轮询让路 --------------------------------------
+
+    /// 一个**手动驱动**的 actor:没有主循环,测试自己说"这一轮 discover 到点了"。
+    ///
+    /// 兜底轮询让不让路,看的是**到点那一刻**这条观察的 live 档位。真起一条
+    /// 主循环的话那一刻是抢出来的(worker 什么时候把"连上了"报进邮箱算它的
+    /// 运气),时序钉不死;手里攥着 actor 就没有这个问题。
+    fn manual_actor(
+        settings: AppSettings,
+        transport: Box<dyn TradeTransport>,
+        connector: &Arc<ScriptedConnector>,
+    ) -> (RuntimeActor, Receiver<Inbox>, Receiver<RuntimeEvent>) {
+        let (events, event_rx) = channel();
+        let (inbox, inbox_rx) = channel();
+        let mut actor = RuntimeActor::new(
+            settings,
+            RuntimePaths::in_memory().open().expect("store"),
+            transport,
+            shared(connector),
+            None,
+            events,
+            inbox,
+        );
+        actor.apply_initial_settings();
+        (actor, inbox_rx, event_rx)
+    }
+
+    /// 等假交易站收够这么多次 search(或者超时)。
+    fn wait_for_searches(log: &Arc<Mutex<TradeLog>>, wanted: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while log.lock().unwrap().searches < wanted && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            log.lock().unwrap().searches,
+            wanted,
+            "等不到第 {wanted} 次 search"
+        );
+    }
+
+    /// 把网关的一封回信喂给手动驱动的 actor。
+    ///
+    /// 没有主循环替它抽邮箱,而不喂的话 `discover_in_flight` 会一直挂着,
+    /// 下一轮 discover 永远起不来。
+    fn pump_reply(actor: &mut RuntimeActor, inbox: &Receiver<Inbox>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok(Inbox::Reply(reply)) = inbox.recv_timeout(Duration::from_millis(50)) {
+                actor.handle_reply(reply);
+                return;
+            }
+        }
+        panic!("等不到网关的回信");
+    }
+
+    /// 秒推连着的时候,兜底那一轮**一次搜索都不发**,只把自己往后排一轮。
+    ///
+    /// 为什么:这条观察要回答的是"什么样的货卖得掉",而那要的是**出生**那一刻
+    /// 的样本。秒推是在挂单上架那一秒知道它的,所以卖 30 秒的和挂一周的被抽中
+    /// 的机会一样大;搜索只回**还活着**的挂单,轮询捞到的那一批天然偏向卖不掉
+    /// 的那些。两条路都往库里写,统计就掺了两种样本 —— 还白花三次抓取额度。
+    #[test]
+    fn a_connected_live_socket_skips_the_backstop_discover() {
+        let (transport, log) = FakeTrade::new();
+        let (settings, obs_id) = observe_settings("Choir of the Storm");
+        let connector = Arc::new(ScriptedConnector::new());
+        let (mut actor, _inbox_rx, _event_rx) = manual_actor(settings, transport, &connector);
+
+        let now = now_secs();
+        actor.set_observation_live_state(&obs_id, LiveRunState::Connected { since: now });
+        actor.start_discover(&obs_id, now);
+
+        // 网关线程要是收到了那封搜索,200 毫秒足够它发出去。
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(log.lock().unwrap().searches, 0, "秒推连着就不该发搜索");
+        assert!(
+            !actor.observations[&obs_id].discover_in_flight,
+            "什么都没发出去,就不该有一轮挂在路上"
+        );
+
+        // 但时间表照走:界面上"新挂单 mm:ss"那个倒计时还得是真的。
+        let entry = actor
+            .observe_scheduler
+            .entry(&obs_id)
+            .expect("still on the timetable");
+        assert_eq!(entry.next_discover_at, now + entry.discover_interval as i64);
+        assert_eq!(
+            actor.observations[&obs_id].status.next_discover_at,
+            Some(entry.next_discover_at),
+            "界面拿到的也该是排好的那一刻"
+        );
+    }
+
+    /// 开机第一轮:秒推**还没连上**,兜底那一轮照跑。
+    ///
+    /// 让路只看"此刻连着没有",而开机那一刻 worker 才刚起。这一轮要是也让开,
+    /// 新加的一条观察在 WebSocket 连上之前就是个空壳。
+    #[test]
+    fn the_first_discover_runs_before_live_has_connected() {
+        let (transport, log) = FakeTrade::new();
+        let (settings, obs_id) = observe_live_settings("Choir of the Storm");
+        let connector = Arc::new(ScriptedConnector::new());
+        let (mut actor, _inbox_rx, _event_rx) = manual_actor(settings, transport, &connector);
+
+        // worker 起来了,可它报上来的档位还在邮箱里躺着 —— 此刻只是"连接中"。
+        assert_eq!(
+            actor.observations[&obs_id].status.live,
+            LiveRunState::Connecting
+        );
+        actor.start_discover(&obs_id, now_secs());
+        wait_for_searches(&log, 1);
+    }
+
+    /// 断了就补一轮,连回来又让开 —— 不需要记"刚才断过没有"。
+    #[test]
+    fn a_live_drop_lets_the_backstop_discover_run_once_more() {
+        let (transport, log) = FakeTrade::new();
+        // 兜底那一轮什么都别找到:这里要看的是"发没发出那封搜索"。
+        log.lock().unwrap().search_ids = Some(Vec::new());
+        let (settings, obs_id) = observe_settings("Choir of the Storm");
+        let connector = Arc::new(ScriptedConnector::new());
+        let (mut actor, inbox_rx, _event_rx) = manual_actor(settings, transport, &connector);
+
+        let now = now_secs();
+        actor.set_observation_live_state(&obs_id, LiveRunState::Connected { since: now });
+        actor.start_discover(&obs_id, now);
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(log.lock().unwrap().searches, 0, "连着的时候让开");
+
+        // 断了:这一轮把断线那几十秒的缺口补上。
+        actor.set_observation_live_state(
+            &obs_id,
+            LiveRunState::Backoff {
+                until: now + 5,
+                attempt: 0,
+            },
+        );
+        actor.start_discover(&obs_id, now + 600);
+        wait_for_searches(&log, 1);
+        pump_reply(&mut actor, &inbox_rx);
+        assert!(!actor.observations[&obs_id].discover_in_flight);
+
+        // 连回来了:下一轮又让开。
+        actor.set_observation_live_state(&obs_id, LiveRunState::Connected { since: now + 700 });
+        actor.start_discover(&obs_id, now + 1_200);
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(log.lock().unwrap().searches, 1, "连回来之后不该再发第二封");
+    }
+
+    /// "立刻找一次新的"是用户自己按的那一下:秒推连着也照发。
+    #[test]
+    fn discover_now_runs_even_while_live_is_connected() {
+        let (transport, log) = FakeTrade::new();
+        let (settings, obs_id) = observe_settings("Choir of the Storm");
+        let connector = Arc::new(ScriptedConnector::new());
+        let (mut actor, _inbox_rx, _event_rx) = manual_actor(settings, transport, &connector);
+
+        actor.set_observation_live_state(&obs_id, LiveRunState::Connected { since: now_secs() });
+        actor.handle_command(RuntimeCommand::DiscoverNow {
+            obs_id: obs_id.clone(),
+        });
+        wait_for_searches(&log, 1);
     }
 
     // ---- 回查阶梯 ------------------------------------------------------
