@@ -154,6 +154,51 @@ pub fn next_check_after(first_seen: i64, rung: u32, recheck_interval_secs: u64) 
     (!is_stale(first_seen, at)).then_some(at)
 }
 
+/// 价位阶梯的下界,单位是**整个**通货(不是千分整数)。
+///
+/// 为什么疏密不均:10 以下每一格都是一个真实的心理价位("2 divine 的碑牌"
+/// 和"3 divine 的碑牌"是两批货,卖家也是照这个数在标价);而 100 以上再
+/// 分细只会把本来就不多的样本摊成每档一两条,什么结论都撑不起来。
+pub const PRICE_BUCKET_UNITS: [i64; 22] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30, 50, 75, 100, 150, 200, 300, 500, 1_000,
+];
+
+/// 一个价位档。记的是这一档的**下界**(千分整数),不是区间两头:
+/// 上界永远是下一档的下界,存两个数就会有对不上的那一天。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PriceBucket {
+    pub lower_bound_milli: i64,
+}
+
+impl PriceBucket {
+    /// 是不是最低那一档。
+    ///
+    /// 单独问一句是因为它的写法和别的档不一样:界面上要写「不到 1 divine」,
+    /// 写成「0 divine」会读成"白送"。
+    #[must_use]
+    pub fn is_under_one(self) -> bool {
+        self.lower_bound_milli == 0
+    }
+}
+
+/// 一个价落在哪一档:阶梯上不大于它的那个最大下界。
+///
+/// 为什么要分档:观察攒下来的价格是一堆散点(2.5、2.8、3、3.2 divine),
+/// 一个一个数过去每个价都只有一两条,看不出"2 divine 那一批出得掉、
+/// 3 divine 那一批堆着"。归了档才数得动。
+#[must_use]
+pub fn price_bucket(amount_milli: i64) -> PriceBucket {
+    let mut lower_bound_milli = 0;
+    for units in PRICE_BUCKET_UNITS {
+        let bound = units * 1_000;
+        if bound > amount_milli {
+            break;
+        }
+        lower_bound_milli = bound;
+    }
+    PriceBucket { lower_bound_milli }
+}
+
 /// 消失之前有没有降过价。
 ///
 /// 只认**降**价:涨价说明卖家觉得还能卖更贵,那和"降到有人肯买"完全是
@@ -328,6 +373,42 @@ mod observe_tests {
                 classify_gone(first, last, gone, &[(first, 20_000)]),
                 GoneClass::GoneBeforeFirstLook
             );
+        }
+    }
+
+    /// 一个价落进哪一档,边界要钉死:挪错一格,"2 divine 的货卖得掉"这个
+    /// 结论就会被记到 3 divine 头上。
+    #[test]
+    fn a_price_falls_into_the_greatest_bound_below_it() {
+        let bound = |milli| price_bucket(milli).lower_bound_milli;
+        // 不到 1 的全在最低那一档,负数(读坏的行)也是。
+        assert_eq!(bound(0), 0);
+        assert_eq!(bound(500), 0, "0.5 → 不到 1");
+        assert_eq!(bound(999), 0);
+        assert_eq!(bound(-1), 0, "无价单的哨兵不该冒到别的档去");
+        // 整 1 就进 1 那一档。
+        assert_eq!(bound(1_000), 1_000);
+        assert_eq!(bound(1_999), 1_000);
+        assert_eq!(bound(2_000), 2_000);
+        assert_eq!(bound(2_500), 2_000, "2.5 divine 算 2 那一档");
+        // 阶梯在 10 以上开始变疏:9.999 还在 9,12 落回 10。
+        assert_eq!(bound(9_999), 9_000);
+        assert_eq!(bound(10_000), 10_000);
+        assert_eq!(bound(12_000), 10_000, "12 chaos 算 10 那一档");
+        assert_eq!(bound(14_900), 10_000);
+        assert_eq!(bound(15_000), 15_000);
+        // 顶上那一档兜住所有更贵的。
+        assert_eq!(bound(1_000_000), 1_000_000);
+        assert_eq!(bound(9_999_999), 1_000_000);
+        // 最低那一档要认得出自己 —— 它的写法和别人不一样。
+        assert!(price_bucket(500).is_under_one());
+        assert!(!price_bucket(1_000).is_under_one());
+        // 阶梯本身:严格递增,而且从 0 起步。
+        assert_eq!(PRICE_BUCKET_UNITS[0], 0);
+        assert!(PRICE_BUCKET_UNITS.windows(2).all(|pair| pair[0] < pair[1]));
+        // 每一档的下界自己落回自己那一档。
+        for units in PRICE_BUCKET_UNITS {
+            assert_eq!(bound(units * 1_000), units * 1_000, "{units} 那一档");
         }
     }
 

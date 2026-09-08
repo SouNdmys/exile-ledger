@@ -403,6 +403,20 @@ mod pages_tests {
         observations::mods_table_content_for(&outcomes, "", 1, text)
     }
 
+    /// 一档价位战绩,拿来量观察页那张价位表。
+    fn observation_price_content(text: &'static i18n::Text) -> TableContent {
+        let outcomes = vec![pnd_storage::PriceOutcome {
+            currency: "divine".to_string(),
+            bucket_milli: 2_000,
+            seen: 8,
+            gone: 6,
+            looks_sold: 6,
+            median_lifetime_secs: Some(12_600),
+            active: 2,
+        }];
+        observations::price_table_content_for(&outcomes, 1, text)
+    }
+
     /// 一条提醒历史,拿来量提醒表。
     fn alert_content(text: &'static i18n::Text) -> TableContent {
         let rows = vec![AlertRow {
@@ -437,6 +451,7 @@ mod pages_tests {
                 ("alerts", alert_content(text)),
                 ("observations", observation_content(text)),
                 ("observation mods", observation_mod_content(text)),
+                ("observation prices", observation_price_content(text)),
                 ("uniques", unique_content(text)),
                 ("mods", mod_content(text)),
             ] {
@@ -551,6 +566,7 @@ mod pages_tests {
             assert_eq!(alert_content(text).rows.len(), 1);
             assert_eq!(observation_content(text).rows.len(), 1);
             assert_eq!(observation_mod_content(text).rows.len(), 1);
+            assert_eq!(observation_price_content(text).rows.len(), 1);
             assert_eq!(unique_content(text).rows.len(), 1);
             assert_eq!(mod_content(text).rows.len(), 1);
         }

@@ -317,6 +317,8 @@ pub struct AppShell {
     pub(crate) obs_error: String,
     /// 词缀战绩表现在要求至少见过几件。
     pub(crate) obs_min_samples: u32,
+    /// 左下那块聚合表现在看的是哪一栏(词缀战绩 / 价位战绩)。
+    pub(crate) obs_agg_tab: pages::observations::AggregateTab,
     /// 挂单流现在看的是哪一栏。
     pub(crate) obs_stream_tab: pages::observations::StreamTab,
     /// 删除观察的按钮已经按过第一下了。删掉的东西找不回来,所以要按两下。
@@ -338,6 +340,9 @@ pub struct AppShell {
     pub(crate) mods_dirty: bool,
     pub(crate) observations_dirty: bool,
     pub(crate) obs_mods_dirty: bool,
+    /// 价位战绩表要重排了。和上面那个分开,是因为词缀类型下拉只筛得动
+    /// 词缀那张表 —— 换一次类型不该顺带把价位表也重排一遍。
+    pub(crate) obs_price_dirty: bool,
     /// 观察页那个词缀类型下拉的选项要重造了(读了新数据,或者换了语言)。
     pub(crate) obs_filters_dirty: bool,
     /// ninja 那几个下拉的选项要重造了(数据换了或者语言换了)。
@@ -371,6 +376,7 @@ pub struct AppShell {
     pub(crate) mods_table: Entity<TableState<SimpleTable>>,
     pub(crate) observations_table: Entity<TableState<SimpleTable>>,
     pub(crate) obs_mods_table: Entity<TableState<SimpleTable>>,
+    pub(crate) obs_price_table: Entity<TableState<SimpleTable>>,
 
     pub(crate) obs_kind_select: ChoiceSelect,
     pub(crate) uniques_partition_select: ChoiceSelect,
@@ -503,6 +509,7 @@ impl AppShell {
         })
         .detach();
         let obs_mods_table = new_table(pages::observations::mods_table_content(text), window, cx);
+        let obs_price_table = new_table(pages::observations::price_table_content(text), window, cx);
 
         // 五个下拉先按空数据造出来:库还没读呢。第一次 render 时
         // `sync_ninja_filters` 会拿真数据把它们重造一遍。
@@ -619,6 +626,7 @@ impl AppShell {
             watch_error: String::new(),
             obs_error: String::new(),
             obs_min_samples: pages::observations::DEFAULT_MIN_SAMPLES,
+            obs_agg_tab: pages::observations::AggregateTab::default(),
             obs_stream_tab: pages::observations::StreamTab::default(),
             obs_remove_armed: false,
             obs_stream_scroll: ScrollHandle::new(),
@@ -631,6 +639,7 @@ impl AppShell {
             mods_dirty: true,
             observations_dirty: true,
             obs_mods_dirty: true,
+            obs_price_dirty: true,
             obs_filters_dirty: true,
             ninja_filters_dirty: true,
             poesessid_dirty: false,
@@ -648,6 +657,7 @@ impl AppShell {
             mods_table,
             observations_table,
             obs_mods_table,
+            obs_price_table,
             obs_kind_select,
             uniques_partition_select,
             mods_class_select,
@@ -759,6 +769,10 @@ impl AppShell {
             self.rebuild_obs_mods_table(cx);
             changed = true;
         }
+        if self.obs_price_dirty {
+            self.rebuild_obs_price_table(cx);
+            changed = true;
+        }
 
         if let Some(at) = self.notice_at
             && at.elapsed() >= NOTICE_LIFETIME
@@ -856,6 +870,20 @@ impl AppShell {
         apply_content(&self.obs_mods_table, content, cx);
     }
 
+    /// 价位战绩表 = 选中那条观察按价位分的档,按样本数筛一遍。
+    ///
+    /// 不看词缀类型下拉:一件货身上有七条词缀,但只有一个价 —— 按"这一档
+    /// 里带 explicit 词缀的货"筛出来的数,分母是什么谁也说不清。
+    fn rebuild_obs_price_table(&mut self, cx: &mut Context<Self>) {
+        self.obs_price_dirty = false;
+        let content = pages::observations::price_table_content_for(
+            &self.observe.prices,
+            self.obs_min_samples,
+            self.text(),
+        );
+        apply_content(&self.obs_price_table, content, cx);
+    }
+
     /// 词缀页三个下拉现在选的是什么。空串 = "全部"。
     pub(crate) fn mods_filters(&self, cx: &App) -> (String, String, String) {
         (
@@ -940,6 +968,7 @@ impl AppShell {
         self.mods_dirty = true;
         self.observations_dirty = true;
         self.obs_mods_dirty = true;
+        self.obs_price_dirty = true;
         self.obs_filters_dirty = true;
         self.ninja_filters_dirty = true;
 

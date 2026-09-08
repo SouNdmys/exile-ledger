@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pnd_domain::{GoneClass, ListingSummary, ObservationId, Price, next_check_after};
+use pnd_domain::{GoneClass, ListingSummary, ObservationId, Price, next_check_after, price_bucket};
 use pnd_ninja::character::{line_numbers, mod_template};
 use rusqlite::{OptionalExtension, Row, params};
 
@@ -264,6 +264,35 @@ pub struct ModOutcome {
     pub median_active_price_milli: Option<i64>,
     /// 卖掉的那些从第一次见到到最后一次见到隔了多久(中位,小时)。
     pub median_hours_alive: Option<f64>,
+}
+
+/// 聚合表里的一行:某个**价位**的战绩。
+///
+/// 和 [`ModOutcome`] 是同一个问题的另一半:那张表问"什么样的货出得掉",
+/// 这张表问"什么价出得掉"。头一天的数据就说明后者一样有话说 —— 消失的
+/// 碑牌全是标 2 divine 的,而还挂着的那些中位价在 3 divine。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriceOutcome {
+    /// 这一档按哪种货币算。价位没法跨货币合并(2 divine 和 2 chaos 是两个
+    /// 世界),所以货币是分组键的一半。
+    pub currency: String,
+    /// 这一档的下界,千分整数。见 [`pnd_domain::price_bucket`]。
+    pub bucket_milli: i64,
+    /// 落在这一档的挂单见过几条。
+    pub seen: u32,
+    /// 其中已经不见了的有几条(含判成 `Unknown` 的)。
+    pub gone: u32,
+    /// 其中**看着像卖掉了**的有几条 —— [`GoneClass::looks_sold`]。
+    /// 界面上那个"疑似成交率"的分子就是它,分母是 `seen`。
+    pub looks_sold: u32,
+    /// 不见了的那些从第一次见到到最后一次见到隔了多久(中位,秒)。
+    ///
+    /// 分母是**全部**消失的挂单,不只是判成卖掉的那些:这一格回答的是
+    /// "标这个价的货能在市面上待多久",而一条挂了三分钟就撤掉的(`Unknown`)
+    /// 同样是这个价位的真实遭遇。
+    pub median_lifetime_secs: Option<i64>,
+    /// 还挂着几条。
+    pub active: u32,
 }
 
 /// 一条挂单身上的一条词缀。
@@ -899,6 +928,66 @@ impl WatchStore {
         Ok(out)
     }
 
+    /// 按**价位**聚合。词缀那张表的另一半:那个问"什么货出得掉",
+    /// 这个问"什么价出得掉"。
+    ///
+    /// 用每条挂单的**最后一个价**(`last_price_milli`,它消失时挂的那个价,
+    /// 或者它现在挂的那个价),不用第一个价:降价之后成交的,成交的是降完
+    /// 的那个价,记在原价那一档会让整档看起来比实际好卖。
+    ///
+    /// 没有货币的行整个不算(空货币 = 无价单,以及"第一眼就没了"那一批
+    /// 记下的空壳):它们连标价多少都不知道,归不进任何一档。
+    ///
+    /// 不做样本数门槛 —— 那是界面上按一下就换的东西([`ModOutcome`] 那边
+    /// 也是这么办的),回一整份让它在内存里筛。
+    pub fn price_aggregate(
+        &self,
+        obs_id: &ObservationId,
+    ) -> Result<Vec<PriceOutcome>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT currency, last_price_milli, status, gone_class, first_seen_at, last_seen_at
+             FROM observed_listings
+             WHERE obs_id = ?1 AND currency <> ''",
+        )?;
+        let rows = statement.query_map(params![obs_id.as_str()], |row| {
+            Ok(PriceAggregateRow {
+                currency: row.get(0)?,
+                price_milli: row.get(1)?,
+                status: ObservedStatus::parse(&row.get::<_, String>(2)?),
+                gone_class: row
+                    .get::<_, Option<String>>(3)?
+                    .map(|raw| GoneClass::parse(&raw)),
+                first_seen_at: row.get(4)?,
+                last_seen_at: row.get(5)?,
+            })
+        })?;
+
+        let mut buckets: BTreeMap<(String, i64), PriceAccumulator> = BTreeMap::new();
+        for row in rows {
+            let row = row?;
+            let bucket = price_bucket(row.price_milli).lower_bound_milli;
+            buckets
+                .entry((row.currency.clone(), bucket))
+                .or_default()
+                .add(&row);
+        }
+
+        let mut out: Vec<PriceOutcome> = buckets
+            .into_iter()
+            .map(|((currency, bucket_milli), bucket)| bucket.finish(currency, bucket_milli))
+            .collect();
+        // divine 先摆:这个游戏里贵重东西都拿它报价,而混进来的 chaos/exalted
+        // 多半是零星几条。同一种货币内部按档位从低到高 —— 这张表是竖着读的
+        // ("到哪个价开始卖不动"),乱序就读不出那条线。
+        out.sort_by(|left, right| {
+            currency_rank(&left.currency)
+                .cmp(&currency_rank(&right.currency))
+                .then_with(|| left.currency.cmp(&right.currency))
+                .then_with(|| left.bucket_milli.cmp(&right.bucket_milli))
+        });
+        Ok(out)
+    }
+
     /// 删掉一条观察:四张表全清。
     ///
     /// 和 `delete_watch` 不一样,这里**什么都不留**:观察攒的全部价值就在
@@ -1006,6 +1095,62 @@ impl Accumulator {
             currency,
         }
     }
+}
+
+/// 价位聚合时从库里读出来的一行(一件货)。
+struct PriceAggregateRow {
+    currency: String,
+    price_milli: i64,
+    status: ObservedStatus,
+    gone_class: Option<GoneClass>,
+    first_seen_at: i64,
+    last_seen_at: i64,
+}
+
+/// 一个价位档的账本。
+#[derive(Default)]
+struct PriceAccumulator {
+    seen: u32,
+    gone: u32,
+    sold: u32,
+    active: u32,
+    /// 不见了的那些看得见的存活时间(秒)。
+    gone_lifetimes: Vec<i64>,
+}
+
+impl PriceAccumulator {
+    fn add(&mut self, row: &PriceAggregateRow) {
+        self.seen += 1;
+        if row.status == ObservedStatus::Active {
+            self.active += 1;
+            return;
+        }
+        self.gone += 1;
+        self.gone_lifetimes.push(pnd_domain::observed_lifetime_secs(
+            row.first_seen_at,
+            row.last_seen_at,
+        ));
+        if row.gone_class.is_some_and(GoneClass::looks_sold) {
+            self.sold += 1;
+        }
+    }
+
+    fn finish(mut self, currency: String, bucket_milli: i64) -> PriceOutcome {
+        PriceOutcome {
+            currency,
+            bucket_milli,
+            seen: self.seen,
+            gone: self.gone,
+            looks_sold: self.sold,
+            median_lifetime_secs: median_i64(&mut self.gone_lifetimes),
+            active: self.active,
+        }
+    }
+}
+
+/// 排序时货币的先后。divine 是主币,排最前;其余并列,由字典序分先后。
+fn currency_rank(currency: &str) -> u8 {
+    u8::from(currency != "divine")
 }
 
 /// 这一组里最常见的货币;打平了按字典序小的,同样的库永远给同样的答案。
@@ -1676,6 +1821,151 @@ mod observe_tests {
             "只有两条 divine 的参与中位(900000 chaos 那条不掺和),\
              两个值的最近秩中位取靠下那个"
         );
+    }
+
+    /// 价位表的算术:每一档见过几条、没了几条、疑似卖掉几条、中位存活多久。
+    ///
+    /// 摆的这一组落在两档里:2 divine 那档四条(三条没了 —— 活了 1/2/3 小时,
+    /// 其中两条判成卖掉;一条还挂着),3 divine 那档两条(全还挂着)。
+    /// 中位存活取最近秩(第 ceil(3/2)=2 个),所以是 2 小时。
+    #[test]
+    fn the_price_aggregate_buckets_the_listings_and_takes_medians() {
+        let store = store();
+        let id = obs("o-1");
+        let hour = 3_600i64;
+        let rows = [
+            ("cheap-a", 2_000i64, hour, Some(GoneClass::SoldLikely)),
+            ("cheap-b", 2_500, 2 * hour, Some(GoneClass::SoldAfterCuts)),
+            // 2.9 还在 2 那一档,而且它判成 Unknown:算"没了",不算"卖掉"。
+            ("cheap-c", 2_900, 3 * hour, Some(GoneClass::Unknown)),
+            ("cheap-d", 2_100, 4 * hour, None),
+            ("mid-a", 3_000, 5 * hour, None),
+            ("mid-b", 3_999, 6 * hour, None),
+        ];
+        for (listing_id, price, alive, class) in rows {
+            let item = listing(listing_id, divine(price), &[]);
+            store.record_seen(&id, &item, 1_000).expect("record");
+            // 存活时间是"看见的那一段":推一次 last_seen 就是它。
+            store
+                .touch_listings(&id, &[listing_id.to_string()], 1_000 + alive)
+                .expect("touch");
+            if let Some(class) = class {
+                store
+                    .mark_gone(&id, listing_id, 1_000 + alive + 60, class)
+                    .expect("gone");
+            }
+        }
+
+        let aggregate = store.price_aggregate(&id).expect("aggregate");
+        assert_eq!(aggregate.len(), 2, "两档:{aggregate:#?}");
+
+        let cheap = &aggregate[0];
+        assert_eq!(cheap.currency, "divine");
+        assert_eq!(cheap.bucket_milli, 2_000, "2.5 和 2.9 都算 2 那一档");
+        assert_eq!(cheap.seen, 4);
+        assert_eq!(cheap.gone, 3, "Unknown 也算不见了");
+        assert_eq!(cheap.looks_sold, 2, "SoldLikely + SoldAfterCuts");
+        assert_eq!(cheap.active, 1);
+        assert_eq!(cheap.median_lifetime_secs, Some(2 * hour));
+
+        let mid = &aggregate[1];
+        assert_eq!(mid.bucket_milli, 3_000);
+        assert_eq!(
+            (mid.seen, mid.gone, mid.looks_sold, mid.active),
+            (2, 0, 0, 2)
+        );
+        assert_eq!(
+            mid.median_lifetime_secs, None,
+            "一条都没消失就没有存活中位,不该写 0"
+        );
+    }
+
+    /// 归档看的是**最后一个价**,不是第一个价。
+    ///
+    /// 降价之后成交的,成交的是降完那个价 —— 记在原价那一档,会让 3 divine
+    /// 看起来卖得动,而实际出手的是 2 divine。
+    #[test]
+    fn a_listing_lands_in_the_bucket_of_the_price_it_vanished_at() {
+        let store = store();
+        let id = obs("o-1");
+        store
+            .record_seen(&id, &listing("a", divine(3_500), &[]), 1_000)
+            .expect("first");
+        store
+            .record_seen(&id, &listing("a", divine(2_200), &[]), 5_000)
+            .expect("cut");
+        store
+            .mark_gone(&id, "a", 6_000, GoneClass::SoldAfterCuts)
+            .expect("gone");
+
+        let aggregate = store.price_aggregate(&id).expect("aggregate");
+        assert_eq!(aggregate.len(), 1);
+        assert_eq!(aggregate[0].bucket_milli, 2_000, "降到 2.2 才卖掉的");
+        assert_eq!(aggregate[0].looks_sold, 1);
+    }
+
+    /// 货币是分组键的一半:2 divine 和 2 chaos 不是同一档。
+    /// 而且 divine 排在最前面 —— 它是这个游戏里报价的主币。
+    #[test]
+    fn every_currency_gets_its_own_buckets_with_divine_first() {
+        let store = store();
+        let id = obs("o-1");
+        for (listing_id, price) in [
+            ("a", Price::new(2_000, Currency::Chaos)),
+            ("b", Price::new(2_000, Currency::Divine)),
+            ("c", Price::new(2_000, Currency::Exalted)),
+            ("d", Price::new(500, Currency::Divine)),
+        ] {
+            store
+                .record_seen(&id, &listing(listing_id, Some(price), &[]), 1_000)
+                .expect("record");
+        }
+        let aggregate = store.price_aggregate(&id).expect("aggregate");
+        assert_eq!(
+            aggregate
+                .iter()
+                .map(|row| (row.currency.as_str(), row.bucket_milli))
+                .collect::<Vec<_>>(),
+            vec![
+                ("divine", 0),
+                ("divine", 2_000),
+                ("chaos", 2_000),
+                ("exalted", 2_000),
+            ],
+            "divine 在前,其余按字典序;同一种货币内部按档位从低到高"
+        );
+        assert!(aggregate.iter().all(|row| row.seen == 1));
+    }
+
+    /// 连价都没见过的行归不进任何一档。
+    ///
+    /// 两种:秒推说有这么一条、去抓详情已经没了的空壳
+    /// (`gone_before_first_look`),以及真正的无价单。它们的货币是空的,
+    /// 硬归档就会凭空多出一档"不到 1",而那一档看起来还特别好卖。
+    #[test]
+    fn listings_without_a_price_are_left_out_of_the_price_table() {
+        let store = store();
+        let id = obs("o-1");
+        store
+            .record_seen(&id, &listing("priced", divine(2_000), &[]), 1_000)
+            .expect("record");
+        store
+            .record_seen(&id, &listing("unpriced", None, &[]), 1_000)
+            .expect("record");
+        assert!(
+            store
+                .record_gone_before_first_look(&id, "quick", 2_000)
+                .expect("record")
+        );
+
+        let aggregate = store.price_aggregate(&id).expect("aggregate");
+        assert_eq!(aggregate.len(), 1, "只有那条有价的进表:{aggregate:#?}");
+        assert_eq!(aggregate[0].bucket_milli, 2_000);
+        assert_eq!(aggregate[0].seen, 1);
+        // 但它们照旧算在这条观察的总账上 —— 只是价位表说不出它们的话。
+        let summary = store.observation_summary(&id).expect("summary");
+        assert_eq!(summary.active, 2);
+        assert_eq!(summary.gone_before_first_look, 1);
     }
 
     /// 删观察就是删干净:四张表一行不留,而且不碰别的观察。

@@ -9,9 +9,12 @@
 //!
 //! 1. **观察列表**。粘一条搜索进来就多一条观察;每一行写着它在册多少条、
 //!    没了多少条、秒推连上没有、下一次什么时候动。
-//! 2. **词缀战绩**(左下)。一行是一条词缀模板:带着它的货见过几件、卖掉
-//!    几件、成交价和在售价的中位差多少。这一页的全部意义就在这张表上 ——
-//!    "+# 生命 的石板到底好不好卖"只有它答得上。
+//! 2. **聚合表**(左下),两栏。**词缀战绩**一行是一条词缀模板:带着它的货
+//!    见过几件、卖掉几件、成交价和在售价的中位差多少 —— "+# 生命 的石板
+//!    到底好不好卖"只有它答得上。**价位战绩**一行是一个价位档:标这个价的
+//!    货见过几件、卖掉几件、在市面上待多久。头一天的数据就说明后者一样要紧:
+//!    消失的碑牌全是标 2 divine 的,还挂着的那些中位价在 3 divine ——
+//!    而那批货的词缀一模一样,词缀表看不出这件事。
 //! 3. **挂单流**(右下)。最近消失的和在售最久的两栏,带着每条货身上的词缀。
 //!    聚合表是结论,这一栏是原始证据:结论看着不对的时候,得能翻到具体是
 //!    哪几件货撑起了那个数。
@@ -31,11 +34,14 @@ use gpui_component::switch::Switch;
 use gpui_component::{Selectable as _, Sizable as _, Size, StyledExt as _};
 
 use pnd_domain::{
-    GoneClass, ObservationId, Price, decode_search_id, default_label_for, parse_search_reference,
+    GoneClass, ObservationId, Price, PriceBucket, decode_search_id, default_label_for,
+    parse_search_reference,
 };
 use pnd_runtime::{LiveRunState, ObservationStatus, RuntimeCommand, now_secs};
 use pnd_settings::{AppSettings, ObservationEntry};
-use pnd_storage::{ModOutcome, ObservationSummary, ObservedListingRow, ObservedMod, StorageError};
+use pnd_storage::{
+    ModOutcome, ObservationSummary, ObservedListingRow, ObservedMod, PriceOutcome, StorageError,
+};
 
 use super::{Cell, TableContent, Tone, column, number_column};
 use crate::i18n::{self, Text};
@@ -69,6 +75,20 @@ pub const DEFAULT_MIN_SAMPLES: u32 = 3;
 /// 而每按一下就要重排一次表。
 pub const MIN_SAMPLE_PRESETS: [u32; 4] = [1, 3, 5, 10];
 
+/// 左下那块聚合表现在看的是哪一栏。
+///
+/// 两栏问的是同一批货的两个问题,而头一天的数据说明第二个问题一样有话说:
+/// 消失的碑牌全是标 2 divine 的,还挂着的那些中位价在 3 divine —— 那是
+/// 词缀那张表看不出来的事(它们的词缀都一样)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AggregateTab {
+    /// 词缀战绩:什么样的货出得掉。
+    #[default]
+    Mods,
+    /// 价位战绩:什么价出得掉。
+    Price,
+}
+
 /// 挂单流现在看的是哪一栏。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StreamTab {
@@ -100,6 +120,8 @@ pub struct ObservationData {
     pub summary: ObservationSummary,
     /// 全部词缀模板(样本数没过滤,过滤在 [`mod_filtered`] 里做)。
     pub mods: Vec<ModOutcome>,
+    /// 全部价位档,同样没过滤([`price_filtered`] 里做)。
+    pub prices: Vec<PriceOutcome>,
     pub gone: Vec<StreamEntry>,
     pub active: Vec<StreamEntry>,
 }
@@ -548,6 +570,93 @@ fn price_cell(milli: Option<i64>, currency: &str, text: &'static Text) -> Cell {
 }
 
 // ---------------------------------------------------------------------
+// 纯函数:价位战绩
+// ---------------------------------------------------------------------
+
+/// 样本太薄的档藏起来。**顺序原样保留** —— 库那边已经排好了
+/// (divine 在前,档位从低到高),而这张表是竖着读的:从便宜往贵看下去,
+/// 成交率在哪一档掉下来,那里就是这条搜索的天花板。按成交率重排会把
+/// 那条线打散。
+#[must_use]
+pub fn price_filtered(outcomes: &[PriceOutcome], min_samples: u32) -> Vec<&PriceOutcome> {
+    outcomes
+        .iter()
+        .filter(|row| row.seen >= min_samples)
+        .collect()
+}
+
+/// 一档价位的写法:`2 divine`。
+///
+/// 最低那一档单独一句「不到 1 divine」:它的下界是 0,而写成「0 divine」
+/// 会读成"白送"。
+#[must_use]
+pub fn price_bucket_label(bucket_milli: i64, currency: &str, text: &'static Text) -> String {
+    let bucket = PriceBucket {
+        lower_bound_milli: bucket_milli,
+    };
+    if bucket.is_under_one() {
+        return i18n::fill(text.obs_price_under_one, &[currency]);
+    }
+    format!("{} {currency}", milli_text(bucket_milli))
+}
+
+/// 价位表的列。
+///
+/// 比词缀表少三列:词缀那边的两个中位价在这里没有意义(价位本身就是价),
+/// 而"词缀类型"根本不适用。
+pub fn price_table_content(text: &'static Text) -> TableContent {
+    TableContent {
+        columns: vec![
+            column("bucket", text.obs_col_price_bucket, 160.),
+            number_column("seen", text.obs_col_seen, 60.),
+            number_column("gone", text.obs_col_gone, 60.),
+            number_column("sold", text.obs_col_sold, 80.),
+            number_column("rate", text.obs_col_sold_rate, 70.),
+            number_column("life", text.obs_col_median_life, 90.),
+        ],
+        rows: Vec::new(),
+        empty: text.obs_price_empty.into(),
+    }
+}
+
+/// 列 + 真行。
+pub fn price_table_content_for(
+    outcomes: &[PriceOutcome],
+    min_samples: u32,
+    text: &'static Text,
+) -> TableContent {
+    TableContent {
+        rows: price_rows(&price_filtered(outcomes, min_samples), text),
+        ..price_table_content(text)
+    }
+}
+
+/// 一档价位一行。语气跟词缀表走,两张表并排看时才不像两个程序画的。
+#[must_use]
+pub fn price_rows(rows: &[&PriceOutcome], text: &'static Text) -> Vec<Vec<Cell>> {
+    rows.iter()
+        .map(|row| {
+            vec![
+                Cell::plain(price_bucket_label(row.bucket_milli, &row.currency, text)),
+                Cell::data(row.seen.to_string()),
+                Cell::data(row.gone.to_string()),
+                // 卖掉几件是这张表的主角,给它金色(同词缀表)。
+                if row.looks_sold == 0 {
+                    Cell::muted("0")
+                } else {
+                    Cell::accent(row.looks_sold.to_string())
+                },
+                Cell::data(sold_rate_text(row.looks_sold, row.seen, text)),
+                match row.median_lifetime_secs {
+                    Some(secs) => Cell::data(lifetime_text(secs, text)),
+                    None => Cell::muted(text.common_none),
+                },
+            ]
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------
 // 纯函数:挂单流
 // ---------------------------------------------------------------------
 
@@ -669,7 +778,7 @@ impl AppShell {
                     .flex()
                     .flex_row()
                     .gap(px(10.))
-                    .child(self.observations_mods_panel(cx))
+                    .child(self.observations_aggregate_panel(cx))
                     .child(self.observations_stream_panel(cx)),
             )
     }
@@ -849,10 +958,11 @@ impl AppShell {
             )
     }
 
-    /// 左下:词缀战绩。
-    fn observations_mods_panel(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+    /// 左下:聚合表。两栏 —— 词缀战绩和价位战绩。
+    fn observations_aggregate_panel(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let text = self.text();
         let min_samples = self.obs_min_samples;
+        let tab = self.obs_agg_tab;
         let selected = self.observe.selected.is_some();
         let no_data = self.observe.is_empty();
         panel()
@@ -869,12 +979,33 @@ impl AppShell {
                     .border_b_1()
                     .border_color(c(HAIRLINE))
                     .child(
-                        div()
-                            .text_size(fs(FS_11_5))
-                            .text_color(c(TEXT_SECONDARY))
-                            .child(text.obs_mods_title),
+                        Button::new("obs-agg-mods")
+                            .ghost()
+                            .xsmall()
+                            .selected(tab == AggregateTab::Mods)
+                            .label(text.obs_mods_tab)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.obs_agg_tab = AggregateTab::Mods;
+                                cx.notify();
+                            })),
                     )
-                    .child(picker(text.mods_kind_label, &self.obs_kind_select, 140.))
+                    .child(
+                        Button::new("obs-agg-price")
+                            .ghost()
+                            .xsmall()
+                            .selected(tab == AggregateTab::Price)
+                            .label(text.obs_price_tab)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.obs_agg_tab = AggregateTab::Price;
+                                cx.notify();
+                            })),
+                    )
+                    // 词缀类型只筛得动词缀那张表。价位表上留着它就是个按了
+                    // 不动的控件 —— 那比它不在更让人以为程序坏了。
+                    .children(
+                        (tab == AggregateTab::Mods)
+                            .then(|| picker(text.mods_kind_label, &self.obs_kind_select, 140.)),
+                    )
                     .child(div().flex_grow())
                     .child(
                         div()
@@ -890,7 +1021,9 @@ impl AppShell {
                             .label(SharedString::from(preset.to_string()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.obs_min_samples = preset;
+                                // 两张表都按这个门槛筛,所以两张都得重排。
                                 this.obs_mods_dirty = true;
+                                this.obs_price_dirty = true;
                                 cx.notify();
                             }))
                     })),
@@ -900,7 +1033,10 @@ impl AppShell {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_hidden()
-                    .child(table(&self.obs_mods_table)),
+                    .child(match tab {
+                        AggregateTab::Mods => table(&self.obs_mods_table),
+                        AggregateTab::Price => table(&self.obs_price_table),
+                    }),
             )
             // 头几个小时表上一行都没有是正常的:判定要么等挂单消失,要么等它
             // 挂满 72 小时。不说的话看起来就像程序没在跑。
@@ -1260,24 +1396,27 @@ impl AppShell {
             ..ObservationData::default()
         };
         self.obs_mods_dirty = true;
+        self.obs_price_dirty = true;
         self.obs_filters_dirty = true;
         let (Some(store), Some(obs_id)) = (&self.alerts_store, selected) else {
             return;
         };
-        // 样本数的门槛在界面这一侧筛(见 `mod_filtered`):按一下预设按钮就
-        // 回库里重查一遍不值当,而这一份行数是几百条量级。
+        // 样本数的门槛在界面这一侧筛(见 `mod_filtered` / `price_filtered`):
+        // 按一下预设按钮就回库里重查一遍不值当,而这一份行数是几百条量级。
         let read: Result<_, StorageError> = (|| {
             Ok((
                 store.observation_summary(&obs_id)?,
                 store.mod_aggregate(&obs_id, 1)?,
+                store.price_aggregate(&obs_id)?,
                 store.recent_gone(&obs_id, STREAM_ROWS)?,
                 store.oldest_active(&obs_id, STREAM_ROWS)?,
             ))
         })();
         match read {
-            Ok((summary, mods, gone, active)) => {
+            Ok((summary, mods, prices, gone, active)) => {
                 self.observe.summary = summary;
                 self.observe.mods = mods;
+                self.observe.prices = prices;
                 self.observe.gone = self.stream_entries(&obs_id, gone);
                 self.observe.active = self.stream_entries(&obs_id, active);
             }
@@ -1356,7 +1495,7 @@ fn input_text(input: &Entity<InputState>, cx: &App) -> String {
 mod observations_page_tests {
     use gpui_component::select::SelectItem as _;
     use pnd_domain::Currency;
-    use pnd_storage::{ObservedListingRow, ObservedStatus};
+    use pnd_storage::{ObservedListingRow, ObservedStatus, PriceOutcome};
 
     use super::*;
     use crate::i18n;
@@ -1770,6 +1909,101 @@ mod observations_page_tests {
         }
         // 认不出来的原样显示,而不是整档消失。
         assert_eq!(kind_label("something-new", &i18n::ENGLISH), "something-new");
+    }
+
+    fn price_outcome(bucket_milli: i64, seen: u32, gone: u32, sold: u32) -> PriceOutcome {
+        PriceOutcome {
+            currency: "divine".to_string(),
+            bucket_milli,
+            seen,
+            gone,
+            looks_sold: sold,
+            median_lifetime_secs: Some(12_600),
+            active: seen - gone,
+        }
+    }
+
+    /// 一档价位一行,而且顺序原样照抄库里那份(从便宜往贵)——
+    /// 这张表是竖着读的:成交率在哪一档掉下来,那里就是天花板。
+    #[test]
+    fn a_price_row_carries_the_counts_the_rate_and_the_median_life() {
+        let outcomes = vec![
+            price_outcome(2_000, 8, 6, 6),
+            price_outcome(3_000, 10, 2, 1),
+            price_outcome(5_000, 4, 0, 0),
+        ];
+        let rows = price_rows(&price_filtered(&outcomes, 1), &i18n::ENGLISH);
+        assert_eq!(rows.len(), 3, "一档一行");
+        assert_eq!(
+            rows.iter().map(|row| row[0].text()).collect::<Vec<_>>(),
+            vec!["2 divine", "3 divine", "5 divine"],
+            "顺序照抄库里那份"
+        );
+        assert_eq!(rows[0][1].text(), "8");
+        assert_eq!(rows[0][2].text(), "6");
+        assert_eq!(rows[0][3].text(), "6");
+        // 6 / 8 = 75%,分母是见过的件数,不是消失的件数(同词缀表)。
+        assert_eq!(rows[0][4].text(), "75.0%");
+        assert_eq!(rows[0][5].text(), "3.5 h");
+        // 一件没卖掉的那一档是灰的 0,不是金色 —— 金色留给这张表的主角。
+        assert_eq!(rows[2][3].text(), "0");
+        assert_eq!(rows[2][3].tone(), Tone::Muted);
+        assert_eq!(rows[0][3].tone(), Tone::Accent);
+    }
+
+    /// 一条都没消失的那一档没有存活中位,写破折号 —— 写 0 会读成"秒没"。
+    #[test]
+    fn a_bucket_with_nothing_gone_yet_shows_a_dash_for_the_median_life() {
+        let mut fresh = price_outcome(10_000, 5, 0, 0);
+        fresh.median_lifetime_secs = None;
+        let rows = price_rows(&[&fresh], &i18n::ENGLISH);
+        assert_eq!(rows[0][0].text(), "10 divine");
+        assert_eq!(rows[0][5].text(), "—");
+    }
+
+    /// 最低那一档要写「不到 1 divine」,两种语言都得有话说。
+    /// 写成「0 divine」会读成"白送",而那一档恰恰是最好卖的一批。
+    #[test]
+    fn the_cheapest_bucket_says_under_one_in_both_languages() {
+        assert_eq!(
+            price_bucket_label(0, "divine", &i18n::ENGLISH),
+            "under 1 divine"
+        );
+        assert_eq!(
+            price_bucket_label(0, "divine", &i18n::SIMPLIFIED_CHINESE),
+            "不到 1 divine"
+        );
+        // 别的档就是"数字 + 货币",两种语言一样(货币码本来就是英文)。
+        for text in [&i18n::ENGLISH, &i18n::SIMPLIFIED_CHINESE] {
+            assert_eq!(price_bucket_label(1_000, "divine", text), "1 divine");
+            assert_eq!(price_bucket_label(15_000, "chaos", text), "15 chaos");
+            assert_eq!(
+                price_bucket_label(1_000_000, "exalted", text),
+                "1000 exalted"
+            );
+        }
+    }
+
+    /// 样本门槛对两张表是同一个:三件货里卖掉两件不能叫 67% 成交率,
+    /// 换成价位也一样。
+    #[test]
+    fn the_minimum_sample_filter_also_hides_thin_price_buckets() {
+        let outcomes = vec![
+            price_outcome(2_000, 8, 6, 6),
+            price_outcome(3_000, 2, 2, 2),
+            price_outcome(5_000, 4, 1, 1),
+        ];
+        assert_eq!(price_filtered(&outcomes, 1).len(), 3);
+        assert_eq!(
+            price_filtered(&outcomes, DEFAULT_MIN_SAMPLES)
+                .iter()
+                .map(|row| row.bucket_milli)
+                .collect::<Vec<_>>(),
+            vec![2_000, 5_000],
+            "只见过两条的那一档藏起来"
+        );
+        assert_eq!(price_filtered(&outcomes, 5).len(), 1);
+        assert!(price_filtered(&outcomes, 99).is_empty());
     }
 
     /// 消失那一栏先说判成了什么:整页的结论都建在那一档上,而它可能判错。

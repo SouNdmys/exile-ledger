@@ -8,8 +8,9 @@ pub mod search_ref;
 
 pub use listing::{ListingSummary, ObservationId, WatchId};
 pub use observe::{
-    CHECK_RUNGS, GoneClass, MIN_OBSERVED_LIFETIME_SECS, STALE_AFTER_SECS, classify_gone, is_stale,
-    next_check_after, observed_lifetime_secs,
+    CHECK_RUNGS, GoneClass, MIN_OBSERVED_LIFETIME_SECS, PRICE_BUCKET_UNITS, PriceBucket,
+    STALE_AFTER_SECS, classify_gone, is_stale, next_check_after, observed_lifetime_secs,
+    price_bucket,
 };
 pub use price::{Currency, CurrencyRates, Price, PriceCap, Verdict, judge, to_divine_milli};
 pub use search_ref::{
