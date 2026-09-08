@@ -160,14 +160,18 @@ impl AppShell {
 
     /// 打开这条提醒当时那次搜索的交易页。按价升序,那件多半还在最上面。
     fn open_selected_alert(&mut self, cx: &mut Context<Self>) {
-        let Some((alert_id, league, search_id)) = self
-            .selected_alert(cx)
-            .map(|row| (row.alert_id, row.league.clone(), row.search_id.clone()))
-        else {
+        let Some((alert_id, game, league, search_id)) = self.selected_alert(cx).map(|row| {
+            (
+                row.alert_id,
+                row.game,
+                row.league.clone(),
+                row.search_id.clone(),
+            )
+        }) else {
             self.select_an_alert_first(cx);
             return;
         };
-        self.open_trade_page(&league, &search_id);
+        self.open_trade_page(game, &league, &search_id);
         self.record_action(alert_id, "open");
         cx.notify();
     }
@@ -227,6 +231,7 @@ mod alerts_page_tests {
             alert_id: 1,
             watch_id: WatchId("w-1".to_string()),
             listing_id: "abc".to_string(),
+            game: pnd_domain::Game::Poe2,
             league: "Forbidden Rites".to_string(),
             search_id: "H4sIAAAA-_09".to_string(),
             item_name: "Choir of the Storm".to_string(),

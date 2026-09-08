@@ -16,11 +16,11 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use pnd_domain::{ListingSummary, ObservationId, WatchId};
+use pnd_domain::{Game, ListingSummary, ObservationId, WatchId};
 use pnd_trade::{
     BucketUsage, Budget, FETCH_POLICY, RateLimiter, SEARCH_POLICY, TradeClient, TradeResponse,
     TransportError, backoff_after_429, parse_fetch_response, parse_fetch_response_by_id,
-    parse_fetch_response_slots, parse_search_response,
+    parse_fetch_response_slots, parse_saved_search_query, parse_search_response,
 };
 use thiserror::Error;
 
@@ -57,17 +57,28 @@ const TRANSPORT_RETRY_DELAY_SECS: i64 = 1;
 ///
 /// 生产用的是 [`TradeClient`](pnd_trade::TradeClient);抽成 trait 只有一个
 /// 目的:测试(和以后的离线回放)能塞一个假的进来,把整条 actor 链路在没有
-/// 网络的情况下跑完。签名和 `TradeClient` 上的三个方法逐字一致。
+/// 网络的情况下跑完。签名和 `TradeClient` 上的那四个方法逐字一致。
 pub trait TradeTransport: Send {
     fn search(
         &self,
+        game: Game,
         league: &str,
         body_json: &str,
         session: Option<&str>,
     ) -> Result<TradeResponse, TransportError>;
 
+    /// 服务端存着的那条查询(PoE1 才有这条路)。
+    fn load_saved_query(
+        &self,
+        game: Game,
+        league: &str,
+        search_id: &str,
+        session: Option<&str>,
+    ) -> Result<TradeResponse, TransportError>;
+
     fn fetch(
         &self,
+        game: Game,
         ids: &[String],
         search_id: &str,
         session: Option<&str>,
@@ -75,6 +86,7 @@ pub trait TradeTransport: Send {
 
     fn whisper(
         &self,
+        game: Game,
         token: &str,
         session: &str,
         referer: &str,
@@ -84,29 +96,42 @@ pub trait TradeTransport: Send {
 impl TradeTransport for TradeClient {
     fn search(
         &self,
+        game: Game,
         league: &str,
         body_json: &str,
         session: Option<&str>,
     ) -> Result<TradeResponse, TransportError> {
-        TradeClient::search(self, league, body_json, session)
+        TradeClient::search(self, game, league, body_json, session)
+    }
+
+    fn load_saved_query(
+        &self,
+        game: Game,
+        league: &str,
+        search_id: &str,
+        session: Option<&str>,
+    ) -> Result<TradeResponse, TransportError> {
+        TradeClient::load_saved_query(self, game, league, search_id, session)
     }
 
     fn fetch(
         &self,
+        game: Game,
         ids: &[String],
         search_id: &str,
         session: Option<&str>,
     ) -> Result<TradeResponse, TransportError> {
-        TradeClient::fetch(self, ids, search_id, session)
+        TradeClient::fetch(self, game, ids, search_id, session)
     }
 
     fn whisper(
         &self,
+        game: Game,
         token: &str,
         session: &str,
         referer: &str,
     ) -> Result<TradeResponse, TransportError> {
-        TradeClient::whisper(self, token, session, referer)
+        TradeClient::whisper(self, game, token, session, referer)
     }
 }
 
@@ -263,12 +288,26 @@ impl std::fmt::Debug for LiveHandle {
     }
 }
 
-/// 五种请求。请求体已经拼好了:网关不认识查询 JSON 长什么样。
+/// 七种请求。请求体已经拼好了:网关不认识查询 JSON 长什么样。
+///
+/// 每一种都带着 `game`:两代交易站是两套接口,而联赛名两边会撞车,
+/// 所以"这封请求发去哪一代"只能一路跟着请求走。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestKind {
     Search {
+        game: Game,
         league: String,
         body_json: String,
+    },
+    /// 拿一条 PoE1 的搜索 id 去服务端换回那条查询。
+    ///
+    /// **只有 PoE1 需要它**:PoE2 的 id 自己就装着查询(gzip + base64url),
+    /// 本地解开就行,而 trade2 对这个地址回 404。花的是 search 的额度,
+    /// 而且一条搜索一辈子只问一次 —— 换回来的东西存进 `saved_queries`。
+    LoadSavedQuery {
+        game: Game,
+        league: String,
+        search_id: String,
     },
     /// 和 `Search` 发的是一模一样的请求,只是**要的东西不同**:回信里带的
     /// 不是挂单 id,而是这次响应的限速规则名 —— 设置页上那个"测试会话"
@@ -277,10 +316,12 @@ pub enum RequestKind {
     /// 单独一种而不是复用 `Search`:限速头是每封响应都有的东西,让所有
     /// 搜索回信都拖着一份规则名,只为了一个按钮,不划算。
     SessionCheck {
+        game: Game,
         league: String,
         body_json: String,
     },
     Fetch {
+        game: Game,
         ids: Vec<String>,
         search_id: String,
     },
@@ -292,6 +333,7 @@ pub enum RequestKind {
     /// 蹲价不需要这份信息(少一条便宜货无所谓),所以没有让所有 fetch 回信
     /// 都拖着一份 id 清单。
     FetchByIds {
+        game: Game,
         ids: Vec<String>,
         search_id: String,
     },
@@ -306,10 +348,14 @@ pub enum RequestKind {
     /// 十张拼进一个 URL 是 9KB,没有人验过服务端认不认;而且票只活 14 秒,
     /// 攒一批的功夫它就废了。**一张一封。**
     FetchHandle {
+        game: Game,
         handle: LiveHandle,
         search_id: String,
     },
+    /// 藏身处传送。**只有 PoE2 有** —— PoE1 的挂单里根本没有那张票,
+    /// 传输层会在发出去之前拦下来(见 `TransportError::Unsupported`)。
     Whisper {
+        game: Game,
         token: String,
         referer: String,
     },
@@ -407,6 +453,9 @@ fn excerpt_suffix(excerpt: &str) -> String {
 #[derive(Debug)]
 pub enum ReplyKind {
     Search(Result<SearchOutcome, GatewayError>),
+    /// 服务端存着的那条查询,已经取出 `query` 那一半的 JSON 原文。
+    /// 见 [`RequestKind::LoadSavedQuery`]。
+    SavedQuery(Result<String, GatewayError>),
     SessionCheck(Result<SessionCheckOutcome, GatewayError>),
     Fetch(Result<Vec<ListingSummary>, GatewayError>),
     /// 按请求时的 id 顺序逐个对号,`None` = 那条挂单没了。见
@@ -550,8 +599,11 @@ fn pick_runnable(
 /// whisper 用占位串(见 [`WHISPER_POLICY_PLACEHOLDER`])。
 fn policy_for(kind: &RequestKind) -> &'static str {
     match kind {
-        // 会话检查发的就是一次 search,它当然要从 search 的预算里出。
-        RequestKind::Search { .. } | RequestKind::SessionCheck { .. } => SEARCH_POLICY,
+        // 会话检查发的就是一次 search,它当然要从 search 的预算里出;
+        // "换一条已保存的查询"也在 `/search/` 下面,服务端按同一条策略记账。
+        RequestKind::Search { .. }
+        | RequestKind::SessionCheck { .. }
+        | RequestKind::LoadSavedQuery { .. } => SEARCH_POLICY,
         RequestKind::Fetch { .. }
         | RequestKind::FetchByIds { .. }
         | RequestKind::FetchHandle { .. } => FETCH_POLICY,
@@ -777,24 +829,59 @@ impl TradeGateway {
 
         let ticket = self.limiter.insert_request(&policy, now);
         let response = match &pending.request.kind {
-            RequestKind::Search { league, body_json }
-            | RequestKind::SessionCheck { league, body_json } => {
-                self.transport.search(league, body_json, session.as_deref())
+            RequestKind::Search {
+                game,
+                league,
+                body_json,
             }
-            RequestKind::Fetch { ids, search_id } | RequestKind::FetchByIds { ids, search_id } => {
-                self.transport.fetch(ids, search_id, session.as_deref())
+            | RequestKind::SessionCheck {
+                game,
+                league,
+                body_json,
+            } => self
+                .transport
+                .search(*game, league, body_json, session.as_deref()),
+            RequestKind::LoadSavedQuery {
+                game,
+                league,
+                search_id,
+            } => self
+                .transport
+                .load_saved_query(*game, league, search_id, session.as_deref()),
+            RequestKind::Fetch {
+                game,
+                ids,
+                search_id,
             }
+            | RequestKind::FetchByIds {
+                game,
+                ids,
+                search_id,
+            } => self
+                .transport
+                .fetch(*game, ids, search_id, session.as_deref()),
             // 把手就填在 id 的位置上 —— 发出去的请求和上面那两种一模一样。
-            RequestKind::FetchHandle { handle, search_id } => self.transport.fetch(
+            RequestKind::FetchHandle {
+                game,
+                handle,
+                search_id,
+            } => self.transport.fetch(
+                *game,
                 std::slice::from_ref(&handle.0),
                 search_id,
                 session.as_deref(),
             ),
             // 上面那道闸已经保证了这里一定有会话。
-            RequestKind::Whisper { token, referer } => {
-                self.transport
-                    .whisper(token, session.as_deref().unwrap_or_default(), referer)
-            }
+            RequestKind::Whisper {
+                game,
+                token,
+                referer,
+            } => self.transport.whisper(
+                *game,
+                token,
+                session.as_deref().unwrap_or_default(),
+                referer,
+            ),
         };
 
         let done_at = now_secs();
@@ -960,6 +1047,10 @@ fn success_reply(kind: &RequestKind, response: &TradeResponse) -> ReplyKind {
                 })
                 .map_err(|error| GatewayError::Parse(error.to_string())),
         ),
+        RequestKind::LoadSavedQuery { .. } => ReplyKind::SavedQuery(
+            parse_saved_search_query(&response.body)
+                .map_err(|error| GatewayError::Parse(error.to_string())),
+        ),
         RequestKind::Fetch { .. } => ReplyKind::Fetch(
             parse_fetch_response(&response.body)
                 .map_err(|error| GatewayError::Parse(error.to_string())),
@@ -979,6 +1070,7 @@ fn success_reply(kind: &RequestKind, response: &TradeResponse) -> ReplyKind {
 fn error_reply(kind: &RequestKind, error: GatewayError) -> ReplyKind {
     match kind {
         RequestKind::Search { .. } => ReplyKind::Search(Err(error)),
+        RequestKind::LoadSavedQuery { .. } => ReplyKind::SavedQuery(Err(error)),
         RequestKind::SessionCheck { .. } => ReplyKind::SessionCheck(Err(error)),
         RequestKind::Fetch { .. } => ReplyKind::Fetch(Err(error)),
         RequestKind::FetchByIds { .. } => ReplyKind::FetchByIds(Err(error)),
@@ -1036,6 +1128,16 @@ mod gateway_tests {
     impl TradeTransport for FlakyTrade {
         fn search(
             &self,
+            _: Game,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<TradeResponse, TransportError> {
+            self.answer()
+        }
+        fn load_saved_query(
+            &self,
+            _: Game,
             _: &str,
             _: &str,
             _: Option<&str>,
@@ -1044,13 +1146,20 @@ mod gateway_tests {
         }
         fn fetch(
             &self,
+            _: Game,
             _: &[String],
             _: &str,
             _: Option<&str>,
         ) -> Result<TradeResponse, TransportError> {
             self.answer()
         }
-        fn whisper(&self, _: &str, _: &str, _: &str) -> Result<TradeResponse, TransportError> {
+        fn whisper(
+            &self,
+            _: Game,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<TradeResponse, TransportError> {
             self.answer()
         }
     }
@@ -1107,6 +1216,7 @@ mod gateway_tests {
         let (transport, calls) = FlakyTrade::new(1);
         let (mut gateway, _events) = offline_gateway(transport);
         let (pending, replies) = queued(RequestKind::FetchByIds {
+            game: Game::Poe2,
             ids: vec!["a".to_string()],
             search_id: "q".to_string(),
         });
@@ -1138,6 +1248,7 @@ mod gateway_tests {
         let (transport, calls) = FlakyTrade::new(9);
         let (mut gateway, _events) = offline_gateway(transport);
         let (pending, replies) = queued(RequestKind::FetchByIds {
+            game: Game::Poe2,
             ids: vec!["a".to_string()],
             search_id: "q".to_string(),
         });
@@ -1171,6 +1282,7 @@ mod gateway_tests {
         let (transport, _calls) = FlakyTrade::new(9);
         let (mut gateway, _events) = offline_gateway(transport);
         let (pending, replies) = queued(RequestKind::FetchByIds {
+            game: Game::Poe2,
             ids: vec!["a".to_string()],
             search_id: "q".to_string(),
         });
@@ -1196,6 +1308,7 @@ mod gateway_tests {
         let (transport, calls) = FlakyTrade::new(1);
         let (mut gateway, _events) = offline_gateway(transport);
         let (pending, replies) = queued(RequestKind::Whisper {
+            game: Game::Poe2,
             token: "t".to_string(),
             referer: "r".to_string(),
         });
@@ -1229,6 +1342,7 @@ mod gateway_tests {
 
     fn search() -> RequestKind {
         RequestKind::Search {
+            game: Game::Poe2,
             league: "Forbidden Rites".to_string(),
             body_json: "{}".to_string(),
         }
@@ -1236,6 +1350,7 @@ mod gateway_tests {
 
     fn fetch() -> RequestKind {
         RequestKind::Fetch {
+            game: Game::Poe2,
             ids: vec!["a".to_string()],
             search_id: "q".to_string(),
         }
@@ -1248,6 +1363,7 @@ mod gateway_tests {
         // 会话检查花的是 search 的额度:它就是一次 search。
         assert_eq!(
             policy_for(&RequestKind::SessionCheck {
+                game: Game::Poe2,
                 league: "Forbidden Rites".to_string(),
                 body_json: "{}".to_string()
             }),
@@ -1255,6 +1371,7 @@ mod gateway_tests {
         );
         assert_eq!(
             policy_for(&RequestKind::Whisper {
+                game: Game::Poe2,
                 token: "t".to_string(),
                 referer: "r".to_string()
             }),
@@ -1350,6 +1467,7 @@ mod gateway_tests {
         impl TradeTransport for NeverCalled {
             fn search(
                 &self,
+                _game: Game,
                 _league: &str,
                 _body_json: &str,
                 _session: Option<&str>,
@@ -1358,8 +1476,20 @@ mod gateway_tests {
                 Err(TransportError::Unreachable("nope".to_string()))
             }
 
+            fn load_saved_query(
+                &self,
+                _game: Game,
+                _league: &str,
+                _search_id: &str,
+                _session: Option<&str>,
+            ) -> Result<TradeResponse, TransportError> {
+                self.0.store(true, Ordering::Relaxed);
+                Err(TransportError::Unreachable("nope".to_string()))
+            }
+
             fn fetch(
                 &self,
+                _game: Game,
                 _ids: &[String],
                 _search_id: &str,
                 _session: Option<&str>,
@@ -1370,6 +1500,7 @@ mod gateway_tests {
 
             fn whisper(
                 &self,
+                _game: Game,
                 _token: &str,
                 _session: &str,
                 _referer: &str,
@@ -1391,6 +1522,7 @@ mod gateway_tests {
         );
         gateway.submit(GatewayRequest {
             kind: RequestKind::Whisper {
+                game: Game::Poe2,
                 token: "tok".to_string(),
                 referer: "https://example.com".to_string(),
             },
@@ -1470,6 +1602,7 @@ mod gateway_tests {
         impl TradeTransport for AlwaysRateLimited {
             fn search(
                 &self,
+                _game: Game,
                 _league: &str,
                 _body_json: &str,
                 _session: Option<&str>,
@@ -1477,8 +1610,19 @@ mod gateway_tests {
                 rate_limited()
             }
 
+            fn load_saved_query(
+                &self,
+                _game: Game,
+                _league: &str,
+                _search_id: &str,
+                _session: Option<&str>,
+            ) -> Result<TradeResponse, TransportError> {
+                rate_limited()
+            }
+
             fn fetch(
                 &self,
+                _game: Game,
                 _ids: &[String],
                 _search_id: &str,
                 _session: Option<&str>,
@@ -1488,6 +1632,7 @@ mod gateway_tests {
 
             fn whisper(
                 &self,
+                _game: Game,
                 _token: &str,
                 _session: &str,
                 _referer: &str,

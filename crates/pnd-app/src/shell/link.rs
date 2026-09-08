@@ -16,7 +16,7 @@
 use std::time::{Duration, Instant};
 
 use gpui::{ClipboardItem, Context};
-use pnd_domain::{ListingSummary, SearchRef, search_page_url};
+use pnd_domain::{Game, ListingSummary, SearchRef, search_page_url};
 use pnd_platform_win::{
     AlertCardService, CardButton, CardConfig, CardError, CardEvent, CardText, Corner, Hotkey,
     LoginConfig, LoginEvent, LoginFailure, LoginService, ValidatedWave, built_in_alert_wave,
@@ -460,7 +460,7 @@ impl AppShell {
         };
         match button {
             CardButton::Primary => {
-                self.open_trade_page(&matched.league, &matched.search_id);
+                self.open_trade_page(matched.game, &matched.league, &matched.search_id);
                 self.record_action(alert_id, "open");
             }
             CardButton::Secondary => {
@@ -693,9 +693,10 @@ impl AppShell {
     // ---- 两个共用的动作 ----------------------------------------------
 
     /// 打开官方交易页。按价升序,想要那件在最上面。
-    pub(crate) fn open_trade_page(&mut self, league: &str, search_id: &str) {
+    pub(crate) fn open_trade_page(&mut self, game: Game, league: &str, search_id: &str) {
         let text = self.text();
         let url = search_page_url(&SearchRef {
+            game,
             league: league.to_owned(),
             search_id: search_id.to_owned(),
         });
@@ -813,6 +814,12 @@ pub(crate) fn card_text_for(
             text.card_dismiss,
         ],
     )
+    // PoE1 的挂单没有藏身处传送(那是 trade2 即刻购买才有的),那颗按钮
+    // 在这张卡片上点了也没用,索性不画。
+    .map(|card| match matched.game {
+        Game::Poe1 => card.without_button(CardButton::Tertiary),
+        Game::Poe2 => card,
+    })
     // 上面每一段都已经裁到平台层上限以内,构造不可能失败;真失败了也
     // 不该把提醒吞掉,退回一张只有标题的卡片。
     .unwrap_or_else(|_| CardText {
@@ -840,6 +847,13 @@ pub(crate) fn hideout_text(outcome: &HideoutOutcome, text: &'static Text) -> Str
         HideoutOutcome::Refreshed => text.hideout_refreshing.to_owned(),
         // 状态码 0 = 请求压根没出门(网络断了、URL 拼不出来)。写成
         // "HTTP 0" 只会让人去查一个不存在的状态码,所以这一档单独说。
+        // PoE1 根本没有这个功能,不是"这次没成":用同一句"失败"去说它,
+        // 只会让人以为再点一次就好了。
+        HideoutOutcome::Failed { status: 0, message }
+            if message == pnd_runtime::HIDEOUT_UNSUPPORTED_MESSAGE =>
+        {
+            text.hideout_not_on_poe1.to_owned()
+        }
         HideoutOutcome::Failed { status: 0, message } => {
             i18n::fill(text.hideout_not_sent, &[message])
         }
@@ -989,6 +1003,7 @@ mod link_tests {
             alert_ids: vec![7, 8, 9, 10],
             watch_id: WatchId("w-1".to_string()),
             label: "Choir of the Storm".to_string(),
+            game: Game::Poe2,
             league: "Forbidden Rites".to_string(),
             search_id: "H4sIAAAA-_09".to_string(),
             headline: listing(),
@@ -1018,6 +1033,39 @@ mod link_tests {
 
         let single = card_text_for(&matched(0), &i18n::ENGLISH, "");
         assert!(!single.line2.contains("more"), "{}", single.line2);
+    }
+
+    /// PoE1 的挂单没有藏身处传送,那颗按钮就不该出现在卡片上 —— 点了也只会
+    /// 弹一句"这里没有这个东西"。
+    #[test]
+    fn a_poe1_card_drops_the_hideout_button() {
+        let mut poe1 = matched(0);
+        poe1.game = Game::Poe1;
+        let card = card_text_for(&poe1, &i18n::ENGLISH, "");
+        assert_eq!(card.hidden, [false, false, true, false]);
+        assert_eq!(card.buttons[0], "Open trade", "别的三颗照旧");
+        assert_eq!(card.buttons[3], "Dismiss");
+
+        let poe2 = card_text_for(&matched(0), &i18n::ENGLISH, "");
+        assert_eq!(poe2.hidden, [false; 4], "PoE2 四颗都在");
+    }
+
+    /// runtime 用一句固定的英文说"PoE1 没有藏身处传送";界面上要换成目录里
+    /// 那一句,而不是把 runtime 的英文原样贴给用户看。
+    #[test]
+    fn the_poe1_hideout_line_comes_from_the_catalogue() {
+        let outcome = HideoutOutcome::Failed {
+            status: 0,
+            message: pnd_runtime::HIDEOUT_UNSUPPORTED_MESSAGE.to_string(),
+        };
+        assert_eq!(
+            hideout_text(&outcome, &i18n::ENGLISH),
+            i18n::ENGLISH.hideout_not_on_poe1
+        );
+        assert_eq!(
+            hideout_text(&outcome, &i18n::SIMPLIFIED_CHINESE),
+            i18n::SIMPLIFIED_CHINESE.hideout_not_on_poe1
+        );
     }
 
     /// 脚注取不到预算就写搜索的名字,不留空。

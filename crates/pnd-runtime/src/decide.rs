@@ -10,7 +10,7 @@
 //! 为什么要合成:一轮轮询可能一口气命中三件。三张卡片、三段报警音,
 //! 是在惩罚你运气好。所以一轮只出一张卡,标题写最便宜那件,右下角写 "+2"。
 
-use pnd_domain::{CurrencyRates, ListingSummary, Price, PriceCap, Verdict, WatchId, judge};
+use pnd_domain::{CurrencyRates, Game, ListingSummary, Price, PriceCap, Verdict, WatchId, judge};
 use pnd_storage::{AlertSource, SeenOutcome};
 
 /// 一轮轮询(或者一次 live 推送)合出来的那一张卡片。
@@ -22,6 +22,9 @@ pub struct MatchedListing {
     pub alert_ids: Vec<i64>,
     pub watch_id: WatchId,
     pub label: String,
+    /// 哪一代游戏。卡片靠它决定"去藏身处"那颗按钮该不该出现,
+    /// 也靠它把"打开交易页"开到对的那一代地址上。
+    pub game: Game,
     pub league: String,
     pub search_id: String,
     /// 卡片标题要显示的那一条。

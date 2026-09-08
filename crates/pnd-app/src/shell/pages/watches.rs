@@ -24,7 +24,7 @@ use pnd_runtime::{LiveOffReason, LiveRunState, RuntimeCommand, WatchRunState, Wa
 use pnd_settings::{AppSettings, WatchEntry};
 use pnd_trade::{FETCH_POLICY, SEARCH_POLICY};
 
-use super::{Cell, TableContent, Tone, column, number_column};
+use super::{Cell, TableContent, Tone, column, league_cell_text, number_column};
 use crate::i18n::{self, Text};
 use crate::shell::link::{countdown_text, local_clock, local_hm};
 use crate::shell::pages;
@@ -206,7 +206,7 @@ pub fn watch_rows(
             let state = run_state(entry, live);
             vec![
                 Cell::plain(entry.label.clone()),
-                Cell::muted(entry.league.clone()),
+                Cell::muted(league_cell_text(entry.game, &entry.league, text)),
                 Cell::data(entry.price_cap.display()),
                 Cell::new(status_text(state, live, text, now), status_tone(state)),
                 match live.and_then(|status| status.last_poll_at) {
@@ -1000,6 +1000,17 @@ mod watches_page_tests {
             ],
             ..AppSettings::default()
         }
+    }
+
+    /// 联赛那一格要说清是哪个游戏:PoE1 和 PoE2 都有 Standard。
+    #[test]
+    fn a_poe1_watch_says_so_in_the_league_cell() {
+        let mut settings = settings();
+        settings.watches[0].game = pnd_domain::Game::Poe1;
+        settings.watches[0].league = "Standard".to_string();
+        let rows = watch_rows(&settings, &status(), &i18n::ENGLISH, 1_000_000);
+        assert_eq!(rows[0][1].text(), "PoE1 · Standard");
+        assert_eq!(rows[1][1].text(), "Forbidden Rites", "PoE2 那条不加前缀");
     }
 
     fn status() -> BTreeMap<WatchId, WatchStatus> {

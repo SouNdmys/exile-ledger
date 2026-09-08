@@ -12,15 +12,37 @@
 
 use std::time::Duration;
 
-use pnd_domain::encode_league_path;
+use pnd_domain::{Game, encode_league_path};
 use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::ParseError;
 use crate::rate_limit::{RateHeaders, parse_rate_headers};
 
-/// 交易站 API 的根路径。poe2 的接口在 `trade2` 下,和 poe1 的 `trade` 是两套。
-const API_BASE: &str = "https://www.pathofexile.com/api/trade2";
+/// 交易站 API 的根路径。两代是两套:poe2 在 `trade2` 下,poe1 在 `trade` 下。
+const API_BASE_POE2: &str = "https://www.pathofexile.com/api/trade2";
+const API_BASE_POE1: &str = "https://www.pathofexile.com/api/trade";
+
+/// 这一代的接口根路径。
+#[must_use]
+fn api_base(game: Game) -> &'static str {
+    match game {
+        Game::Poe1 => API_BASE_POE1,
+        Game::Poe2 => API_BASE_POE2,
+    }
+}
+
+/// 搜索路径里"联赛之前"的那一段。
+///
+/// poe2 在联赛前面还夹了一层 `poe2/`(`/search/poe2/Standard`),poe1 没有
+/// (`/search/Standard`)—— 就这一处不对称,别的形状两代一模一样。
+#[must_use]
+fn search_path(game: Game) -> &'static str {
+    match game {
+        Game::Poe1 => "/search/",
+        Game::Poe2 => "/search/poe2/",
+    }
+}
 
 /// 浏览器在同源请求上会带的 `Origin`。只有 whisper 用得着(见 [`TradeClient::whisper`])。
 const ORIGIN: &str = "https://www.pathofexile.com";
@@ -55,6 +77,14 @@ pub enum TransportError {
     /// 网关是一条长命线程,不该被一次拼错的批次弄崩。
     #[error("fetch takes at most {MAX_FETCH_IDS} listing ids, got {0}")]
     TooManyIds(usize),
+    /// 这一代根本没有这个接口。
+    ///
+    /// 现在只有一处会用到:**"去藏身处"是 PoE2 的即刻购买才有的东西** ——
+    /// PoE1 的挂单没有 `hideout_token`,那一代的成交方式就是自己私聊卖家。
+    /// 单独一类而不是硬发一次请求让服务端回 404:那样白花一次额度,
+    /// 报出来的还是一句看不懂的状态码。
+    #[error("the trade site has no {0} for {1}")]
+    Unsupported(&'static str, Game),
 }
 
 /// 一次交易站响应的全部有用信息。
@@ -147,22 +177,57 @@ pub struct SearchResponse {
 
 /// search 接口地址。联赛名要 URL 编码(`Forbidden Rites` → `Forbidden%20Rites`)。
 #[must_use]
-pub fn search_url(league: &str) -> String {
-    format!("{API_BASE}/search/poe2/{}", encode_league_path(league))
+pub fn search_url(game: Game, league: &str) -> String {
+    format!(
+        "{}{}{}",
+        api_base(game),
+        search_path(game),
+        encode_league_path(league)
+    )
+}
+
+/// "已保存的查询"接口地址:`GET .../search/<联赛>/<搜索id>`。
+///
+/// **只有 PoE1 有这条路,而且只对老式的短把手 id 有用。** 2026-09-09 实测:
+/// PoE1 的接口自己发回来的那种自描述长 id(`H4sIAAAA…`)拿到这里也是 404,
+/// 它本来就该在本地解开(见 [`pnd_domain::decode_search_id`]);trade2 则整条
+/// 路都没有。所以调用它之前先本地解一次,解不开才问。
+#[must_use]
+pub fn saved_search_url(game: Game, league: &str, search_id: &str) -> String {
+    format!("{}/{search_id}", search_url(game, league))
 }
 
 /// fetch 接口地址:id 逗号分隔,搜索 id 走 `?query=`。
 ///
 /// id 和搜索 id 都是 base64url 字符,不需要百分号编码 —— 逗号在路径段里也是合法字符。
 #[must_use]
-pub fn fetch_url(ids: &[String], search_id: &str) -> String {
-    format!("{API_BASE}/fetch/{}?query={search_id}", ids.join(","))
+pub fn fetch_url(game: Game, ids: &[String], search_id: &str) -> String {
+    format!(
+        "{}/fetch/{}?query={search_id}",
+        api_base(game),
+        ids.join(",")
+    )
 }
 
-/// 私聊/去藏身处接口地址。
+/// 私聊/去藏身处接口地址。**只有 PoE2 有**(见 [`TransportError::Unsupported`])。
 #[must_use]
 pub fn whisper_url() -> String {
-    format!("{API_BASE}/whisper")
+    format!("{API_BASE_POE2}/whisper")
+}
+
+/// "已保存的查询"响应 → 查询 JSON 原文。
+///
+/// PoE1 的这封回信长这样:`{"id":…,"complexity":…,"league":…,"query":{…},
+/// "sort":{…}}`。我们只要 `query` 那一半:`sort` 由我们自己按用途换
+/// (蹲价按价升序、观察按上架时间倒序),原样带着只会被覆盖掉。
+pub fn parse_saved_search_query(body: &[u8]) -> Result<String, ParseError> {
+    let root: Value =
+        serde_json::from_slice(body).map_err(|e| ParseError::NotJson(e.to_string()))?;
+    let query = root
+        .get("query")
+        .filter(|query| query.is_object())
+        .ok_or(ParseError::Missing("query"))?;
+    Ok(query.to_string())
 }
 
 /// whisper 的请求体:**只有 token,没有第二个字段**。
@@ -204,13 +269,14 @@ impl TradeClient {
     /// 拼好再传进来,这里不碰查询内容。
     pub fn search(
         &self,
+        game: Game,
         league: &str,
         request_body_json: &str,
         session: Option<&str>,
     ) -> Result<TradeResponse, TransportError> {
         let mut request = self
             .agent
-            .post(search_url(league))
+            .post(search_url(game, league))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header("User-Agent", &self.user_agent);
@@ -220,10 +286,33 @@ impl TradeClient {
         collect(request.send(request_body_json))
     }
 
+    /// GET 一条已经存在服务端的查询(PoE1 那条路,见 [`saved_search_url`])。
+    ///
+    /// 花的是 search 的限速额度 —— 地址就在 `/search/` 下面,服务端按同一条
+    /// 策略记账。一条搜索一辈子只问一次:回来的查询存进 `saved_queries`。
+    pub fn load_saved_query(
+        &self,
+        game: Game,
+        league: &str,
+        search_id: &str,
+        session: Option<&str>,
+    ) -> Result<TradeResponse, TransportError> {
+        let mut request = self
+            .agent
+            .get(saved_search_url(game, league, search_id))
+            .header("Accept", "application/json")
+            .header("User-Agent", &self.user_agent);
+        if let Some(session) = session {
+            request = request.header("Cookie", cookie(session));
+        }
+        collect(request.call())
+    }
+
     /// GET 一批挂单详情。带上 POESESSID 时,响应里会多出
     /// `whisper_token` / `hideout_token`(短命 JWT,第二版的"去藏身处"要用)。
     pub fn fetch(
         &self,
+        game: Game,
         ids: &[String],
         search_id: &str,
         session: Option<&str>,
@@ -233,7 +322,7 @@ impl TradeClient {
         }
         let mut request = self
             .agent
-            .get(fetch_url(ids, search_id))
+            .get(fetch_url(game, ids, search_id))
             .header("Accept", "application/json")
             .header("User-Agent", &self.user_agent);
         if let Some(session) = session {
@@ -293,12 +382,22 @@ impl TradeClient {
     /// **`POETOKEN` 是唯一还没弄清的那一格。** 它是网站登录时另发的一张票,
     /// 我们的 WebView2 登录只抄了 `POESESSID`。要是改成官网这封请求之后还是
     /// 403,下一个该查的就是它 —— 不要再往这里加别的头了。
+    /// # PoE1 没有这个接口
+    ///
+    /// 藏身处传送是 trade2 那套"即刻购买"的一部分:挂单上带一张
+    /// `hideout_token`,POST 回去服务端就替你发传送邀请。PoE1 的挂单里根本
+    /// 没有那张票,那一代的成交方式是自己私聊卖家。所以这里在**发出去之前**
+    /// 就拦下来,而不是拿一张不存在的 token 去换一个 404。
     pub fn whisper(
         &self,
+        game: Game,
         token: &str,
         session: &str,
         referer: &str,
     ) -> Result<TradeResponse, TransportError> {
+        if game != Game::Poe2 {
+            return Err(TransportError::Unsupported("hideout travel", game));
+        }
         let body = whisper_body(token);
         collect(self.whisper_request(session, referer).send(body.as_str()))
     }
@@ -446,11 +545,11 @@ mod client_tests {
     #[test]
     fn search_url_encodes_the_league() {
         assert_eq!(
-            search_url("Forbidden Rites"),
+            search_url(Game::Poe2, "Forbidden Rites"),
             "https://www.pathofexile.com/api/trade2/search/poe2/Forbidden%20Rites"
         );
         assert_eq!(
-            search_url("Standard"),
+            search_url(Game::Poe2, "Standard"),
             "https://www.pathofexile.com/api/trade2/search/poe2/Standard"
         );
     }
@@ -459,12 +558,95 @@ mod client_tests {
     fn fetch_url_joins_ids_with_commas() {
         let ids = vec!["aaa111".to_string(), "bbb222".to_string()];
         assert_eq!(
-            fetch_url(&ids, "H4sIAAAA"),
+            fetch_url(Game::Poe2, &ids, "H4sIAAAA"),
             "https://www.pathofexile.com/api/trade2/fetch/aaa111,bbb222?query=H4sIAAAA"
         );
         assert_eq!(
-            fetch_url(&["only".to_string()], "q"),
+            fetch_url(Game::Poe2, &["only".to_string()], "q"),
             "https://www.pathofexile.com/api/trade2/fetch/only?query=q"
+        );
+    }
+
+    /// PoE1 走的是另一套根路径,而且联赛前面**没有** `poe2/` 那一层。
+    #[test]
+    fn poe1_urls_drop_the_trade2_base_and_the_poe2_segment() {
+        assert_eq!(
+            search_url(Game::Poe1, "Standard"),
+            "https://www.pathofexile.com/api/trade/search/Standard"
+        );
+        assert_eq!(
+            search_url(Game::Poe1, "Hardcore Settlers"),
+            "https://www.pathofexile.com/api/trade/search/Hardcore%20Settlers"
+        );
+        assert_eq!(
+            fetch_url(
+                Game::Poe1,
+                &["aaa".to_string(), "bbb".to_string()],
+                "Rj3mL5Sw"
+            ),
+            "https://www.pathofexile.com/api/trade/fetch/aaa,bbb?query=Rj3mL5Sw"
+        );
+        // 服务端存着的那条查询:GET 同一条 search 路径再跟一个 id。
+        assert_eq!(
+            saved_search_url(Game::Poe1, "Standard", "Rj3mL5Sw"),
+            "https://www.pathofexile.com/api/trade/search/Standard/Rj3mL5Sw"
+        );
+    }
+
+    /// 一封真实形状的"已保存查询"回信 → 查询那一半。`sort` 不要:
+    /// 排序由调用方按用途换,原样带着只会被覆盖。
+    #[test]
+    fn a_saved_search_response_yields_just_the_query() {
+        let body = br#"{"id":"Rj3mL5Sw","complexity":4,"league":"Standard",
+            "query":{"status":{"option":"online"},"name":"Headhunter","type":"Leather Belt"},
+            "sort":{"price":"asc"}}"#;
+        let query = parse_saved_search_query(body).unwrap();
+        let parsed: Value = serde_json::from_str(&query).unwrap();
+        assert_eq!(parsed["name"], "Headhunter");
+        assert_eq!(parsed["type"], "Leather Belt");
+        assert_eq!(parsed["status"]["option"], "online");
+        assert!(parsed.get("sort").is_none(), "{query}");
+        // 拼成请求体之后就是我们平常发的那一封。
+        let body: Value = serde_json::from_str(&pnd_domain::search_request_body(&query)).unwrap();
+        assert_eq!(body["query"]["name"], "Headhunter");
+        assert_eq!(body["sort"]["price"], "asc");
+    }
+
+    /// 形状不对的回信要说清缺了什么,别让上层拿一句"不是 JSON"去猜。
+    #[test]
+    fn a_saved_search_response_reports_what_is_missing() {
+        assert_eq!(
+            parse_saved_search_query(br#"{"id":"Rj3mL5Sw","league":"Standard"}"#),
+            Err(ParseError::Missing("query"))
+        );
+        // 404 的 body 是 GGG 的错误 JSON:里面也没有 `query`。
+        assert_eq!(
+            parse_saved_search_query(br#"{"error":{"code":2,"message":"Invalid query"}}"#),
+            Err(ParseError::Missing("query"))
+        );
+        assert!(matches!(
+            parse_saved_search_query(b"<!DOCTYPE html>"),
+            Err(ParseError::NotJson(_))
+        ));
+    }
+
+    /// 藏身处传送是 PoE2 独有的。PoE1 点下去连一个字节都不该出门。
+    #[test]
+    fn a_poe1_hideout_travel_is_refused_before_any_request() {
+        let client = TradeClient::new("test".to_string());
+        let error = client
+            .whisper(Game::Poe1, "tok", "session", "https://example.com")
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                TransportError::Unsupported("hideout travel", Game::Poe1)
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "the trade site has no hideout travel for poe1"
         );
     }
 
@@ -472,7 +654,7 @@ mod client_tests {
     fn fetch_refuses_more_than_ten_ids() {
         let client = TradeClient::new("test".to_string());
         let ids: Vec<String> = (0..11).map(|i| format!("id{i}")).collect();
-        let error = client.fetch(&ids, "q", None).unwrap_err();
+        let error = client.fetch(Game::Poe2, &ids, "q", None).unwrap_err();
         assert!(matches!(error, TransportError::TooManyIds(11)));
     }
 

@@ -254,7 +254,9 @@ impl CardWorker {
 
     fn present(&mut self, alert_id: i64, text: CardText, fresh: bool) {
         let was_visible = self.window.visible;
+        let mut buttons_changed = false;
         if let Some(context) = self.window.context_mut() {
+            buttons_changed = context.text.hidden != text.hidden;
             context.text = text;
             if fresh {
                 // 新提醒:上一张卡片残留的按下/悬停状态不该跟着过来。
@@ -266,6 +268,11 @@ impl CardWorker {
         // 来一条新挂单就把它拽回右下角,等于把他的调整撤销掉。
         if !was_visible && let Err(error) = self.window.place(self.style) {
             self.warn(error.to_string());
+        }
+        // 卡片已经在屏幕上、只是换了一条提醒:位置不动,但按钮行要按新的
+        // 显示/隐藏重排一次,否则上一张卡片留下的矩形还在,点了会命中错的按钮。
+        if was_visible && buttons_changed {
+            self.window.relayout_buttons();
         }
         if let Err(error) = self.window.show() {
             self.warn(error.to_string());
@@ -506,7 +513,8 @@ impl CardWindow {
             context.dpi = dpi;
             context.strip_height = scale_for_dpi(STRIP_HEIGHT, dpi);
             // WS_POPUP 没有边框,客户区就是整个窗口,所以按钮直接按 0,0 起算。
-            context.buttons = button_rects(RectI::new(0, 0, card.w, card.h), dpi);
+            let hidden = context.text.hidden;
+            context.buttons = button_rects(RectI::new(0, 0, card.w, card.h), dpi, &hidden);
         }
         // SAFETY: hwnd 存活;NOACTIVATE 保证摆放不会把焦点抢过来。
         unsafe {
@@ -521,6 +529,27 @@ impl CardWindow {
             )
         }
         .map_err(|error| error_from_windows("SetWindowPos(place alert card)", error))
+    }
+
+    /// 只重排按钮,不动窗口位置。
+    ///
+    /// 用户可能把卡片拖到别处了,来一条新提醒时不该把它拽回角落(见 `present`),
+    /// 但新提醒的按钮可能少一颗,矩形必须跟着换。
+    fn relayout_buttons(&mut self) {
+        let mut client = RECT::default();
+        // SAFETY: hwnd 存活;失败时 client 仍是全零,下面按 0 尺寸算,不会读到脏值。
+        if unsafe { GetClientRect(self.hwnd, &mut client) }.is_err() {
+            return;
+        }
+        if let Some(context) = self.context_mut() {
+            let hidden = context.text.hidden;
+            let dpi = context.dpi;
+            context.buttons = button_rects(
+                RectI::new(0, 0, client.right - client.left, client.bottom - client.top),
+                dpi,
+                &hidden,
+            );
+        }
     }
 
     fn show(&mut self) -> Result<(), PlatformError> {
@@ -929,6 +958,10 @@ fn paint_card(hwnd: HWND, context: &WindowContext) {
     }
 
     for (index, rect) in context.buttons.iter().enumerate() {
+        if rect.w <= 0 {
+            // 零宽 = 这颗按钮这次不出现(见 alert_card::button_rects)。
+            continue;
+        }
         let fill = if context.pressed == Some(index) {
             BUTTON_PRESSED
         } else if context.hovered == Some(index) {

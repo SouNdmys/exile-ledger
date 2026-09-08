@@ -18,8 +18,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use pnd_domain::{
-    CurrencyRates, ListingSummary, ObservationId, PriceCap, SearchRef, WatchId, classify_gone,
-    decode_search_id, judge, next_check_after, search_page_url, search_request_body, with_sort,
+    CurrencyRates, Game, ListingSummary, ObservationId, PriceCap, SearchRef, WatchId,
+    classify_gone, decode_search_id, judge, next_check_after, search_page_url, search_request_body,
+    with_sort,
 };
 use pnd_ninja::client::NinjaClient;
 use pnd_settings::{AppSettings, ObservationEntry, WatchEntry};
@@ -68,6 +69,16 @@ const HIDEOUT_FETCH_LABEL: &str = "hideout-fetch";
 const HIDEOUT_WHISPER_LABEL: &str = "hideout-whisper";
 /// 设置页那个"测试会话"发出去的一次搜索。
 const SESSION_CHECK_LABEL: &str = "session-check";
+/// 去服务端换一条 PoE1 搜索的查询。一条搜索一辈子只发一次(见 `saved_queries`)。
+const SAVED_QUERY_LABEL: &str = "load-saved-query";
+
+/// PoE1 上点"去藏身处"时说的那句话。
+///
+/// 是一句英文原文而不是一个新的结局枚举:界面把它套进自己那条双语模板里
+/// (`hideout_*`),和别的失败一个走法。导出成常量是为了让界面能**认出**
+/// 这一句、换成自己的说法,而不是靠比对一段魔法字符串。
+pub const HIDEOUT_UNSUPPORTED_MESSAGE: &str =
+    "Path of Exile 1 listings have no hideout token — open the trade page and whisper the seller";
 /// 市场观察的四步:兜底拉最新 100 条、抓那一轮里新面孔的详情、
 /// 抓秒推来的新面孔、回查到点的在册挂单。
 const OBSERVE_SEARCH_LABEL: &str = "observe-discover";
@@ -546,6 +557,8 @@ struct WatchRuntime {
     query_body: Option<String>,
     /// 上一次 search 回来的服务端搜索 id,fetch 要用。
     search_id: String,
+    /// PoE1 的那次"换查询"正在路上。见 [`RuntimeActor::resolve_query`]。
+    query_pending: bool,
     /// 加进来之后第一轮跑完了没有。`alert_on_first_poll = false` 的搜索靠它
     /// 把第一轮的存量货色静音。
     first_poll_done: bool,
@@ -563,6 +576,8 @@ struct ObservationRuntime {
     query_body: Option<String>,
     /// 上一次 discover 回来的服务端搜索 id,fetch 要拿它当 `?query=`。
     search_id: String,
+    /// PoE1 的那次"换查询"正在路上。见 [`RuntimeActor::resolve_query`]。
+    query_pending: bool,
     /// discover 的那次 search 正在路上。
     discover_in_flight: bool,
     /// 这一轮 discover 还有几批 fetch 没回来。
@@ -589,12 +604,23 @@ struct HandleFetch {
     issued_at: i64,
 }
 
+/// [`RuntimeActor::lookup_query`] 的三种答案。
+enum QueryLookup {
+    /// 查询在手上,这条搜索可以开跑了。
+    Ready(String),
+    /// 已经派人去服务端换了(PoE1 第一次见到这条搜索),等回信。
+    Pending,
+    /// 这条搜索的 id 有问题,原样报给界面让用户改。
+    Failed(String),
+}
+
 /// 一次"去藏身处"点击走到哪一步了。
 ///
 /// 一个 alert 同时只会有一条:第二次点击在这条还没走完时会被挡掉,
 /// 否则"每次点击最多 POST 两次"这条纪律就成了空话。
 struct HideoutFlow {
     listing_id: String,
+    game: Game,
     league: String,
     search_id: String,
     /// 已经 POST 过几次 whisper。上限 [`MAX_WHISPER_POSTS`]。
@@ -913,20 +939,40 @@ impl RuntimeActor {
             let cap_changed =
                 known.is_some_and(|runtime| runtime.entry.price_cap != entry.price_cap);
 
-            let query_body = if query_stale {
+            // PoE1 的查询要问服务端,一问就是一封请求。已经有一封在路上时
+            // 什么都别做:每保存一次设置就再问一遍,白花额度不说,还会把
+            // 已经连上的那条 live 一次次掐掉。
+            let query_pending = known.is_some_and(|runtime| runtime.query_pending);
+            let mut still_pending = false;
+            let query_body = if !query_stale {
+                known.and_then(|runtime| runtime.query_body.clone())
+            } else if query_pending {
+                still_pending = true;
+                None
+            } else {
                 // 搜索 id 或联赛变了 = 这是另一次搜索。已经连着的那条 live
                 // 盯的是旧的,停掉它,下面的 `sync_live_workers` 会照新的重开。
                 self.stop_live_worker(&LiveTarget::Watch(entry.id.clone()));
-                match decode_search_id(&entry.search_id) {
-                    Ok(query_json) => {
+                let tag = RequestTag::watch(entry.id.clone(), SAVED_QUERY_LABEL);
+                match self.lookup_query(
+                    &entry.label,
+                    entry.game,
+                    &entry.league,
+                    &entry.search_id,
+                    tag,
+                ) {
+                    QueryLookup::Ready(query_json) => {
                         self.persist_watch(entry, &query_json, now);
                         Some(search_request_body(&query_json))
                     }
-                    Err(error) => {
+                    QueryLookup::Pending => {
+                        still_pending = true;
+                        None
+                    }
+                    QueryLookup::Failed(message) => {
                         // 粘错了的 id 不排班,但这条搜索留在列表里,
                         // 界面上带着错误原因,用户改掉就能继续。
                         self.scheduler.remove(&entry.id);
-                        let message = format!("{}: {error}", entry.label);
                         self.emit(RuntimeEvent::Log(message.clone()));
                         self.upsert_watch(
                             entry.clone(),
@@ -938,8 +984,6 @@ impl RuntimeActor {
                         continue;
                     }
                 }
-            } else {
-                known.and_then(|runtime| runtime.query_body.clone())
             };
 
             self.scheduler.upsert(
@@ -955,6 +999,9 @@ impl RuntimeActor {
             }
             stagger += 1;
             self.upsert_watch(entry.clone(), query_body, WatchRunState::Polling, None, now);
+            if let Some(runtime) = self.watches.get_mut(&entry.id) {
+                runtime.query_pending = still_pending;
+            }
         }
 
         // 设置里没有的搜索:从时间表和内存里拿掉,库里的历史留着。
@@ -1016,6 +1063,7 @@ impl RuntimeActor {
                 continue;
             }
             let search = SearchRef {
+                game: entry.game,
                 league: entry.league.clone(),
                 search_id: entry.search_id.clone(),
             };
@@ -1051,6 +1099,7 @@ impl RuntimeActor {
                 continue;
             }
             let search = SearchRef {
+                game: entry.game,
                 league: entry.league.clone(),
                 search_id: entry.search_id.clone(),
             };
@@ -1226,6 +1275,7 @@ impl RuntimeActor {
         }
         // fetch 要一个 `?query=` 参数。上一轮 search 回的那个最准;还没轮询过
         // 就用用户粘进来的那个(两者通常一样)。
+        let game = runtime.entry.game;
         let search_id = if runtime.search_id.is_empty() {
             runtime.entry.search_id.clone()
         } else {
@@ -1235,6 +1285,7 @@ impl RuntimeActor {
         for batch in ids.chunks(self.fetch_batch()) {
             self.gateway.submit(GatewayRequest {
                 kind: RequestKind::Fetch {
+                    game,
                     ids: batch.to_vec(),
                     search_id: search_id.clone(),
                 },
@@ -1311,9 +1362,11 @@ impl RuntimeActor {
             }
         }
 
-        let search_id = match self.observations.get(obs_id) {
-            Some(runtime) if !runtime.search_id.is_empty() => runtime.search_id.clone(),
-            Some(runtime) => runtime.entry.search_id.clone(),
+        let (game, search_id) = match self.observations.get(obs_id) {
+            Some(runtime) if !runtime.search_id.is_empty() => {
+                (runtime.entry.game, runtime.search_id.clone())
+            }
+            Some(runtime) => (runtime.entry.game, runtime.entry.search_id.clone()),
             None => return,
         };
         for handle in wanted {
@@ -1330,6 +1383,7 @@ impl RuntimeActor {
             );
             self.gateway.submit(GatewayRequest {
                 kind: RequestKind::FetchHandle {
+                    game,
                     handle,
                     search_id: search_id.clone(),
                 },
@@ -1425,6 +1479,7 @@ impl RuntimeActor {
                         entry,
                         query_body,
                         search_id: String::new(),
+                        query_pending: false,
                         first_poll_done: false,
                         in_flight: false,
                         status,
@@ -1433,6 +1488,159 @@ impl RuntimeActor {
             }
         }
         self.emit_status(&watch_id);
+    }
+
+    // ---- 查询从哪儿来 ------------------------------------------------
+
+    /// 这条搜索的查询 JSON 现在拿得到吗。
+    ///
+    /// 两代的答案不一样,而这是整个 PoE1 支持里唯一一处真正的分叉:
+    ///
+    /// - **PoE2** —— 搜索 id 就是查询本身(gzip + base64url),本地解开,
+    ///   一个请求都不用发。
+    /// - **PoE1** —— 先按同一招试:2026-09-09 那趟核实跑里,PoE1 的接口发回来
+    ///   的也是这种自带查询的长 id,解得开就到此为止,同样一个请求都不发。
+    ///   解不开(用户粘的是老式的短把手,比如 `Rj3mL5Sw`)才去
+    ///   `GET .../search/<联赛>/<id>` 换一次,花一次 search 额度。查询不会变
+    ///   (那条 id 指的就是那一份条件),所以问到之后存进 `saved_queries`,
+    ///   重启、改名、开关 live 都不用再问一次。
+    ///
+    /// 注意那趟核实跑里,长 id 去换查询服务端回的是 **404**;所以顺序不能反,
+    /// 得先本地解、解不开再问。
+    ///
+    /// 返回 `Pending` 的时候请求已经投出去了,回信落在
+    /// [`RuntimeActor::on_watch_saved_query`] / [`RuntimeActor::on_observation_saved_query`]。
+    fn lookup_query(
+        &mut self,
+        entry_label: &str,
+        game: Game,
+        league: &str,
+        search_id: &str,
+        tag: RequestTag,
+    ) -> QueryLookup {
+        match decode_search_id(search_id) {
+            Ok(query_json) => return QueryLookup::Ready(query_json),
+            // PoE2 的 id 只有这一条路:解不开就是这条搜索本身有问题。
+            Err(error) if game == Game::Poe2 => {
+                return QueryLookup::Failed(format!("{entry_label}: {error}"));
+            }
+            Err(_) => {}
+        }
+        if let Some(query_json) = self
+            .note(
+                self.store.saved_query(game, league, search_id),
+                "saved_query",
+            )
+            .flatten()
+        {
+            return QueryLookup::Ready(query_json);
+        }
+        // 一条搜索一辈子就这一句日志,所以它值得占一行:没有它,界面上
+        // 会莫名其妙多出一次 search 额度的消耗,而谁也说不清是谁花的。
+        self.emit(RuntimeEvent::Log(format!(
+            "{entry_label}: asking the trade site for the saved poe1 query {league}/{search_id}"
+        )));
+        self.gateway.submit(GatewayRequest {
+            kind: RequestKind::LoadSavedQuery {
+                game,
+                league: league.to_string(),
+                search_id: search_id.to_string(),
+            },
+            // 和一轮轮询的 search 同一档:它就是那一轮的第零步。
+            priority: Priority::PollSearch,
+            reply: self.replies.clone(),
+            tag,
+        });
+        QueryLookup::Pending
+    }
+
+    /// 一条蹲价搜索的 PoE1 查询换回来了(或者没换成)。
+    fn on_watch_saved_query(
+        &mut self,
+        watch_id: &WatchId,
+        result: Result<String, GatewayError>,
+        now: i64,
+    ) {
+        let Some(runtime) = self.watches.get_mut(watch_id) else {
+            return;
+        };
+        runtime.query_pending = false;
+        let entry = runtime.entry.clone();
+        match result {
+            Ok(query_json) => {
+                self.note(
+                    self.store.put_saved_query(
+                        entry.game,
+                        &entry.league,
+                        &entry.search_id,
+                        &query_json,
+                        now,
+                    ),
+                    "put_saved_query",
+                );
+                self.persist_watch(&entry, &query_json, now);
+                if let Some(runtime) = self.watches.get_mut(watch_id) {
+                    runtime.query_body = Some(search_request_body(&query_json));
+                    runtime.status.last_error = None;
+                }
+                // 查询到手才谈得上第一轮:排在此刻,限速器一放行就发。
+                self.scheduler.poll_now(watch_id, now);
+                self.emit_status(watch_id);
+            }
+            // 砸了就说一声:这条搜索在下一次 `ApplySettings`(或者下次开程序)
+            // 之前只是不排班,别的什么都没坏,不值得为它加一条重试时间线。
+            Err(error) => {
+                let message = format!("{}: could not load the saved query: {error}", entry.label);
+                self.emit(RuntimeEvent::Log(message.clone()));
+                if let Some(runtime) = self.watches.get_mut(watch_id) {
+                    runtime.status.state = WatchRunState::Backoff;
+                    runtime.status.last_error = Some(message);
+                }
+            }
+        }
+        self.emit_status(watch_id);
+    }
+
+    /// 同上,观察那一边。
+    fn on_observation_saved_query(
+        &mut self,
+        obs_id: &ObservationId,
+        result: Result<String, GatewayError>,
+        now: i64,
+    ) {
+        let Some(runtime) = self.observations.get_mut(obs_id) else {
+            return;
+        };
+        runtime.query_pending = false;
+        let entry = runtime.entry.clone();
+        match result {
+            Ok(query_json) => {
+                self.note(
+                    self.store.put_saved_query(
+                        entry.game,
+                        &entry.league,
+                        &entry.search_id,
+                        &query_json,
+                        now,
+                    ),
+                    "put_saved_query",
+                );
+                self.persist_observation(&entry, &query_json, now);
+                if let Some(runtime) = self.observations.get_mut(obs_id) {
+                    runtime.query_body = Some(with_sort(&query_json, "indexed", "desc"));
+                    runtime.status.last_error = None;
+                }
+                self.observe_scheduler.run_now(obs_id, now);
+            }
+            Err(error) => {
+                let message = format!("{}: could not load the saved query: {error}", entry.label);
+                self.emit(RuntimeEvent::Log(message.clone()));
+                if let Some(runtime) = self.observations.get_mut(obs_id) {
+                    runtime.status.last_error = Some(message);
+                }
+            }
+        }
+        self.emit_observation_status(obs_id);
     }
 
     /// 把这条搜索的"跑出来的状态"写回库。已有的行只补 query_json 和联赛,
@@ -1471,6 +1679,7 @@ impl RuntimeActor {
         let Some(body_json) = runtime.query_body.clone() else {
             return;
         };
+        let game = runtime.entry.game;
         let league = runtime.entry.league.clone();
         runtime.in_flight = true;
         runtime.status.state = healthy_state(runtime.status.live);
@@ -1485,7 +1694,11 @@ impl RuntimeActor {
         }
 
         self.gateway.submit(GatewayRequest {
-            kind: RequestKind::Search { league, body_json },
+            kind: RequestKind::Search {
+                game,
+                league,
+                body_json,
+            },
             priority: Priority::PollSearch,
             reply: self.replies.clone(),
             tag: RequestTag::watch(watch_id.clone(), SEARCH_LABEL),
@@ -1545,6 +1758,9 @@ impl RuntimeActor {
         }
         let from_live = tag.label == LIVE_FETCH_LABEL;
         match kind {
+            // PoE1 那条"先去换查询"的回信。它不属于任何一轮轮询:
+            // 换到了才谈得上第一轮。
+            ReplyKind::SavedQuery(result) => self.on_watch_saved_query(&watch_id, result, now),
             ReplyKind::Search(Ok(outcome)) => self.on_search(&watch_id, outcome, now),
             ReplyKind::Fetch(Ok(listings)) if from_live => {
                 self.on_live_fetch(&watch_id, listings, now);
@@ -1577,7 +1793,9 @@ impl RuntimeActor {
 
         let batch = self.fetch_batch();
         let ids: Vec<String> = outcome.result.iter().take(batch).cloned().collect();
+        let mut game = Game::default();
         if let Some(runtime) = self.watches.get_mut(watch_id) {
+            game = runtime.entry.game;
             runtime.search_id = outcome.id.clone();
             runtime.status.last_poll_at = Some(now);
             runtime.status.last_total = Some(outcome.total);
@@ -1591,6 +1809,7 @@ impl RuntimeActor {
 
         self.gateway.submit(GatewayRequest {
             kind: RequestKind::Fetch {
+                game,
                 ids,
                 search_id: outcome.id,
             },
@@ -1634,6 +1853,7 @@ impl RuntimeActor {
         };
         let cap: PriceCap = runtime.entry.price_cap.clone();
         let label = runtime.entry.label.clone();
+        let game = runtime.entry.game;
         let league = runtime.entry.league.clone();
         let search_id = runtime.entry.search_id.clone();
 
@@ -1657,6 +1877,7 @@ impl RuntimeActor {
             }
             let alert = NewAlert {
                 watch_id,
+                game,
                 league: &league,
                 search_id: &search_id,
                 listing: &listing,
@@ -1683,6 +1904,7 @@ impl RuntimeActor {
                     alert_ids,
                     watch_id: watch_id.clone(),
                     label,
+                    game,
                     league,
                     search_id,
                     headline,
@@ -1784,28 +2006,44 @@ impl RuntimeActor {
                         || runtime.entry.league != entry.league
                 }
             };
-            let query_body = if query_stale {
+            // 同蹲价那一段:PoE1 的查询要问服务端,一封在路上时就按兵不动。
+            let query_pending = known.is_some_and(|runtime| runtime.query_pending);
+            let mut still_pending = false;
+            let query_body = if !query_stale {
+                known.and_then(|runtime| runtime.query_body.clone())
+            } else if query_pending {
+                still_pending = true;
+                None
+            } else {
                 // 搜索 id 或联赛变了 = 这是另一条搜索。已经连着的那条 live
                 // 盯的是旧的,停掉它,后面的 `sync_live_workers` 会照新的重开。
                 self.stop_live_worker(&LiveTarget::Observation(entry.id.clone()));
-                match decode_search_id(&entry.search_id) {
-                    Ok(query_json) => {
+                let tag = RequestTag::observation(entry.id.clone(), SAVED_QUERY_LABEL);
+                match self.lookup_query(
+                    &entry.label,
+                    entry.game,
+                    &entry.league,
+                    &entry.search_id,
+                    tag,
+                ) {
+                    QueryLookup::Ready(query_json) => {
                         self.persist_observation(entry, &query_json, now);
                         // 兜底那一轮要的是"最新挂上来的 100 条",所以把排序换成
                         // 上架时间倒序 —— 蹲价那个"最便宜的 100 条"永远看不到贵货,
                         // 而观察要的正是完整的一批。
                         Some(with_sort(&query_json, "indexed", "desc"))
                     }
-                    Err(error) => {
+                    QueryLookup::Pending => {
+                        still_pending = true;
+                        None
+                    }
+                    QueryLookup::Failed(message) => {
                         self.observe_scheduler.remove(&entry.id);
-                        let message = format!("{}: {error}", entry.label);
                         self.emit(RuntimeEvent::Log(message.clone()));
                         self.upsert_observation(entry.clone(), None, Some(message));
                         continue;
                     }
                 }
-            } else {
-                known.and_then(|runtime| runtime.query_body.clone())
             };
 
             self.observe_scheduler.upsert(
@@ -1817,6 +2055,9 @@ impl RuntimeActor {
             );
             stagger += 1;
             self.upsert_observation(entry.clone(), query_body, None);
+            if let Some(runtime) = self.observations.get_mut(&entry.id) {
+                runtime.query_pending = still_pending;
+            }
         }
 
         // 设置里没有的观察:停掉排班、从内存里拿掉,**库里的行留着**。
@@ -1889,6 +2130,7 @@ impl RuntimeActor {
                         entry,
                         query_body,
                         search_id: String::new(),
+                        query_pending: false,
                         discover_in_flight: false,
                         discover_pending: 0,
                         pushed_seen: 0,
@@ -1965,6 +2207,7 @@ impl RuntimeActor {
         let Some(body_json) = runtime.query_body.clone() else {
             return;
         };
+        let game = runtime.entry.game;
         let league = runtime.entry.league.clone();
         runtime.discover_in_flight = true;
         // 上一轮的错误到此为止:这一轮的结论由这一轮说了算。
@@ -1976,7 +2219,11 @@ impl RuntimeActor {
         self.refresh_observe_schedule(obs_id);
 
         self.gateway.submit(GatewayRequest {
-            kind: RequestKind::Search { league, body_json },
+            kind: RequestKind::Search {
+                game,
+                league,
+                body_json,
+            },
             // 观察永远排在队列最后:它是攒数据的活,晚十秒钟什么也不影响,
             // 而蹲价晚十秒可能就错过一件好货。
             priority: Priority::Background,
@@ -2048,7 +2295,9 @@ impl RuntimeActor {
             return;
         }
         let batch = self.fetch_batch();
+        let mut game = Game::default();
         if let Some(runtime) = self.observations.get_mut(obs_id) {
+            game = runtime.entry.game;
             runtime.discover_pending = ids.chunks(batch).count();
         }
         // 和回查那一行对着看:两边发的是同一种请求,形状也该看得见 ——
@@ -2058,13 +2307,14 @@ impl RuntimeActor {
             self.observation_label(obs_id),
             ids.len(),
             ids.chunks(batch).count(),
-            fetch_url(&ids[..ids.len().min(batch)], search_id).len()
+            fetch_url(game, &ids[..ids.len().min(batch)], search_id).len()
         )));
         for chunk in ids.chunks(batch) {
             self.gateway.submit(GatewayRequest {
                 // 按 id 对号的那一种:普通 fetch 的回信早把 `null` 那几格丢掉了,
                 // 而"我问的这一条已经没了"正是要记一笔的事。
                 kind: RequestKind::FetchByIds {
+                    game,
                     ids: chunk.to_vec(),
                     search_id: search_id.to_string(),
                 },
@@ -2275,15 +2525,19 @@ impl RuntimeActor {
             // `?query=` 只是这次 fetch 的上下文参数,认的是 id 本身;混批时
             // 拿第一条观察的那个就行 —— 拆成"一条观察一批"反而会发出好几个
             // 装不满的请求,那才是真正在浪费额度。
-            let search_id = self
+            //
+            // 代数同理 —— 混批时按第一条观察的那一代发。两代的挂单 id 混进
+            // 同一批本来就不该发生:一条观察只属于一代,而回查是按观察捞出来的。
+            let (game, search_id) = self
                 .observations
                 .get(&chunk[0].1[0].obs_id)
                 .map(|runtime| {
-                    if runtime.search_id.is_empty() {
+                    let search_id = if runtime.search_id.is_empty() {
                         runtime.entry.search_id.clone()
                     } else {
                         runtime.search_id.clone()
-                    }
+                    };
+                    (runtime.entry.game, search_id)
                 })
                 .unwrap_or_default();
             let sweep_id = self.next_sweep_id;
@@ -2299,10 +2553,14 @@ impl RuntimeActor {
             self.emit(RuntimeEvent::Log(format!(
                 "observation recheck batch #{sweep_id}: {} listing(s), fetch url {} chars",
                 ids.len(),
-                fetch_url(&ids, &search_id).len()
+                fetch_url(game, &ids, &search_id).len()
             )));
             self.gateway.submit(GatewayRequest {
-                kind: RequestKind::FetchByIds { ids, search_id },
+                kind: RequestKind::FetchByIds {
+                    game,
+                    ids,
+                    search_id,
+                },
                 priority: Priority::Background,
                 reply: self.replies.clone(),
                 tag: RequestTag::sweep(sweep_id, OBSERVE_RECHECK_LABEL),
@@ -2521,6 +2779,7 @@ impl RuntimeActor {
             return;
         }
         match kind {
+            ReplyKind::SavedQuery(result) => self.on_observation_saved_query(obs_id, result, now),
             ReplyKind::Search(Ok(outcome)) => self.on_discover_search(obs_id, outcome, now),
             ReplyKind::Search(Err(error)) => self.on_discover_failed(obs_id, &error),
             ReplyKind::FetchByIds(Ok(pairs)) => {
@@ -2626,6 +2885,20 @@ impl RuntimeActor {
             return;
         };
 
+        // PoE1 上这颗按钮根本不该出现(卡片会把它藏掉),但提醒记录页那颗
+        // 还在,而且用户随时可能点。在**发出去之前**答一句人话,别拿一张
+        // 不存在的 token 去换服务端的一个 404 —— 那要白花一次额度。
+        if row.game != Game::Poe2 {
+            self.finish_hideout(
+                alert_id,
+                HideoutOutcome::Failed {
+                    status: 0,
+                    message: HIDEOUT_UNSUPPORTED_MESSAGE.to_string(),
+                },
+            );
+            return;
+        }
+
         let token = usable_token(row.hideout_token.as_deref(), row.token_fetched_at, now);
         self.hideout.insert(alert_id, flow_for(&row));
         match token {
@@ -2653,6 +2926,7 @@ impl RuntimeActor {
         flow.refreshed = true;
         let request = GatewayRequest {
             kind: RequestKind::Fetch {
+                game: flow.game,
                 ids: vec![flow.listing_id.clone()],
                 search_id: flow.search_id.clone(),
             },
@@ -2681,12 +2955,15 @@ impl RuntimeActor {
             return;
         }
         flow.posts += 1;
+        let game = flow.game;
         let referer = search_page_url(&SearchRef {
+            game,
             league: flow.league.clone(),
             search_id: flow.search_id.clone(),
         });
         let request = GatewayRequest {
             kind: RequestKind::Whisper {
+                game,
                 token: token.to_string(),
                 referer,
             },
@@ -2737,9 +3014,11 @@ impl RuntimeActor {
                 let outcome = hideout_failure(HideoutStep::Whisper, &listing_id, &error);
                 self.finish_hideout(alert_id, outcome);
             }
-            // 这条链路上不会有 search、不会有会话检查,也不会有市场观察专用的
-            // 那两种 fetch(按 id 对号的、按位置读的)。
+            // 这条链路上不会有 search、不会有会话检查、不会有"换一条已保存的
+            // 查询",也不会有市场观察专用的那两种 fetch(按 id 对号的、
+            // 按位置读的)。
             ReplyKind::Search(_)
+            | ReplyKind::SavedQuery(_)
             | ReplyKind::SessionCheck(_)
             | ReplyKind::FetchByIds(_)
             | ReplyKind::FetchSlots(_) => {}
@@ -2844,14 +3123,18 @@ impl RuntimeActor {
             });
             return;
         }
-        let (league, body_json) =
+        let (game, league, body_json) =
             session_check_request(&self.settings.watches, &self.settings.league, |watch_id| {
                 self.watches
                     .get(watch_id)
                     .and_then(|runtime| runtime.query_body.clone())
             });
         self.gateway.submit(GatewayRequest {
-            kind: RequestKind::SessionCheck { league, body_json },
+            kind: RequestKind::SessionCheck {
+                game,
+                league,
+                body_json,
+            },
             // 用户正看着按钮等结果,排在队列最前面。
             priority: Priority::User,
             reply: self.replies.clone(),
@@ -3099,26 +3382,27 @@ fn usable_token(token: Option<&str>, fetched_at: Option<i64>, now: i64) -> Optio
     (now - fetched_at <= HIDEOUT_TOKEN_MAX_AGE_SECS).then(|| token.to_string())
 }
 
-/// 测试会话拿什么去问:(联赛, 请求体)。
+/// 测试会话拿什么去问:(哪一代, 联赛, 请求体)。
 ///
 /// 借用户自己第一条启用着的搜索 —— 那个查询一定是合法的,而且它本来就是
 /// 这个程序会发的东西。一条搜索都没有(或者粘进来的 id 还没解开)才退回
-/// [`probe_body`]。纯函数:`body_of` 把"这条搜索的请求体在哪儿"这件事
-/// 留给调用方,于是这一段不用碰 actor 的内部状态也测得动。
+/// [`probe_body`],那时按设置页当前的联赛问 PoE2。纯函数:`body_of` 把
+/// "这条搜索的请求体在哪儿"这件事留给调用方,于是这一段不用碰 actor 的
+/// 内部状态也测得动。
 fn session_check_request(
     watches: &[WatchEntry],
     league: &str,
     body_of: impl Fn(&WatchId) -> Option<String>,
-) -> (String, String) {
+) -> (Game, String, String) {
     for entry in watches {
         if !entry.enabled {
             continue;
         }
         if let Some(body) = body_of(&entry.id) {
-            return (entry.league.clone(), body);
+            return (entry.game, entry.league.clone(), body);
         }
     }
-    (league.to_string(), probe_body())
+    (Game::default(), league.to_string(), probe_body())
 }
 
 /// 没有搜索可借时用的探针查询:在线的 Divine Orb,按价升序。
@@ -3156,6 +3440,7 @@ fn session_check_report(result: &Result<SessionCheckOutcome, GatewayError>) -> (
 fn flow_for(row: &AlertRow) -> HideoutFlow {
     HideoutFlow {
         listing_id: row.listing_id.clone(),
+        game: row.game,
         league: row.league.clone(),
         search_id: row.search_id.clone(),
         posts: 0,
@@ -3371,6 +3656,18 @@ mod actor_tests {
     /// 用真的而不是编一个:`decode_search_id` 会去解 gzip,编的解不开。
     const FIXTURE_ID: &str = "H4sIAAAAAAAAAx2LvQnAIBBGV5GvdgLbjJAyWAhRFPRO9FIEcfdo2vcz0MXJ02EGuEpiggFTTuQxNcgVv8AROTXFQUn06hRuBfof13cNyFt35eheOKQsvm1hp50f6Xdj02AAAAA";
 
+    /// PoE1 老式的搜索 id:服务端发的短把手,本地一个字节都解不出来。
+    const POE1_ID: &str = "Rj3mL5Sw";
+
+    /// 那条 id 去 `GET /api/trade/search/<联赛>/<id>` 换回来的东西。
+    ///
+    /// **这个形状没有实测过**:2026-09-09 那趟核实跑手里只有接口自己发的
+    /// 长 id,拿它去换查询服务端回的是 404,短把手手上一个也没有。所以这里
+    /// 照官方文档和 trade2 的形状写,真拿到短把手时对不对得等下一次核实。
+    const POE1_SAVED_RESPONSE: &str = r#"{"id":"Rj3mL5Sw","complexity":4,"league":"Standard",
+        "query":{"status":{"option":"online"},"name":"Headhunter","type":"Leather Belt"},
+        "sort":{"price":"asc"}}"#;
+
     /// 假交易站记下来的账:测试从这里读"到底发出去了什么请求"。
     #[derive(Default)]
     struct TradeLog {
@@ -3432,6 +3729,13 @@ mod actor_tests {
         indexed: Option<String>,
         /// 每件货身上的显示词缀。市场观察按它们聚合。
         item_mods: Vec<String>,
+        /// 每次 search 发去了哪一代、哪个联赛。PoE1 那条路证明"它真的
+        /// POST 到了 `/api/trade/search/<联赛>`"靠的就是它。
+        search_targets: Vec<(Game, String)>,
+        /// 每次"换一条已保存的查询"问的是 (哪一代, 联赛, 搜索 id)。
+        saved_query_calls: Vec<(Game, String, String)>,
+        /// 那一问回什么。`None` = 一份写死的 PoE1 查询。
+        saved_query_body: Option<String>,
     }
 
     /// 假交易站:不打网络,search 回两个写死的 id,fetch 按你问的 id 现编。
@@ -3530,7 +3834,8 @@ mod actor_tests {
     impl TradeTransport for FakeTrade {
         fn search(
             &self,
-            _league: &str,
+            game: Game,
+            league: &str,
             body_json: &str,
             _session: Option<&str>,
         ) -> Result<TradeResponse, pnd_trade::TransportError> {
@@ -3538,6 +3843,7 @@ mod actor_tests {
                 let mut log = self.log.lock().unwrap();
                 log.searches += 1;
                 log.search_bodies.push(body_json.to_string());
+                log.search_targets.push((game, league.to_string()));
                 (
                     log.rate_rules.clone(),
                     log.search_ids.clone(),
@@ -3573,8 +3879,27 @@ mod actor_tests {
             })
         }
 
+        fn load_saved_query(
+            &self,
+            game: Game,
+            league: &str,
+            search_id: &str,
+            _session: Option<&str>,
+        ) -> Result<TradeResponse, pnd_trade::TransportError> {
+            let body = {
+                let mut log = self.log.lock().unwrap();
+                log.saved_query_calls
+                    .push((game, league.to_string(), search_id.to_string()));
+                log.saved_query_body
+                    .clone()
+                    .unwrap_or_else(|| POE1_SAVED_RESPONSE.to_string())
+            };
+            ok(&body)
+        }
+
         fn fetch(
             &self,
+            _game: Game,
             ids: &[String],
             _search_id: &str,
             _session: Option<&str>,
@@ -3626,6 +3951,7 @@ mod actor_tests {
 
         fn whisper(
             &self,
+            _game: Game,
             token: &str,
             _session: &str,
             _referer: &str,
@@ -3993,6 +4319,225 @@ mod actor_tests {
         let midnight = start_of_today(now);
         assert!(midnight <= now);
         assert!(now - midnight < 25 * 3_600);
+    }
+
+    // ---- PoE1 --------------------------------------------------------
+
+    /// 一份盯着 PoE1 `Standard` 的蹲价设置。
+    ///
+    /// 不勾 live:这几个测试不需要 WebSocket,而离线跑的时候生产连接器会
+    /// 真的去连 GGG。
+    fn poe1_settings() -> AppSettings {
+        AppSettings {
+            league: "Forbidden Rites".to_string(),
+            watches: vec![WatchEntry {
+                id: WatchId("w1".to_string()),
+                label: "Headhunter".to_string(),
+                game: Game::Poe1,
+                league: "Standard".to_string(),
+                search_id: POE1_ID.to_string(),
+                price_cap: Price::new(20_000, Currency::Divine),
+                live: false,
+                ..WatchEntry::default()
+            }],
+            ..AppSettings::default()
+        }
+    }
+
+    /// PoE1 的搜索 id 本地解不开,所以第一轮之前要先去服务端**换**一次查询,
+    /// 换到了才 POST 那条查询 —— 而且是 POST 到 `/api/trade/search/<联赛>`,
+    /// 不是 trade2 那条路。
+    ///
+    /// 一条搜索只换一次:再保存一次设置不该再花一次 search 额度。
+    #[test]
+    fn a_poe1_watch_swaps_its_id_for_a_query_once_then_polls_the_poe1_endpoint() {
+        let (transport, log) = FakeTrade::new();
+        let handle =
+            RuntimeHandle::start_offline(poe1_settings(), RuntimePaths::in_memory(), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        wait_for(&handle, &mut seen, |e| *e == RuntimeEvent::Ready, "Ready");
+        wait_for(
+            &handle,
+            &mut seen,
+            |event| matches!(event, RuntimeEvent::ListingMatched(_)),
+            "ListingMatched",
+        );
+
+        // 再保存一次设置:查询已经在手上了,不该再问一遍。
+        handle
+            .try_send(RuntimeCommand::ApplySettings(Box::new(poe1_settings())))
+            .unwrap();
+        thread::sleep(Duration::from_millis(200));
+
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.saved_query_calls,
+            vec![(Game::Poe1, "Standard".to_string(), POE1_ID.to_string())],
+            "换查询只该发一次"
+        );
+        assert!(
+            log.search_targets
+                .iter()
+                .all(|(game, league)| *game == Game::Poe1 && league == "Standard"),
+            "{:?}",
+            log.search_targets
+        );
+        // 这条搜索真正会被 POST 到的地址。
+        assert_eq!(
+            pnd_trade::search_url(Game::Poe1, "Standard"),
+            "https://www.pathofexile.com/api/trade/search/Standard"
+        );
+        // 发出去的请求体是**换回来的那条查询**,不是那串 id。
+        let body = log.search_bodies.first().expect("a search body");
+        assert!(body.contains("Headhunter"), "{body}");
+        assert!(!body.contains(POE1_ID), "{body}");
+    }
+
+    /// 2026-09-09 那趟核实跑发现的事:PoE1 的接口现在**也**发那种自带查询的
+    /// 长 id(`H4sIAAAA…`,和 trade2 一样是 gzip+base64url)。这种 id 本地就
+    /// 解得开,一次请求都不该花 —— 而且真去 `GET .../search/<联赛>/<那串长 id>`
+    /// 换查询,服务端回的是 404。所以本地解得开的时候绝不问服务端。
+    #[test]
+    fn a_poe1_id_that_decodes_locally_costs_no_request() {
+        let mut settings = poe1_settings();
+        settings.watches[0].search_id = FIXTURE_ID.to_string();
+
+        let (transport, log) = FakeTrade::new();
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::in_memory(), transport).unwrap();
+
+        let mut seen = Vec::new();
+        wait_for(&handle, &mut seen, |e| *e == RuntimeEvent::Ready, "Ready");
+        wait_for(
+            &handle,
+            &mut seen,
+            |event| matches!(event, RuntimeEvent::ListingMatched(_)),
+            "ListingMatched",
+        );
+
+        let log = log.lock().unwrap();
+        assert!(
+            log.saved_query_calls.is_empty(),
+            "id 自己就带着查询,不该去问服务端:{:?}",
+            log.saved_query_calls
+        );
+        assert_eq!(log.search_targets[0], (Game::Poe1, "Standard".to_string()));
+    }
+
+    /// 换回来的查询存进了 `saved_queries`,所以重启之后一个请求都不用发。
+    #[test]
+    fn a_cached_poe1_query_costs_no_request_at_all() {
+        let path = temp_db("poe1-cache");
+        {
+            let store = WatchStore::open(&path).expect("open");
+            store
+                .put_saved_query(
+                    Game::Poe1,
+                    "Standard",
+                    POE1_ID,
+                    r#"{"status":{"option":"online"},"name":"Headhunter"}"#,
+                    0,
+                )
+                .expect("seed");
+        }
+
+        let (transport, log) = FakeTrade::new();
+        let handle = RuntimeHandle::start_offline(
+            poe1_settings(),
+            RuntimePaths::new(path.clone()),
+            transport,
+        )
+        .unwrap();
+
+        let mut seen = Vec::new();
+        wait_for(&handle, &mut seen, |e| *e == RuntimeEvent::Ready, "Ready");
+        wait_for(
+            &handle,
+            &mut seen,
+            |event| matches!(event, RuntimeEvent::ListingMatched(_)),
+            "ListingMatched",
+        );
+
+        {
+            let log = log.lock().unwrap();
+            assert!(
+                log.saved_query_calls.is_empty(),
+                "库里已经有这条查询了,不该再问服务端:{:?}",
+                log.saved_query_calls
+            );
+            assert_eq!(log.search_targets[0], (Game::Poe1, "Standard".to_string()));
+            assert!(log.search_bodies[0].contains("Headhunter"));
+        }
+        drop(handle);
+        remove_db(&path);
+    }
+
+    /// PoE1 的 live 走的是另一条 socket 地址,联赛前面没有 `poe2/`。
+    ///
+    /// 秒推**不用等换查询**:那条 socket 认的就是用户粘进来的那串 id。
+    #[test]
+    fn a_poe1_live_connection_opens_the_poe1_socket() {
+        let (transport, _log) = FakeTrade::new();
+        // 剧本留空 = 连上之后一直安静(和真的空闲连接一样)。这个测试只关心
+        // 握手去了哪个地址。
+        let connector = Arc::new(ScriptedConnector::new());
+        let mut settings = poe1_settings();
+        settings.poesessid = "cookie".to_string();
+        settings.watches[0].live = true;
+
+        let handle = RuntimeHandle::start_offline_with_connector(
+            settings,
+            RuntimePaths::in_memory(),
+            transport,
+            shared(&connector),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while connector.connects() == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(handle);
+
+        assert_eq!(
+            connector.urls().first().map(String::as_str),
+            Some("wss://www.pathofexile.com/api/trade/live/Standard/Rj3mL5Sw")
+        );
+    }
+
+    /// PoE1 上"去藏身处"根本不成立:那一代的挂单里没有 `hideout_token`。
+    /// 所以这一下**一个请求都不该出门** —— 答一句人话,不去换服务端的一个 404。
+    #[test]
+    fn travelling_to_a_poe1_hideout_is_refused_without_a_request() {
+        let (transport, log) = FakeTrade::new();
+        log.lock().unwrap().hideout_token = Some("tok-fresh".to_string());
+        let mut settings = poe1_settings();
+        settings.poesessid = "cookie".to_string();
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::in_memory(), transport).unwrap();
+
+        let mut seen = Vec::new();
+        let alert_id = first_alert(&handle, &mut seen);
+        let fetches_before = log.lock().unwrap().fetches.len();
+        let outcomes = hideout_outcomes(&handle, &mut seen, alert_id);
+
+        assert_eq!(
+            outcomes,
+            vec![HideoutOutcome::Failed {
+                status: 0,
+                message: HIDEOUT_UNSUPPORTED_MESSAGE.to_string(),
+            }],
+            "{seen:#?}"
+        );
+        let log = log.lock().unwrap();
+        assert!(log.whispers.is_empty(), "一封 whisper 都不该发出去");
+        assert_eq!(
+            log.fetches.len(),
+            fetches_before,
+            "也不该为了换 token 再 fetch 一次"
+        );
     }
 
     // ---- live --------------------------------------------------------
@@ -5175,17 +5720,32 @@ mod actor_tests {
         ];
         let bodies = |id: &WatchId| (id.as_str() == "on").then(|| "{\"query\":1}".to_string());
 
-        let (league, body) = session_check_request(&watches, "Whatever", bodies);
+        let (game, league, body) = session_check_request(&watches, "Whatever", bodies);
+        assert_eq!(game, Game::Poe2);
         assert_eq!(league, "Forbidden Rites", "停用的那条不算");
         assert_eq!(body, "{\"query\":1}");
 
-        // 一条搜索都没有:退回探针查询,联赛用设置里那个。
-        let (league, body) = session_check_request(&[], "Forbidden Rites", |_| None);
+        // 一条搜索都没有:退回探针查询,联赛用设置里那个,代数用默认那个。
+        let (game, league, body) = session_check_request(&[], "Forbidden Rites", |_| None);
+        assert_eq!(game, Game::Poe2);
         assert_eq!(league, "Forbidden Rites");
         assert_eq!(body, probe_body());
         // 搜索还没解开(粘错了的 id)时也一样。
-        let (_, body) = session_check_request(&watches, "Forbidden Rites", |_| None);
+        let (_, _, body) = session_check_request(&watches, "Forbidden Rites", |_| None);
         assert_eq!(body, probe_body());
+
+        // 借的那条搜索是 PoE1 的话,这一问就得发去 PoE1 —— 拿 trade2 的地址
+        // 去问一个 PoE1 联赛,回来的状态码说明不了会话的死活。
+        let poe1 = vec![WatchEntry {
+            id: WatchId("poe1".to_string()),
+            game: Game::Poe1,
+            league: "Standard".to_string(),
+            ..WatchEntry::default()
+        }];
+        let (game, league, _) =
+            session_check_request(&poe1, "Forbidden Rites", |_| Some("{}".to_string()));
+        assert_eq!(game, Game::Poe1);
+        assert_eq!(league, "Standard");
     }
 
     /// 探针查询就是计划里写死的那一句,不多不少。
@@ -5280,6 +5840,7 @@ mod actor_tests {
     /// 一份只有一条市场观察、一条蹲价搜索都没有的设置。
     fn observe_settings(label: &str) -> (AppSettings, ObservationId) {
         let search = SearchRef {
+            game: Game::Poe2,
             league: "Forbidden Rites".to_string(),
             search_id: FIXTURE_ID.to_string(),
         };

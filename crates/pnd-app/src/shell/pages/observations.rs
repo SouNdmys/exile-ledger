@@ -34,7 +34,7 @@ use gpui_component::switch::Switch;
 use gpui_component::{Selectable as _, Sizable as _, Size, StyledExt as _};
 
 use pnd_domain::{
-    GoneClass, ObservationId, Price, PriceBucket, decode_search_id, default_label_for,
+    Game, GoneClass, ObservationId, Price, PriceBucket, decode_search_id, default_label_for,
     encode_search_id, parse_search_reference, with_stat_filter,
 };
 use pnd_runtime::{LiveRunState, ObservationStatus, RuntimeCommand, now_secs};
@@ -43,7 +43,7 @@ use pnd_storage::{
     ModOutcome, ObservationSummary, ObservedListingRow, ObservedMod, PriceOutcome, StorageError,
 };
 
-use super::{Cell, TableContent, Tone, column, number_column};
+use super::{Cell, TableContent, Tone, column, league_cell_text, number_column};
 use crate::i18n::{self, Text};
 use crate::shell::link::local_stamp;
 use crate::shell::ninja::percent_text;
@@ -326,7 +326,7 @@ pub fn observation_rows(
             let live = status.get(&entry.id);
             vec![
                 Cell::plain(entry.label.clone()),
-                Cell::muted(entry.league.clone()),
+                Cell::muted(league_cell_text(entry.game, &entry.league, text)),
                 Cell::data(entry.sample_every.to_string()),
                 count_cell(live.map(|status| status.active), text),
                 count_cell(live.map(|status| status.gone), text),
@@ -337,6 +337,16 @@ pub fn observation_rows(
             ]
         })
         .collect()
+}
+
+/// 词缀那排按钮里的「做成蹲价」这次给不给。
+///
+/// 一键蹲价要把观察的搜索 id 解回查询原文(`decode_search_id`),而 PoE1 的 id
+/// 是服务器发的一串号,里面没有查询 —— 那条路在 PoE1 上走不通,所以按钮干脆
+/// 不出现,而不是点下去再报错。还没选中任何观察时照常显示。
+#[must_use]
+pub fn make_watch_offered(entry: Option<&ObservationEntry>) -> bool {
+    entry.is_none_or(|entry| entry.game == Game::Poe2)
 }
 
 /// 计数那两格。"—" 只留给"还没有状态可说";已经在跑却一条都没记下来是个
@@ -978,13 +988,21 @@ impl AppShell {
                         this.toggle_selected_mod_favourite(cx);
                     })),
             )
-            .child(
-                Button::new("obs-make-watch")
-                    .label(text.obs_make_watch)
-                    .with_size(Size::Small)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.make_watch_from_selected_mod(window, cx);
-                    })),
+            .children(
+                make_watch_offered(
+                    self.observe
+                        .selected
+                        .as_ref()
+                        .and_then(|id| self.settings.observation(id)),
+                )
+                .then(|| {
+                    Button::new("obs-make-watch")
+                        .label(text.obs_make_watch)
+                        .with_size(Size::Small)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.make_watch_from_selected_mod(window, cx);
+                        }))
+                }),
             )
     }
 
@@ -1911,6 +1929,29 @@ mod observations_page_tests {
             ],
             ..AppSettings::default()
         }
+    }
+
+    /// 联赛那一格要说清是哪个游戏,理由同蹲价页。
+    #[test]
+    fn a_poe1_observation_says_so_in_the_league_cell() {
+        let mut settings = settings();
+        settings.observations[0].game = pnd_domain::Game::Poe1;
+        settings.observations[0].league = "Standard".to_string();
+        let rows = observation_rows(&settings, &status(), &i18n::ENGLISH, NOW);
+        assert_eq!(rows[0][1].text(), "PoE1 · Standard");
+        assert_eq!(rows[1][1].text(), "Forbidden Rites", "PoE2 那条不加前缀");
+    }
+
+    /// PoE1 的观察上没有「做成蹲价」:那条路要把搜索 id 解回查询原文,
+    /// PoE1 的 id 里没有查询。
+    #[test]
+    fn make_watch_is_hidden_for_a_poe1_observation() {
+        let settings = settings();
+        assert!(make_watch_offered(None), "还没选中时照常显示");
+        assert!(make_watch_offered(Some(&settings.observations[0])));
+        let mut poe1 = settings.observations[0].clone();
+        poe1.game = pnd_domain::Game::Poe1;
+        assert!(!make_watch_offered(Some(&poe1)));
     }
 
     fn status() -> BTreeMap<ObservationId, ObservationStatus> {

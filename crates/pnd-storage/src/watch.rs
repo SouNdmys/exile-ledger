@@ -17,7 +17,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use pnd_domain::{Currency, ListingSummary, Price, Verdict, WatchId};
+use pnd_domain::{Currency, Game, ListingSummary, Price, Verdict, WatchId};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use thiserror::Error;
 
@@ -84,7 +84,21 @@ CREATE TABLE IF NOT EXISTS alerts (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS alerts_fired ON alerts(fired_at DESC);
+
+CREATE TABLE IF NOT EXISTS saved_queries (
+    game TEXT NOT NULL,
+    league TEXT NOT NULL,
+    search_id TEXT NOT NULL,
+    query_json TEXT NOT NULL,
+    loaded_at INTEGER NOT NULL,
+    PRIMARY KEY (game, league, search_id)
+) STRICT;
 "#;
+
+/// `alerts` 是已经发货的表,加列只能 `ALTER TABLE`,而 SQLite 没有
+/// `ADD COLUMN IF NOT EXISTS` —— 每次开库都无脑执行会在第二次报错。
+/// 所以先问一句 `PRAGMA table_info` 再决定加不加。
+const ALERTS_GAME_COLUMN: &str = "ALTER TABLE alerts ADD COLUMN game TEXT NOT NULL DEFAULT 'poe2'";
 
 /// 一条搜索的 live 连接现在处在哪一档。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -175,6 +189,9 @@ pub struct WatchState {
 #[derive(Debug, Clone)]
 pub struct NewAlert<'a> {
     pub watch_id: &'a WatchId,
+    /// 哪一代游戏。记下来才知道这张卡片上该不该有"去藏身处"那颗按钮,
+    /// 以及"打开交易页"该开哪一代的地址 —— 联赛名两代会撞车。
+    pub game: Game,
     pub league: &'a str,
     pub search_id: &'a str,
     pub listing: &'a ListingSummary,
@@ -187,6 +204,9 @@ pub struct AlertRow {
     pub alert_id: i64,
     pub watch_id: WatchId,
     pub listing_id: String,
+    /// 老库里的行没有这一列,`ALTER TABLE` 给它们补的是 `'poe2'` ——
+    /// 这个程序在加 PoE1 之前只可能记下 PoE2 的提醒,所以那个默认值是对的。
+    pub game: Game,
     pub league: String,
     pub search_id: String,
     pub item_name: String,
@@ -237,6 +257,9 @@ impl WatchStore {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(BASELINE_SCHEMA)?;
         conn.execute_batch(crate::observe::OBSERVE_SCHEMA)?;
+        if !has_column(&conn, "alerts", "game")? {
+            conn.execute_batch(ALERTS_GAME_COLUMN)?;
+        }
         Ok(Self { conn })
     }
 
@@ -431,13 +454,14 @@ impl WatchStore {
         // token 是短命 JWT,记下拿到它的时刻:点"去藏身处"时超过 10 分钟就先重新 fetch。
         let token_fetched_at = listing.hideout_token.as_ref().map(|_| now);
         self.conn.execute(
-            "INSERT INTO alerts (watch_id, listing_id, league, search_id, item_name,
+            "INSERT INTO alerts (watch_id, listing_id, game, league, search_id, item_name,
                  price_milli, price_currency, account, character, whisper,
                  hideout_token, token_fetched_at, source, fired_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 alert.watch_id.as_str(),
                 listing.id,
+                alert.game.as_str(),
                 alert.league,
                 alert.search_id,
                 listing.item_name,
@@ -459,7 +483,7 @@ impl WatchStore {
         let row = self
             .conn
             .query_row(
-                "SELECT alert_id, watch_id, listing_id, league, search_id, item_name,
+                "SELECT alert_id, watch_id, listing_id, game, league, search_id, item_name,
                         price_milli, price_currency, account, character, whisper,
                         hideout_token, token_fetched_at, source, fired_at, dismissed_at, last_action
                  FROM alerts WHERE alert_id = ?1",
@@ -473,7 +497,7 @@ impl WatchStore {
     /// 提醒记录页要的那一页:最新的在最前面。
     pub fn recent_alerts(&self, limit: u32) -> Result<Vec<AlertRow>, StorageError> {
         let mut statement = self.conn.prepare(
-            "SELECT alert_id, watch_id, listing_id, league, search_id, item_name,
+            "SELECT alert_id, watch_id, listing_id, game, league, search_id, item_name,
                     price_milli, price_currency, account, character, whisper,
                     hideout_token, token_fetched_at, source, fired_at, dismissed_at, last_action
              FROM alerts ORDER BY fired_at DESC, alert_id DESC LIMIT ?1",
@@ -526,6 +550,56 @@ impl WatchStore {
             |row| row.get(0),
         )?;
         Ok(to_u32(count))
+    }
+
+    // ---- saved_queries --------------------------------------------------
+
+    /// 服务端存着的那条查询,我们抄下来的副本(PoE1 专用,走的是
+    /// `GET /api/trade/search/<联赛>/<id>`)。
+    ///
+    /// 为什么要缓存:PoE1 那些本地解不开的老式 id,查询只能问服务端;而那一问
+    /// 要花一次 search 额度。查询本身是不会变的(那条 id 指的就是那一份条件),
+    /// 所以问一次存下来,重启之后也不用再问。
+    ///
+    /// 键里有 `game`:`Standard` 两代都有,光靠(联赛, id)会把两代的查询
+    /// 存进同一格。
+    pub fn saved_query(
+        &self,
+        game: Game,
+        league: &str,
+        search_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let query = self
+            .conn
+            .query_row(
+                "SELECT query_json FROM saved_queries
+                 WHERE game = ?1 AND league = ?2 AND search_id = ?3",
+                params![game.as_str(), league, search_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(query)
+    }
+
+    /// 把刚问回来的那条查询存下来。同一格再存一次就是覆盖 ——
+    /// 服务端要是哪天改了这条 id 的内容,以新的为准。
+    pub fn put_saved_query(
+        &self,
+        game: Game,
+        league: &str,
+        search_id: &str,
+        query_json: &str,
+        now: i64,
+    ) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT INTO saved_queries (game, league, search_id, query_json, loaded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(game, league, search_id) DO UPDATE SET
+                 query_json = excluded.query_json,
+                 loaded_at = excluded.loaded_at",
+            params![game.as_str(), league, search_id, query_json, now],
+        )?;
+        Ok(())
     }
 
     /// 删掉一条搜索:运行状态和去重记录都不留,**提醒历史留着**。
@@ -599,27 +673,42 @@ fn watch_state_from_row(row: &Row<'_>) -> rusqlite::Result<WatchState> {
 }
 
 fn alert_row_from_row(row: &Row<'_>) -> rusqlite::Result<AlertRow> {
-    let price_milli: i64 = row.get(6)?;
-    let price_currency: String = row.get(7)?;
-    let source: String = row.get(13)?;
+    let game: String = row.get(3)?;
+    let price_milli: i64 = row.get(7)?;
+    let price_currency: String = row.get(8)?;
+    let source: String = row.get(14)?;
     Ok(AlertRow {
         alert_id: row.get(0)?,
         watch_id: WatchId(row.get(1)?),
         listing_id: row.get(2)?,
-        league: row.get(3)?,
-        search_id: row.get(4)?,
-        item_name: row.get(5)?,
+        game: Game::parse(&game),
+        league: row.get(4)?,
+        search_id: row.get(5)?,
+        item_name: row.get(6)?,
         price: decode_price(price_milli, &price_currency),
-        account: row.get(8)?,
-        character: row.get(9)?,
-        whisper: row.get(10)?,
-        hideout_token: row.get(11)?,
-        token_fetched_at: row.get(12)?,
+        account: row.get(9)?,
+        character: row.get(10)?,
+        whisper: row.get(11)?,
+        hideout_token: row.get(12)?,
+        token_fetched_at: row.get(13)?,
         source: AlertSource::parse(&source),
-        fired_at: row.get(14)?,
-        dismissed_at: row.get(15)?,
-        last_action: row.get(16)?,
+        fired_at: row.get(15)?,
+        dismissed_at: row.get(16)?,
+        last_action: row.get(17)?,
     })
+}
+
+/// 这张表上有没有这一列。加列前问一句 —— 见 [`ALERTS_GAME_COLUMN`]。
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, StorageError> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -676,6 +765,7 @@ mod watch_tests {
     fn new_alert<'a>(watch_id: &'a WatchId, listing: &'a ListingSummary) -> NewAlert<'a> {
         NewAlert {
             watch_id,
+            game: Game::Poe2,
             league: "Forbidden Rites",
             search_id: "H4sIAAAA-_09",
             listing,
@@ -900,6 +990,7 @@ mod watch_tests {
                 alert_id,
                 watch_id: watch("w-1"),
                 listing_id: "aaa".to_string(),
+                game: Game::Poe2,
                 league: "Forbidden Rites".to_string(),
                 search_id: "H4sIAAAA-_09".to_string(),
                 item_name: "Choir of the Storm".to_string(),
@@ -994,6 +1085,129 @@ mod watch_tests {
         assert_eq!(store.hits_since(&one, 2_000).expect("count"), 2);
         assert_eq!(store.hits_since(&one, 9_000).expect("count"), 0);
         assert_eq!(store.hits_since(&two, 0).expect("count"), 1);
+    }
+
+    /// 提醒记的是哪一代游戏 —— 卡片上"去藏身处"那颗按钮只有 PoE2 才该有,
+    /// 而"打开交易页"两代的地址也不一样。
+    #[test]
+    fn an_alert_remembers_which_game_it_came_from() {
+        let store = store();
+        let id = watch("w-1");
+        let item = listing("aaa", divine(15_000));
+        let mut alert = new_alert(&id, &item);
+        alert.game = Game::Poe1;
+        alert.league = "Standard";
+        alert.search_id = "Rj3mL5Sw";
+
+        let alert_id = store.insert_alert(&alert, 1_000).expect("insert");
+        let row = store.alert(alert_id).expect("read").expect("row");
+        assert_eq!(row.game, Game::Poe1);
+        assert_eq!(row.league, "Standard");
+        assert_eq!(row.search_id, "Rj3mL5Sw");
+
+        // 列表那条路读的是同一批列,别只修好其中一条。
+        assert_eq!(store.recent_alerts(10).expect("read")[0].game, Game::Poe1);
+    }
+
+    /// `alerts` 已经发过货了,`game` 是后加的一列。老库里的行读出来必须是
+    /// PoE2(加这个功能之前只可能记下 PoE2 的提醒),而且开库语句能跑两遍 ——
+    /// 每次启动都会执行一次。
+    #[test]
+    fn an_older_alerts_table_gains_the_game_column_and_defaults_to_poe2() {
+        let conn = Connection::open_in_memory().expect("open");
+        // 加列之前那张表,逐字就是 baseline 里的写法。
+        conn.execute_batch(
+            "CREATE TABLE alerts (
+                alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                watch_id TEXT NOT NULL, listing_id TEXT NOT NULL, league TEXT NOT NULL,
+                search_id TEXT NOT NULL, item_name TEXT NOT NULL, price_milli INTEGER NOT NULL,
+                price_currency TEXT NOT NULL, account TEXT NOT NULL, character TEXT NOT NULL,
+                whisper TEXT NOT NULL, hideout_token TEXT, token_fetched_at INTEGER,
+                source TEXT NOT NULL, fired_at INTEGER NOT NULL, dismissed_at INTEGER,
+                last_action TEXT
+             ) STRICT;
+             INSERT INTO alerts (watch_id, listing_id, league, search_id, item_name,
+                 price_milli, price_currency, account, character, whisper, source, fired_at)
+             VALUES ('w-1','old','Forbidden Rites','H4sIAAAA','Choir',
+                 15000,'divine','Seller','Char','@Char hi','poll',900);",
+        )
+        .expect("legacy table");
+
+        let store = WatchStore::initialize(conn).expect("initialize");
+        let row = store.alert(1).expect("read").expect("row");
+        assert_eq!(row.game, Game::Poe2, "老行补的默认值就该是 poe2");
+        assert_eq!(row.item_name, "Choir");
+        assert_eq!(row.fired_at, 900);
+
+        // 第二次开同一个库不该再加一遍列。
+        assert!(has_column(&store.conn, "alerts", "game").expect("pragma"));
+        store
+            .conn
+            .execute_batch(BASELINE_SCHEMA)
+            .expect("baseline applies twice");
+    }
+
+    /// PoE1 的查询是问服务端要回来的,一条搜索只该问一次:存进去、读得回来。
+    #[test]
+    fn a_saved_query_round_trips_and_is_keyed_by_the_game() {
+        let store = store();
+        let query = r#"{"status":{"option":"online"},"name":"Headhunter"}"#;
+        assert_eq!(
+            store
+                .saved_query(Game::Poe1, "Standard", "Rj3mL5Sw")
+                .expect("read"),
+            None,
+            "还没问过就是没有"
+        );
+
+        store
+            .put_saved_query(Game::Poe1, "Standard", "Rj3mL5Sw", query, 1_000)
+            .expect("put");
+        assert_eq!(
+            store
+                .saved_query(Game::Poe1, "Standard", "Rj3mL5Sw")
+                .expect("read")
+                .as_deref(),
+            Some(query)
+        );
+
+        // `Standard` 两代都有 —— 代数是键的一部分,不能混。
+        assert_eq!(
+            store
+                .saved_query(Game::Poe2, "Standard", "Rj3mL5Sw")
+                .expect("read"),
+            None
+        );
+        // 别的联赛、别的 id 也各是各的。
+        assert_eq!(
+            store
+                .saved_query(Game::Poe1, "Hardcore", "Rj3mL5Sw")
+                .expect("read"),
+            None
+        );
+
+        // 同一格再存一次是覆盖,不是第二行。
+        store
+            .put_saved_query(
+                Game::Poe1,
+                "Standard",
+                "Rj3mL5Sw",
+                r#"{"name":"Mageblood"}"#,
+                2_000,
+            )
+            .expect("put again");
+        assert_eq!(
+            store
+                .saved_query(Game::Poe1, "Standard", "Rj3mL5Sw")
+                .expect("read")
+                .as_deref(),
+            Some(r#"{"name":"Mageblood"}"#)
+        );
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM saved_queries", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(rows, 1);
     }
 
     /// 删搜索删掉的是"还要不要继续跑",不是"我当时看到过什么"。

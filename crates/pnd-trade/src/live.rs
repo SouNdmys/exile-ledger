@@ -30,7 +30,7 @@ use std::io;
 use std::net::TcpStream;
 use std::time::Duration;
 
-use pnd_domain::{SearchRef, encode_league_path, live_page_url};
+use pnd_domain::{Game, SearchRef, encode_league_path, live_page_url};
 use serde_json::Value;
 use thiserror::Error;
 use tungstenite::stream::MaybeTlsStream;
@@ -38,8 +38,10 @@ use tungstenite::{Message, WebSocket};
 
 use crate::jwt::jwt_claims;
 
-/// Live Search 的 WebSocket 根路径(poe2 在 `trade2` 下,和 poe1 是两套)。
-const WS_BASE: &str = "wss://www.pathofexile.com/api/trade2/live/poe2";
+/// Live Search 的 WebSocket 根路径。两代各一条,和 HTTP 那边一样:
+/// poe2 在 `trade2` 下、联赛前面还夹着 `poe2/`,poe1 直接就是联赛。
+const WS_BASE_POE2: &str = "wss://www.pathofexile.com/api/trade2/live/poe2";
+const WS_BASE_POE1: &str = "wss://www.pathofexile.com/api/trade/live";
 
 /// 握手要带的三个"我是从网页来的"字段里的两个常量。
 const HOST: &str = "www.pathofexile.com";
@@ -90,6 +92,8 @@ const PAYLOAD_CLAIM: &str = "d";
 /// `Debug` 是手写的:这个结构会出现在日志和错误上下文里,而它带着 POESESSID。
 #[derive(Clone)]
 pub struct LiveConfig {
+    /// 哪一代游戏 —— 握手地址和 `Referer` 都跟着它走。
+    pub game: Game,
     pub league: String,
     pub search_id: String,
     /// 空串 = 匿名握手(不发 Cookie 头)。服务端几乎肯定会拒,但这条路径
@@ -108,6 +112,7 @@ impl LiveConfig {
         user_agent: impl Into<String>,
     ) -> Self {
         Self {
+            game: search.game,
             league: search.league.clone(),
             search_id: search.search_id.clone(),
             poesessid: poesessid.into(),
@@ -124,6 +129,7 @@ impl LiveConfig {
 
     fn search_ref(&self) -> SearchRef {
         SearchRef {
+            game: self.game,
             league: self.league.clone(),
             search_id: self.search_id.clone(),
         }
@@ -133,6 +139,7 @@ impl LiveConfig {
 impl fmt::Debug for LiveConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LiveConfig")
+            .field("game", &self.game)
             .field("league", &self.league)
             .field("search_id", &self.search_id)
             // 只说有没有,绝不说是什么。
@@ -152,8 +159,12 @@ impl fmt::Debug for LiveConfig {
 
 /// live 接口地址。联赛名和搜索页一样要 URL 编码。
 #[must_use]
-pub fn live_ws_url(league: &str, search_id: &str) -> String {
-    format!("{WS_BASE}/{}/{search_id}", encode_league_path(league))
+pub fn live_ws_url(game: Game, league: &str, search_id: &str) -> String {
+    let base = match game {
+        Game::Poe1 => WS_BASE_POE1,
+        Game::Poe2 => WS_BASE_POE2,
+    };
+    format!("{base}/{}/{search_id}", encode_league_path(league))
 }
 
 // ---------------------------------------------------------------------
@@ -482,7 +493,7 @@ impl LiveSession {
     /// 成功之后立刻给底层 TcpStream 设读超时 —— 见模块头第 2 点。设不上
     /// (理论上只有非 TCP 的流才会)不算失败,只是取消会迟钝一点。
     pub fn connect(config: &LiveConfig) -> Result<LiveSession, LiveError> {
-        let url = live_ws_url(&config.league, &config.search_id);
+        let url = live_ws_url(config.game, &config.league, &config.search_id);
         let request = handshake_request(config, &url)?;
         let (socket, _response) = tungstenite::connect(request).map_err(classify)?;
         set_read_timeout(socket.get_ref(), config.read_timeout);
@@ -675,6 +686,7 @@ mod live_tests {
 
     fn config() -> LiveConfig {
         LiveConfig {
+            game: Game::Poe2,
             league: "Forbidden Rites".to_string(),
             search_id: "H4sIAAAA-_09".to_string(),
             poesessid: SECRET.to_string(),
@@ -688,13 +700,45 @@ mod live_tests {
     #[test]
     fn ws_url_encodes_the_league() {
         assert_eq!(
-            live_ws_url("Forbidden Rites", "abcd1234"),
+            live_ws_url(Game::Poe2, "Forbidden Rites", "abcd1234"),
             "wss://www.pathofexile.com/api/trade2/live/poe2/Forbidden%20Rites/abcd1234"
         );
         assert_eq!(
-            live_ws_url("Standard", "abcd1234"),
+            live_ws_url(Game::Poe2, "Standard", "abcd1234"),
             "wss://www.pathofexile.com/api/trade2/live/poe2/Standard/abcd1234"
         );
+    }
+
+    /// PoE1 的 live 在另一条根路径上,而且联赛前面没有 `poe2/`。
+    #[test]
+    fn a_poe1_ws_url_drops_the_trade2_base_and_the_poe2_segment() {
+        assert_eq!(
+            live_ws_url(Game::Poe1, "Standard", "Rj3mL5Sw"),
+            "wss://www.pathofexile.com/api/trade/live/Standard/Rj3mL5Sw"
+        );
+        assert_eq!(
+            live_ws_url(Game::Poe1, "Hardcore Settlers", "Rj3mL5Sw"),
+            "wss://www.pathofexile.com/api/trade/live/Hardcore%20Settlers/Rj3mL5Sw"
+        );
+    }
+
+    /// 握手的 `Referer` 是"这条搜索的 live 页面",所以它也得跟着代数走 ——
+    /// 拿一张 trade2 的页面地址去敲 trade 的 socket,服务端有理由不认。
+    #[test]
+    fn a_poe1_handshake_refers_to_the_poe1_live_page() {
+        let config = LiveConfig {
+            game: Game::Poe1,
+            league: "Standard".to_string(),
+            search_id: "Rj3mL5Sw".to_string(),
+            ..config()
+        };
+        let url = live_ws_url(config.game, &config.league, &config.search_id);
+        let request = handshake_request(&config, &url).unwrap();
+        assert_eq!(
+            request.headers()["Referer"],
+            "https://www.pathofexile.com/trade/search/Standard/Rj3mL5Sw/live"
+        );
+        assert_eq!(request.uri().to_string(), url);
     }
 
     // ---- 握手请求 ----------------------------------------------------
@@ -702,7 +746,7 @@ mod live_tests {
     #[test]
     fn handshake_carries_every_required_header() {
         let config = config();
-        let url = live_ws_url(&config.league, &config.search_id);
+        let url = live_ws_url(config.game, &config.league, &config.search_id);
         let request = handshake_request(&config, &url).unwrap();
         let headers = request.headers();
 
@@ -733,7 +777,7 @@ mod live_tests {
     #[test]
     fn every_handshake_gets_a_fresh_key() {
         let config = config();
-        let url = live_ws_url(&config.league, &config.search_id);
+        let url = live_ws_url(config.game, &config.league, &config.search_id);
         let first = handshake_request(&config, &url).unwrap();
         let second = handshake_request(&config, &url).unwrap();
         assert_ne!(

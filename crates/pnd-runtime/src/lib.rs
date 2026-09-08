@@ -21,8 +21,8 @@ pub mod observe;
 pub mod poll;
 
 pub use actor::{
-    HideoutOutcome, ObservationStatus, RuntimeCommand, RuntimeError, RuntimeEvent, RuntimeHandle,
-    RuntimePaths, WatchRunState, WatchStatus,
+    HIDEOUT_UNSUPPORTED_MESSAGE, HideoutOutcome, ObservationStatus, RuntimeCommand, RuntimeError,
+    RuntimeEvent, RuntimeHandle, RuntimePaths, WatchRunState, WatchStatus,
 };
 pub use decide::{Decision, MatchedListing, coalesce, decide};
 pub use gateway::{

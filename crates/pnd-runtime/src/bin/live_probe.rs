@@ -103,7 +103,7 @@ fn run(args: &Args) -> Result<(), String> {
     println!("search id    {}", search_ref.search_id);
     println!(
         "wss url      {}",
-        live_ws_url(&search_ref.league, &search_ref.search_id)
+        live_ws_url(search_ref.game, &search_ref.league, &search_ref.search_id)
     );
     println!("referer      {}", live_page_url(&search_ref));
     println!("user agent   {user_agent}");
@@ -263,7 +263,7 @@ fn fetch_and_print(
         }
 
         let ticket = limiter.insert_request(FETCH_POLICY, now_secs());
-        let response = match client.fetch(batch, &search_ref.search_id, session) {
+        let response = match client.fetch(search_ref.game, batch, &search_ref.search_id, session) {
             Ok(response) => response,
             Err(error) => {
                 println!("{}            fetch failed: {error}", stamp());

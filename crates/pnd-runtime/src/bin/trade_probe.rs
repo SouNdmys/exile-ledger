@@ -78,8 +78,8 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use pnd_domain::{
-    Currency, CurrencyRates, ListingSummary, ObservationId, Price, PriceCap, SearchRef, Verdict,
-    decode_search_id, judge, parse_search_reference, search_page_url, search_request_body,
+    Currency, CurrencyRates, Game, ListingSummary, ObservationId, Price, PriceCap, SearchRef,
+    Verdict, decode_search_id, judge, parse_search_reference, search_page_url, search_request_body,
     with_seller_filter, with_sort,
 };
 use pnd_ninja::client::NinjaClient;
@@ -92,7 +92,8 @@ use pnd_runtime::{describe_token, now_secs};
 use pnd_settings::{AppSettings, ObservationEntry, SettingsStore, WatchEntry};
 use pnd_storage::{ObservedListingRow, WatchStore};
 use pnd_trade::client::{
-    MAX_FETCH_IDS, SearchResponse, TradeClient, TradeResponse, ggg_error, parse_search_response,
+    MAX_FETCH_IDS, SearchResponse, TradeClient, TradeResponse, ggg_error, parse_saved_search_query,
+    parse_search_response,
 };
 use pnd_trade::listing::{parse_fetch_response, parse_fetch_response_by_id};
 use pnd_trade::rate_limit::{
@@ -112,7 +113,7 @@ const USER_AGENT: &str = concat!(
 const MIN_ROUND_GAP_SECS: u64 = 5;
 
 const USAGE: &str = "usage: trade_probe --search <url|id> [--league \"Forbidden Rites\"] \
-[--cap 20] [--currency divine] [--rounds 1] [--session <POESESSID>] \
+[--query-json '{...}'] [--cap 20] [--currency divine] [--rounds 1] [--session <POESESSID>] \
 [--rates chaos=25.21,exalted=83.42]\n       \
 trade_probe --watch --minutes 3 [--poll-seconds 60] --search <url|id> [--search <url|id>] \
 [--cap 20] [--currency divine] [--session <POESESSID>] [--hideout <alert_id>]\n       \
@@ -159,12 +160,15 @@ fn run(args: &Args) -> Result<(), String> {
     }
     let search_ref = parse_search_reference(raw, &args.league)
         .ok_or_else(|| format!("could not read a search reference out of {raw:?}"))?;
-    let query_json = decode_search_id(&search_ref.search_id).map_err(|e| e.to_string())?;
+    let client = TradeClient::new(USER_AGENT.to_string());
+    let mut limiter = RateLimiter::default();
+    let query_json = resolve_query(&client, &mut limiter, args, &search_ref)?;
     let request_body = search_request_body(&query_json);
 
     let rates = resolve_rates(args, &search_ref);
     let cap = args.cap();
 
+    println!("game        {}", search_ref.game);
     println!("league      {}", search_ref.league);
     println!("search id   {}", search_ref.search_id);
     println!("search page {}", search_page_url(&search_ref));
@@ -182,9 +186,6 @@ fn run(args: &Args) -> Result<(), String> {
     }
     println!("rates       {}", describe_rates(&rates));
     println!("rounds      {}", args.rounds);
-
-    let client = TradeClient::new(USER_AGENT.to_string());
-    let mut limiter = RateLimiter::default();
 
     for round in 1..=args.rounds {
         println!(
@@ -204,6 +205,10 @@ fn run(args: &Args) -> Result<(), String> {
             sleep(Duration::from_secs(wait));
         }
 
+        // 自己写的查询发出去之后,服务器回一个新 id;PoE1 的第一轮把那个 id
+        // 再读回来一次,看看它指的是不是同一段查询 —— 这是"PoE1 的 id 是个
+        // 存根、要回服务器换查询"这件事唯一的直接证据。
+        let read_back = round == 1 && search_ref.game == Game::Poe1 && args.query_json.is_some();
         match one_round(
             &client,
             &mut limiter,
@@ -212,6 +217,7 @@ fn run(args: &Args) -> Result<(), String> {
             &request_body,
             &rates,
             &cap,
+            read_back,
         )? {
             RoundOutcome::Ok => {}
             RoundOutcome::RateLimited => {
@@ -255,7 +261,7 @@ fn run_observe(args: &Args) -> Result<(), String> {
     let raw = &args.searches[0];
     let search_ref = parse_search_reference(raw, &args.league)
         .ok_or_else(|| format!("could not read a search reference out of {raw:?}"))?;
-    let query_json = decode_search_id(&search_ref.search_id).map_err(|e| e.to_string())?;
+    let query_json = local_query(args, &search_ref)?;
 
     println!("league        {}", search_ref.league);
     println!("search id     {}", search_ref.search_id);
@@ -308,7 +314,15 @@ fn run_observe(args: &Args) -> Result<(), String> {
         "\nfetching those {} ids to read their `indexed` stamps",
         head.len()
     );
-    let response = observe_fetch(&client, &mut limiter, &mut spend, args, &head, &search.id)?;
+    let response = observe_fetch(
+        &client,
+        &mut limiter,
+        &mut spend,
+        args,
+        search_ref.game,
+        &head,
+        &search.id,
+    )?;
     if !response.is_success() {
         return Err(format!(
             "fetch failed with status {}: {}",
@@ -355,6 +369,7 @@ fn run_observe(args: &Args) -> Result<(), String> {
         &mut limiter,
         &mut spend,
         args,
+        search_ref.game,
         &[real.clone(), fake.clone()],
         &search.id,
     )?;
@@ -461,7 +476,12 @@ fn observe_search(
     wait_for_budget(limiter, SEARCH_POLICY, "search");
     let ticket = limiter.insert_request(SEARCH_POLICY, now_secs());
     let response = client
-        .search(&search_ref.league, body, args.session.as_deref())
+        .search(
+            search_ref.game,
+            &search_ref.league,
+            body,
+            args.session.as_deref(),
+        )
         .map_err(|e| e.to_string())?;
     spend.searches += 1;
     limiter.finish_request(ticket, response.rate.as_ref(), now_secs());
@@ -480,6 +500,7 @@ fn observe_fetch(
     limiter: &mut RateLimiter,
     spend: &mut Spend,
     args: &Args,
+    game: Game,
     ids: &[String],
     search_id: &str,
 ) -> Result<TradeResponse, String> {
@@ -491,7 +512,7 @@ fn observe_fetch(
     wait_for_budget(limiter, FETCH_POLICY, "fetch");
     let ticket = limiter.insert_request(FETCH_POLICY, now_secs());
     let response = client
-        .fetch(ids, search_id, args.session.as_deref())
+        .fetch(game, ids, search_id, args.session.as_deref())
         .map_err(|e| e.to_string())?;
     spend.fetches += 1;
     limiter.finish_request(ticket, response.rate.as_ref(), now_secs());
@@ -578,7 +599,9 @@ fn run_observe_run(args: &Args) -> Result<(), String> {
     let raw = &args.searches[0];
     let search_ref = parse_search_reference(raw, &args.league)
         .ok_or_else(|| format!("could not read a search reference out of {raw:?}"))?;
-    let query_json = decode_search_id(&search_ref.search_id).map_err(|e| e.to_string())?;
+    // 标签只是屏幕上那个名字:PoE1 解不出查询就退回 id 的前几位,
+    // 真正的查询由 actor 自己去服务器取(和真程序走同一条路)。
+    let query_json = local_query(args, &search_ref).unwrap_or_default();
     let label = label_from_query(&query_json, &search_ref);
 
     let mut settings = AppSettings {
@@ -879,7 +902,8 @@ fn run_watch(args: &Args) -> Result<(), String> {
     for raw in &args.searches {
         let search_ref = parse_search_reference(raw, &args.league)
             .ok_or_else(|| format!("could not read a search reference out of {raw:?}"))?;
-        let query_json = decode_search_id(&search_ref.search_id).map_err(|e| e.to_string())?;
+        // 同 `run_observe_run`:标签解不出来不算错,查询由 actor 去取。
+        let query_json = local_query(args, &search_ref).unwrap_or_default();
         let label = label_from_query(&query_json, &search_ref);
         let entry = WatchEntry::new(label.clone(), &search_ref, cap.clone());
         labels.insert(entry.id.to_string(), label);
@@ -1178,6 +1202,117 @@ fn stamp() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
+/// 这次要发的查询原文从哪来。
+///
+/// 搜索 id 就是查询本身(gzip+base64)的时候本地解开,一次请求都不用花 ——
+/// 两个游戏的接口现在发的都是这种 id(2026-09-09 核实过)。解不开的(PoE1 老式
+/// 的短把手)才回服务器换一次:`GET /api/trade/search/<联赛>/<id>`,走的是生产
+/// 代码里那条 `load_saved_query`,和真程序开一条 PoE1 蹲价时同一个函数。
+/// `--query-json` 两个游戏都认:手上没有 id、想从零起一次搜索的时候用它。
+fn resolve_query(
+    client: &TradeClient,
+    limiter: &mut RateLimiter,
+    args: &Args,
+    search_ref: &SearchRef,
+) -> Result<String, String> {
+    if let Some(json) = &args.query_json {
+        println!("query       from --query-json (no id decoded, no request spent)");
+        return Ok(json.clone());
+    }
+    let decoded = decode_search_id(&search_ref.search_id);
+    match (search_ref.game, decoded) {
+        (_, Ok(query_json)) => Ok(query_json),
+        (Game::Poe2, Err(error)) => Err(error.to_string()),
+        (Game::Poe1, Err(error)) => {
+            println!("query       id does not decode ({error}) — asking the trade site for it");
+            wait_for_budget(limiter, SEARCH_POLICY, "saved query");
+            let ticket = limiter.insert_request(SEARCH_POLICY, now_secs());
+            let response = client
+                .load_saved_query(
+                    search_ref.game,
+                    &search_ref.league,
+                    &search_ref.search_id,
+                    args.session.as_deref(),
+                )
+                .map_err(|e| e.to_string())?;
+            limiter.finish_request(ticket, response.rate.as_ref(), now_secs());
+            println!("\nGET saved search -> status {}", response.status);
+            print_rate_headers(response.rate.as_ref());
+            if !response.is_success() {
+                return Err(format!(
+                    "saved search failed with status {}: {}",
+                    response.status,
+                    first_line(&response.body_text())
+                ));
+            }
+            print_saved_keys(&response.body);
+            parse_saved_search_query(&response.body).map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// 不花请求就能拿到的那份查询原文。
+///
+/// 自带查询的 id 本地解开;解不开的(PoE1 老式短把手)只能靠 `--query-json`。
+/// 拿它当标签、当排序试验的底子 —— 这些地方不值得为了一个名字去发一次请求。
+fn local_query(args: &Args, search_ref: &SearchRef) -> Result<String, String> {
+    if let Some(json) = &args.query_json {
+        return Ok(json.clone());
+    }
+    decode_search_id(&search_ref.search_id).map_err(|error| {
+        format!(
+            "{} does not decode into a query ({error}) — pass --query-json '{{...}}'",
+            search_ref.search_id
+        )
+    })
+}
+
+/// 刚拿到的那个 id 再读回来一次,把服务器存的那份查询打出来。
+fn print_saved_query(
+    client: &TradeClient,
+    limiter: &mut RateLimiter,
+    args: &Args,
+    search_ref: &SearchRef,
+    search_id: &str,
+) -> Result<(), String> {
+    wait_for_budget(limiter, SEARCH_POLICY, "saved query");
+    let ticket = limiter.insert_request(SEARCH_POLICY, now_secs());
+    let response = client
+        .load_saved_query(
+            search_ref.game,
+            &search_ref.league,
+            search_id,
+            args.session.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
+    limiter.finish_request(ticket, response.rate.as_ref(), now_secs());
+    println!("\nGET saved search -> status {}", response.status);
+    print_rate_headers(response.rate.as_ref());
+    print_budget(limiter, SEARCH_POLICY, "search");
+    if !response.is_success() {
+        println!("saved search failed: {}", first_line(&response.body_text()));
+        return Ok(());
+    }
+    print_saved_keys(&response.body);
+    match parse_saved_search_query(&response.body) {
+        Ok(query) => println!("saved query    {query}"),
+        Err(error) => println!("saved query    could not be read: {error}"),
+    }
+    Ok(())
+}
+
+/// 存查询那个响应的顶层键有哪些。形状对不对,看这一行就够。
+fn print_saved_keys(body: &[u8]) {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(serde_json::Value::Object(map)) => {
+            let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            println!("top-level keys {}", keys.join(", "));
+        }
+        Ok(other) => println!("top-level      not an object: {other}"),
+        Err(error) => println!("top-level      not JSON: {error}"),
+    }
+}
+
 enum RoundOutcome {
     Ok,
     RateLimited,
@@ -1192,12 +1327,18 @@ fn one_round(
     request_body: &str,
     rates: &CurrencyRates,
     cap: &Option<PriceCap>,
+    read_back: bool,
 ) -> Result<RoundOutcome, String> {
     // ---- search -------------------------------------------------------
     wait_for_budget(limiter, SEARCH_POLICY, "search");
     let ticket = limiter.insert_request(SEARCH_POLICY, now_secs());
     let response = client
-        .search(&search_ref.league, request_body, args.session.as_deref())
+        .search(
+            search_ref.game,
+            &search_ref.league,
+            request_body,
+            args.session.as_deref(),
+        )
         .map_err(|e| e.to_string())?;
     limiter.finish_request(ticket, response.rate.as_ref(), now_secs());
 
@@ -1229,6 +1370,21 @@ fn one_round(
         search.result.len()
     );
     println!("first {} ids: {}", head.len(), head.join(", "));
+    if search_ref.game == Game::Poe1 {
+        println!(
+            "search id      {} ({} chars)  page {}",
+            search.id,
+            search.id.chars().count(),
+            search_page_url(&SearchRef {
+                game: search_ref.game,
+                league: search_ref.league.clone(),
+                search_id: search.id.clone(),
+            })
+        );
+    }
+    if read_back {
+        print_saved_query(client, limiter, args, search_ref, &search.id)?;
+    }
 
     if head.is_empty() {
         println!("nothing listed right now — no fetch this round.");
@@ -1239,7 +1395,7 @@ fn one_round(
     wait_for_budget(limiter, FETCH_POLICY, "fetch");
     let ticket = limiter.insert_request(FETCH_POLICY, now_secs());
     let response = client
-        .fetch(&head, &search.id, args.session.as_deref())
+        .fetch(search_ref.game, &head, &search.id, args.session.as_deref())
         .map_err(|e| e.to_string())?;
     limiter.finish_request(ticket, response.rate.as_ref(), now_secs());
 
@@ -1502,6 +1658,11 @@ struct Args {
     poll_seconds: u64,
     /// `--hideout <alert_id>`:蹲价模式下发一条 `TravelToHideout` 命令。
     hideout: Option<i64>,
+    /// `--query-json '{...}'`:直接给一段查询原文,不从搜索 id 里解。
+    ///
+    /// PoE1 的搜索 id 是服务器发的一串号,里面没有查询 —— 想在 PoE1 上从零
+    /// 起一次搜索,只能自己写一段查询。给了它就不去解 id,也不去读存查询。
+    query_json: Option<String>,
 }
 
 impl Args {
@@ -1532,6 +1693,7 @@ impl Args {
         let mut minutes: u64 = 3;
         let mut poll_seconds: u64 = 300;
         let mut hideout: Option<i64> = None;
+        let mut query_json: Option<String> = None;
 
         let mut args = args.peekable();
         while let Some(flag) = args.next() {
@@ -1606,6 +1768,7 @@ impl Args {
                             .map_err(|_| format!("--hideout wants an alert id, got {raw:?}"))?,
                     );
                 }
+                "--query-json" => query_json = Some(value()?),
                 "--session" => session = Some(value()?),
                 "--session-from-settings" => session_from_settings = true,
                 "--rates" => rates = Some(parse_rates(&value()?)?),
@@ -1650,6 +1813,7 @@ impl Args {
             // 这里先兜是为了打印出来的数就是真正会用的数。
             poll_seconds: poll_seconds.max(60),
             hideout,
+            query_json,
         })
     }
 }

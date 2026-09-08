@@ -55,6 +55,12 @@ catalogue! {
     common_milliseconds_short,
     common_percent,
     common_days_short,
+    /// 挂单来自哪个游戏。两种语言写法一样(游戏名不翻译),但仍然走目录:
+    /// 界面上的字一律从这里取,业务代码里不内联。
+    common_game_poe1,
+    common_game_poe2,
+    /// "{} · {}" —— 游戏 + 联赛。Standard 两个游戏都有,单看联赛名分不出来。
+    common_game_league,
     /// 参考价那一列的单位。基准币是接口自己报的,所以三种都得有写法。
     common_currency_divine,
     common_currency_exalted,
@@ -521,6 +527,9 @@ catalogue! {
     /// "hideout: failed HTTP {}: {}" —— 状态码 + 交易站自己说的那句话。
     /// 失败时那两样是唯一的线索,而提醒记录里只存得下动作码,所以要单列一条。
     hideout_failed_http,
+    /// PoE1 的挂单根本没有藏身处传送(那是 trade2 即刻购买才有的),所以这不是
+    /// 一次"失败",而是"这里没有这个东西",得和上面几条区分开。
+    hideout_not_on_poe1,
 
     // -- 状态行上的一句话 --
     notice_opened_trade,
@@ -614,6 +623,9 @@ pub static ENGLISH: Text = Text {
     common_milliseconds_short: "ms",
     common_percent: "%",
     common_days_short: "d",
+    common_game_poe1: "PoE1",
+    common_game_poe2: "PoE2",
+    common_game_league: "{} · {}",
     common_currency_divine: "div",
     common_currency_exalted: "ex",
     common_currency_chaos: "chaos",
@@ -947,6 +959,7 @@ pub static ENGLISH: Text = Text {
     hideout_failed: "hideout: failed",
     hideout_not_sent: "hideout: not sent — {}",
     hideout_failed_http: "hideout: failed HTTP {}: {}",
+    hideout_not_on_poe1: "hideout: PoE1 listings have no travel — open the trade page and whisper the seller",
 
     notice_opened_trade: "Opened the trade page in your browser.",
     notice_open_failed: "Could not open the browser: {}",
@@ -986,6 +999,9 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     common_milliseconds_short: "毫秒",
     common_percent: "%",
     common_days_short: "天",
+    common_game_poe1: "PoE1",
+    common_game_poe2: "PoE2",
+    common_game_league: "{} · {}",
     common_currency_divine: "div",
     common_currency_exalted: "ex",
     common_currency_chaos: "chaos",
@@ -1319,6 +1335,7 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     hideout_failed: "去藏身处:失败",
     hideout_not_sent: "去藏身处:没发出去 —— {}",
     hideout_failed_http: "去藏身处:失败 HTTP {}:{}",
+    hideout_not_on_poe1: "去藏身处:PoE1 的挂单没有传送 —— 打开交易页私聊卖家",
 
     notice_opened_trade: "已在浏览器里打开交易页。",
     notice_open_failed: "打不开浏览器:{}",

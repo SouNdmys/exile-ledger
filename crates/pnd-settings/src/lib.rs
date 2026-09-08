@@ -10,7 +10,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use pnd_domain::{Currency, ObservationId, Price, SearchRef, WatchId};
+use pnd_domain::{Currency, Game, ObservationId, Price, SearchRef, WatchId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -37,13 +37,18 @@ pub enum UserAgentMode {
 
 /// 一条蹲价搜索:用户在网页筛好条件粘进来之后,程序要记住的全部东西。
 ///
-/// `search_id` 是自描述的(gzip + base64url 的查询 JSON),所以不用另存查询条件;
-/// 联赛单独存是因为同一个 id 换个联赛就是另一次搜索。
+/// PoE2 的 `search_id` 是自描述的(gzip + base64url 的查询 JSON),所以不用
+/// 另存查询条件;PoE1 的 id 解不开,那一代的查询由运行时问一次服务端再存进
+/// `watch.sqlite`(见 `pnd_domain::search_ref` 的模块注释)。联赛单独存是因为
+/// 同一个 id 换个联赛就是另一次搜索 —— 而 `Standard` 两代都有,所以光有联赛
+/// 还不够,得连 [`WatchEntry::game`] 一起看。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct WatchEntry {
     pub id: WatchId,
     pub label: String,
+    /// 哪一代游戏。老的 `settings.json` 里没有这个键,缺了就是 PoE2。
+    pub game: Game,
     pub league: String,
     pub search_id: String,
     pub price_cap: Price,
@@ -61,6 +66,7 @@ impl Default for WatchEntry {
         Self {
             id: WatchId(String::new()),
             label: String::new(),
+            game: Game::default(),
             league: String::new(),
             search_id: String::new(),
             price_cap: Price::new(0, Currency::Divine),
@@ -79,6 +85,7 @@ impl WatchEntry {
         WatchEntry {
             id: WatchId(uuid::Uuid::new_v4().to_string()),
             label: label.into(),
+            game: search_ref.game,
             league: search_ref.league.clone(),
             search_id: search_ref.search_id.clone(),
             price_cap,
@@ -99,6 +106,8 @@ impl WatchEntry {
 pub struct ObservationEntry {
     pub id: ObservationId,
     pub label: String,
+    /// 哪一代游戏。同 [`WatchEntry::game`]:老文件缺这个键就是 PoE2。
+    pub game: Game,
     pub league: String,
     pub search_id: String,
     pub enabled: bool,
@@ -140,6 +149,7 @@ impl Default for ObservationEntry {
         Self {
             id: ObservationId(String::new()),
             label: String::new(),
+            game: Game::default(),
             league: String::new(),
             search_id: String::new(),
             enabled: true,
@@ -158,6 +168,7 @@ impl ObservationEntry {
         ObservationEntry {
             id: ObservationId(uuid::Uuid::new_v4().to_string()),
             label: label.into(),
+            game: search_ref.game,
             league: search_ref.league.clone(),
             search_id: search_ref.search_id.clone(),
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -650,6 +661,7 @@ mod settings_tests {
     fn round_trip_preserves_settings() {
         let store = temp_store("round-trip");
         let search = SearchRef {
+            game: Game::Poe2,
             league: "Forbidden Rites".to_string(),
             search_id: "H4sIAAAA-_09".to_string(),
         };
@@ -793,6 +805,7 @@ mod settings_tests {
     #[test]
     fn a_new_watch_entry_is_ready_to_run() {
         let search = SearchRef {
+            game: Game::Poe2,
             league: "Forbidden Rites".to_string(),
             search_id: "H4sIAAAA-_09".to_string(),
         };
@@ -807,10 +820,67 @@ mod settings_tests {
         assert_ne!(entry.id, other.id, "每条记录一个自己的 id");
     }
 
+    /// 粘进来的是哪一代,记下来的就得是哪一代 —— 联赛名两代会撞车
+    /// (`Standard` / `Hardcore` 都有),光记联赛会把这条搜索发到另一套接口上。
+    #[test]
+    fn a_new_entry_remembers_which_game_the_search_came_from() {
+        let poe1 = SearchRef {
+            game: Game::Poe1,
+            league: "Standard".to_string(),
+            search_id: "Rj3mL5Sw".to_string(),
+        };
+        let watch = WatchEntry::new("Headhunter", &poe1, Price::new(20_000, Currency::Divine));
+        assert_eq!(watch.game, Game::Poe1);
+        assert_eq!(watch.league, "Standard");
+        assert_eq!(ObservationEntry::new("Belts", &poe1).game, Game::Poe1);
+
+        // PoE2 那边一个字都没变。
+        let poe2 = SearchRef {
+            game: Game::Poe2,
+            league: "Forbidden Rites".to_string(),
+            search_id: "H4sIAAAA-_09".to_string(),
+        };
+        assert_eq!(
+            WatchEntry::new("Choir", &poe2, Price::new(1, Currency::Divine)).game,
+            Game::Poe2
+        );
+        assert_eq!(ObservationEntry::new("Tablets", &poe2).game, Game::Poe2);
+    }
+
+    /// 盘上那份 schema 1 的文件里,每一条搜索都没有 `game` 这个键 ——
+    /// 读出来必须还是 PoE2(那是这个程序原来唯一认识的那一代),
+    /// 而且**版本号还是 1**:加一个字段不该逼用户重设一遍。
+    #[test]
+    fn entries_without_a_game_key_stay_on_poe2() {
+        let store = temp_store("older-no-game");
+        write_file(
+            &store,
+            r#"{"schema_version":1,
+                "watches":[{"id":"w-1","label":"Choir","league":"Forbidden Rites",
+                            "search_id":"H4sIAAAA-_09"}],
+                "observations":[{"id":"o-1","label":"Tablets","league":"Forbidden Rites",
+                                 "search_id":"H4sIAAAA-_09"}]}"#,
+        );
+        let loaded = store.load();
+        assert_eq!(loaded.status, LoadStatus::Loaded);
+        assert_eq!(loaded.settings.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(loaded.settings.watches[0].game, Game::Poe2);
+        assert_eq!(loaded.settings.observations[0].game, Game::Poe2);
+
+        // 存回去再读一遍,PoE1 那条也要原样活下来。
+        let mut settings = loaded.settings;
+        settings.watches[0].game = Game::Poe1;
+        store.save(&settings).expect("save");
+        assert_eq!(store.load().settings.watches[0].game, Game::Poe1);
+        let text = fs::read_to_string(store.path()).expect("read");
+        assert!(text.contains(r#""game": "poe1""#), "{text}");
+    }
+
     /// 新建的观察:有 uuid、有时间戳、默认开着,两个节奏是计划里那两个数。
     #[test]
     fn a_new_observation_entry_is_ready_to_run() {
         let search = SearchRef {
+            game: Game::Poe2,
             league: "Forbidden Rites".to_string(),
             search_id: "H4sIAAAA-_09".to_string(),
         };
@@ -836,6 +906,7 @@ mod settings_tests {
     fn observations_round_trip_and_can_be_looked_up() {
         let store = temp_store("observations");
         let search = SearchRef {
+            game: Game::Poe2,
             league: "Forbidden Rites".to_string(),
             search_id: "H4sIAAAA-_09".to_string(),
         };
@@ -880,6 +951,7 @@ mod settings_tests {
     #[test]
     fn normalize_clamps_the_observation_intervals() {
         let search = SearchRef {
+            game: Game::Poe2,
             league: "Forbidden Rites".to_string(),
             search_id: "H4sIAAAA-_09".to_string(),
         };

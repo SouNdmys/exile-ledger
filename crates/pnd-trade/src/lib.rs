@@ -11,7 +11,8 @@ pub mod rate_limit;
 
 pub use client::{
     MAX_FETCH_IDS, SearchResponse, TradeClient, TradeResponse, TransportError, fetch_url,
-    ggg_error, parse_search_response, search_url, whisper_body, whisper_url,
+    ggg_error, parse_saved_search_query, parse_search_response, saved_search_url, search_url,
+    whisper_body, whisper_url,
 };
 pub use jwt::{jwt_claims, jwt_expiry, jwt_header};
 pub use listing::{parse_fetch_response, parse_fetch_response_by_id, parse_fetch_response_slots};

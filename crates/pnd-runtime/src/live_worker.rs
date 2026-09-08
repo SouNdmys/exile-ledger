@@ -609,6 +609,9 @@ pub(crate) mod live_worker_tests {
         connects: Arc<std::sync::atomic::AtomicUsize>,
         /// 每次 `connect()` 的结果。空了就当成功。
         outcomes: Arc<Mutex<VecDeque<LiveError>>>,
+        /// 每次握手要去的那个地址。PoE1 的搜索证明"live 也走对了那一代"
+        /// 靠的就是它 —— 配置里那个 `game` 只有拼成 URL 才看得见效果。
+        urls: Arc<Mutex<Vec<String>>>,
     }
 
     impl ScriptedConnector {
@@ -617,6 +620,7 @@ pub(crate) mod live_worker_tests {
                 steps: Arc::new(Mutex::new(VecDeque::new())),
                 connects: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 outcomes: Arc::new(Mutex::new(VecDeque::new())),
+                urls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -632,11 +636,20 @@ pub(crate) mod live_worker_tests {
         pub(crate) fn connects(&self) -> usize {
             self.connects.load(Ordering::Relaxed)
         }
+
+        pub(crate) fn urls(&self) -> Vec<String> {
+            self.urls.lock().unwrap().clone()
+        }
     }
 
     impl LiveConnector for ScriptedConnector {
-        fn connect(&self, _config: &LiveConfig) -> Result<Box<dyn LiveStream>, LiveError> {
+        fn connect(&self, config: &LiveConfig) -> Result<Box<dyn LiveStream>, LiveError> {
             self.connects.fetch_add(1, Ordering::Relaxed);
+            self.urls.lock().unwrap().push(pnd_trade::live::live_ws_url(
+                config.game,
+                &config.league,
+                &config.search_id,
+            ));
             if let Some(error) = self.outcomes.lock().unwrap().pop_front() {
                 return Err(error);
             }
@@ -676,6 +689,7 @@ pub(crate) mod live_worker_tests {
 
     pub(crate) fn live_config(session: &str) -> LiveConfig {
         let search = SearchRef {
+            game: pnd_domain::Game::Poe2,
             league: "Forbidden Rites".to_string(),
             search_id: "H4sIAAAA-_09".to_string(),
         };

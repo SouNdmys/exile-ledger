@@ -23,7 +23,9 @@ use gpui::{
 use gpui_component::StyledExt as _;
 use gpui_component::table::{Column, TableDelegate, TableState};
 
+use crate::i18n::{self, Text};
 use crate::theme::*;
+use pnd_domain::Game;
 
 /// 一个格子的语气。颜色不写在页面里,写在这儿:改配色只动 `theme.rs`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +152,17 @@ pub fn column(key: &'static str, name: &'static str, width: f32) -> Column {
 /// 一列右对齐的数字。
 pub fn number_column(key: &'static str, name: &'static str, width: f32) -> Column {
     column(key, name, width).text_right()
+}
+
+/// 表里"联赛"那一格的字。
+///
+/// PoE1 和 PoE2 都有 Standard、Hardcore,只写联赛名分不出这条搜索盯的是哪个
+/// 游戏。PoE2 是常态,写出来只会让每一行都变长,所以只有 PoE1 才加前缀。
+pub fn league_cell_text(game: Game, league: &str, text: &'static Text) -> String {
+    match game {
+        Game::Poe2 => league.to_owned(),
+        Game::Poe1 => i18n::fill(text.common_game_league, &[text.common_game_poe1, league]),
+    }
 }
 
 /// 四页共用的表格委托。
@@ -304,6 +317,24 @@ mod pages_tests {
     use super::*;
     use crate::i18n;
 
+    /// PoE2 是常态,不加前缀;PoE1 要看得出来,两个游戏都有 Standard。
+    #[test]
+    fn only_a_poe1_league_says_which_game_it_is() {
+        assert_eq!(
+            league_cell_text(Game::Poe2, "Forbidden Rites", &i18n::ENGLISH),
+            "Forbidden Rites"
+        );
+        assert_eq!(
+            league_cell_text(Game::Poe1, "Standard", &i18n::ENGLISH),
+            "PoE1 · Standard"
+        );
+        assert_eq!(
+            league_cell_text(Game::Poe1, "Standard", &i18n::SIMPLIFIED_CHINESE),
+            "PoE1 · Standard",
+            "游戏名不翻译"
+        );
+    }
+
     /// 一条搜索 + 一条它的运行状态,拿来量蹲价表。
     fn watch_content(text: &'static i18n::Text) -> TableContent {
         let settings = AppSettings {
@@ -430,6 +461,7 @@ mod pages_tests {
             alert_id: 1,
             watch_id: WatchId("w-1".to_string()),
             listing_id: "abc".to_string(),
+            game: pnd_domain::Game::Poe2,
             league: "Forbidden Rites".to_string(),
             search_id: "H4sIAAAA-_09".to_string(),
             item_name: "Choir of the Storm".to_string(),

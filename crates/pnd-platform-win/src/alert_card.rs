@@ -182,6 +182,16 @@ pub struct CardText {
     pub line2: String,
     pub footer: String,
     pub buttons: [String; 4],
+    /// 哪几颗按钮这次不画。
+    ///
+    /// 为什么是"藏起来"而不是"少传一个":按钮的**下标就是它的含义**
+    /// (上层按 [`CardButton`] 认),把第三颗删掉再往前挪一格,点"忽略"
+    /// 就会变成点"去藏身处"。藏起来的那颗留着自己的位置,剩下的几颗
+    /// 平分整行 —— 三颗按钮的卡片看着仍然是满的。
+    ///
+    /// 现在只有一处用到:PoE1 的挂单没有藏身处传送(那是 trade2 即刻购买
+    /// 才有的东西),所以那张卡片上的第三颗按钮不该出现。
+    pub hidden: [bool; 4],
 }
 
 impl CardText {
@@ -217,7 +227,15 @@ impl CardText {
             line2,
             footer,
             buttons,
+            hidden: [false; 4],
         })
+    }
+
+    /// 把某一颗按钮藏起来。链式写法,好在构造之后直接接一句。
+    #[must_use]
+    pub fn without_button(mut self, button: CardButton) -> Self {
+        self.hidden[button.index()] = true;
+        self
     }
 }
 
@@ -589,26 +607,51 @@ pub fn card_geometry_for_corner(work_area: RectI, dpi: u32, corner: Corner) -> R
     RectI::new(x, y, width, height)
 }
 
-/// 卡片底部一排四个等宽按钮的矩形,坐标相对传入的 `card` 原点。
+/// 卡片底部那一排等宽按钮的矩形,坐标相对传入的 `card` 原点。
 ///
 /// 画和命中共用这一个函数——命中一个画在别处的按钮,比没有按钮更糟。
+///
+/// `hidden` 里为 `true` 的那几颗不画:它们拿到一个**零宽的空矩形**
+/// ([`RectI::contains`] 对零宽永远是 false,所以那一片区域点不响),
+/// 剩下的按顺序平分整行。四颗全显示时算出来的和以前一个像素不差。
 #[must_use]
-pub fn button_rects(card: RectI, dpi: u32) -> [RectI; 4] {
+pub fn button_rects(card: RectI, dpi: u32, hidden: &[bool; 4]) -> [RectI; 4] {
     let padding = scale_for_dpi(BUTTON_ROW_PADDING, dpi);
     let gap = scale_for_dpi(BUTTON_ROW_GAP, dpi);
     let height = scale_for_dpi(BUTTON_HEIGHT, dpi);
     let row_width = (card.w - padding * 2).max(4);
-    let width = ((row_width - gap * 3) / 4).max(1);
     let top = card.y + (card.h - padding - height).max(0);
     let left = card.x + padding;
-    std::array::from_fn(|index| {
-        RectI::new(
-            left + (width + gap) * index as i32,
+
+    // 藏起来的按钮不占位置,剩下几颗平分整行。等宽除不尽时余下的一两个像素
+    // 摊进间距,这样最后一颗照样贴着右边 —— 否则三颗按钮的卡片右下角会空一块。
+    let mut visible = [0usize; 4];
+    let mut shown = 0usize;
+    for (index, is_hidden) in hidden.iter().enumerate() {
+        if !is_hidden {
+            visible[shown] = index;
+            shown += 1;
+        }
+    }
+    let count = shown.max(1) as i32;
+    let width = ((row_width - gap * (count - 1)) / count).max(1);
+    let slack = (row_width - width * count - gap * (count - 1)).max(0);
+    let spread = if count > 1 {
+        gap + slack / (count - 1)
+    } else {
+        gap
+    };
+
+    let mut rects = [RectI::default(); 4];
+    for (slot, index) in visible[..shown].iter().enumerate() {
+        rects[*index] = RectI::new(
+            left + (width + spread) * slot as i32,
             top,
             width,
             height.max(1),
-        )
-    })
+        );
+    }
+    rects
 }
 
 /// 点 (x, y) 落在哪个按钮上。
@@ -673,10 +716,69 @@ mod alert_card_tests {
         assert_eq!(card, RectI::new(0, 0, 300, 120));
     }
 
+    /// 藏起一颗按钮之后,剩下三颗要平分整行、贴住两边 —— 卡片不该出现
+    /// 一块空白。被藏的那颗拿一个零宽矩形,那一片区域点不响。
+    #[test]
+    fn hiding_a_button_leaves_three_equal_boxes_and_no_gap() {
+        let card = RectI::new(0, 0, 420, 180);
+        let hidden = [false, false, true, false];
+        let buttons = button_rects(card, 96, &hidden);
+
+        assert_eq!(buttons[2], RectI::default(), "藏起来的那颗没有位置");
+        let shown = [buttons[0], buttons[1], buttons[3]];
+        assert!(shown.iter().all(|rect| rect.w == shown[0].w), "{shown:?}");
+        assert!(shown.iter().all(|rect| rect.h == 32), "{shown:?}");
+        assert_eq!(shown[0].x, 12, "还是贴着左边那 12 像素");
+        assert_eq!(shown[2].right(), 420 - 12, "右边也要贴住");
+        // 396 像素的一行放三颗等宽按钮除不尽,多出来的像素摊进间距,
+        // 所以间距只保证彼此相同、且不小于原来的 8。
+        let spacing = shown[1].x - shown[0].right();
+        assert_eq!(spacing, shown[2].x - shown[1].right(), "两处间距要一样");
+        assert!(spacing >= 8, "{spacing}");
+
+        // 点在藏起来那颗**原来**的位置上,不该命中任何按钮。
+        let four = button_rects(card, 96, &[false; 4]);
+        let ghost = four[2];
+        assert_ne!(
+            hit_button(&buttons, ghost.x + 1, ghost.y + 1),
+            Some(CardButton::Tertiary)
+        );
+        // 而剩下三颗各自还认得自己 —— 下标就是含义,不能因为少了一颗就平移。
+        for button in [
+            CardButton::Primary,
+            CardButton::Secondary,
+            CardButton::Dismiss,
+        ] {
+            let rect = buttons[button.index()];
+            assert_eq!(
+                hit_button(&buttons, rect.x + rect.w / 2, rect.y + rect.h / 2),
+                Some(button)
+            );
+        }
+    }
+
+    /// `without_button` 只动那一颗,别的字一个不改。
+    #[test]
+    fn without_button_hides_exactly_one() {
+        let text = CardText::new("t", "1", "2", "f", ["a", "b", "c", "d"])
+            .unwrap()
+            .without_button(CardButton::Tertiary);
+        assert_eq!(text.hidden, [false, false, true, false]);
+        assert_eq!(text.buttons[2], "c", "文字留着,只是不画");
+        assert_eq!(text.title, "t");
+        assert_eq!(
+            CardText::new("t", "1", "2", "f", ["a", "b", "c", "d"])
+                .unwrap()
+                .hidden,
+            [false; 4],
+            "默认四颗都显示"
+        );
+    }
+
     #[test]
     fn buttons_form_one_row_of_four_equal_boxes_inside_the_card() {
         let card = RectI::new(0, 0, 420, 180);
-        let buttons = button_rects(card, 96);
+        let buttons = button_rects(card, 96, &[false; 4]);
         assert!(buttons.iter().all(|rect| rect.w == buttons[0].w));
         assert!(buttons.iter().all(|rect| rect.y == buttons[0].y));
         assert_eq!(buttons[0].x, 12);
@@ -690,7 +792,7 @@ mod alert_card_tests {
 
     #[test]
     fn hit_testing_matches_the_drawn_rectangles() {
-        let buttons = button_rects(RectI::new(0, 0, 420, 180), 96);
+        let buttons = button_rects(RectI::new(0, 0, 420, 180), 96, &[false; 4]);
         for button in CardButton::ALL {
             let rect = buttons[button.index()];
             let hit = hit_button(&buttons, rect.x + rect.w / 2, rect.y + rect.h / 2);

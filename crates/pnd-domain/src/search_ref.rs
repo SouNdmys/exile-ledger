@@ -1,9 +1,17 @@
-//! 搜索引用:把用户从浏览器地址栏粘进来的东西变成"联赛 + 搜索 id"。
+//! 搜索引用:把用户从浏览器地址栏粘进来的东西变成"哪一代游戏 + 联赛 + 搜索 id"。
 //!
 //! 为什么要在本地解码搜索 id:trade2 的搜索 id 是自描述的 —— 它就是查询 JSON
 //! 先 gzip 再 base64url(`H4sI` 开头正是 gzip 的 1f 8b 魔数)。官方的"已保存
 //! 查询"接口对这种 id 返回 404,所以想反复轮询同一个搜索,只能自己把查询解出来
 //! 再 POST 回去。用户在网页上筛好条件,粘一次地址栏就够了。
+//!
+//! **PoE1 大多数时候也是这样,但不保证。** 2026-09-09 实测:PoE1 的接口
+//! `POST /api/trade/search/<联赛>` 回来的 id 同样是 gzip+base64url 的自描述
+//! 长串,本地解得开;而拿那种长 id 去 `GET /api/trade/search/<联赛>/<id>`
+//! 换查询,服务端回 404。老式的短把手(`Rj3mL5Sw` 这种)则相反 —— 本地解不开,
+//! 只能去服务端换。所以运行时的顺序是**先本地解,解不开再问服务端**,换回来的
+//! 存进 `watch.sqlite` 的 `saved_queries`。[`encode_search_id`](一键做成蹲价)
+//! 仍然只用在 PoE2 上:那条路要自己造一个 id,而 PoE1 会不会认没验证过。
 
 use std::fmt;
 use std::io::{Read, Write as _};
@@ -14,15 +22,75 @@ use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// 交易站搜索页 URL 里固定不变的那一段,靠它把联赛和 id 从任意写法的链接里切出来。
-const SEARCH_PATH_MARKER: &str = "/trade2/search/poe2/";
+/// PoE2 搜索页 URL 里固定不变的那一段,靠它把联赛和 id 从任意写法的链接里切出来。
+const SEARCH_PATH_MARKER_POE2: &str = "/trade2/search/poe2/";
 
-/// 一次搜索的最小引用:联赛名(人类可读、未编码)+ 搜索 id。
+/// PoE1 的同一段。注意它**不是** PoE2 那一段的子串(`trade2/` ≠ `trade/`),
+/// 所以两个 marker 谁先匹配都不会认错;先试 PoE2 只是为了读起来顺。
+const SEARCH_PATH_MARKER_POE1: &str = "/trade/search/";
+
+/// 哪一代流放之路。两代的交易站是两套接口(`/api/trade` 和 `/api/trade2`),
+/// 联赛名却会撞车(`Standard` 和 `Hardcore` 两边都有),所以凡是拿联赛当键的
+/// 地方都得把它拼进去。
+///
+/// 默认是 PoE2:这个程序原本只认 trade2,老的 `settings.json` 里没有这个键,
+/// 读出来必须还是它原来的那一代。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Game {
+    Poe1,
+    #[default]
+    Poe2,
+}
+
+impl Game {
+    /// 库里、设置文件里、URL 里统一的写法。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Game::Poe1 => "poe1",
+            Game::Poe2 => "poe2",
+        }
+    }
+
+    /// 认不出来的一律当 PoE2:手改过的设置、老库里的空值,都不该让整条记录
+    /// 读不出来 —— 退回默认的那一代最多是"这条搜索发错了接口",改回去就好。
+    #[must_use]
+    pub fn parse(raw: &str) -> Game {
+        match raw.trim() {
+            "poe1" => Game::Poe1,
+            _ => Game::Poe2,
+        }
+    }
+
+    /// 搜索页 URL 里"域名之后、联赛之前"的那一段。
+    #[must_use]
+    pub fn search_path_marker(self) -> &'static str {
+        match self {
+            Game::Poe1 => SEARCH_PATH_MARKER_POE1,
+            Game::Poe2 => SEARCH_PATH_MARKER_POE2,
+        }
+    }
+}
+
+impl fmt::Display for Game {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 一次搜索的最小引用:哪一代游戏 + 联赛名(人类可读、未编码)+ 搜索 id。
 ///
 /// 联赛在这里存解码后的原文(`Forbidden Rites`),要拼 URL 时再编码,
 /// 这样存进 `settings.json` 的内容和网页上看到的一致。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchRef {
+    /// 老的 `settings.json` 里没有这个键 —— 缺了就是 PoE2,那是这个程序
+    /// 一开始唯一认识的那一代。
+    #[serde(default)]
+    pub game: Game,
     pub league: String,
     pub search_id: String,
 }
@@ -66,15 +134,20 @@ pub fn parse_search_reference(input: &str, default_league: &str) -> Option<Searc
         .next()
         .unwrap_or(without_fragment);
 
-    if let Some((head, tail)) = path.split_once(SEARCH_PATH_MARKER) {
-        if !host_looks_sane(head) {
-            return None;
+    // 两个 marker 挨个试。谁先谁后其实无所谓 —— `trade2/search` 里不含
+    // `trade/search`,一条链接只可能命中其中一个。
+    for game in [Game::Poe2, Game::Poe1] {
+        if let Some((head, tail)) = path.split_once(game.search_path_marker()) {
+            if !host_looks_sane(head) {
+                return None;
+            }
+            return parse_url_tail(game, tail);
         }
-        return parse_url_tail(tail);
     }
 
     if is_search_id(path) {
         Some(SearchRef {
+            game: Game::default(),
             league: default_league.to_string(),
             search_id: path.to_string(),
         })
@@ -86,7 +159,8 @@ pub fn parse_search_reference(input: &str, default_league: &str) -> Option<Searc
 /// 搜索页地址。卡片上"打开交易页"按钮就是把这个丢给 `ShellExecuteW`。
 pub fn search_page_url(r: &SearchRef) -> String {
     format!(
-        "https://www.pathofexile.com{SEARCH_PATH_MARKER}{}/{}",
+        "https://www.pathofexile.com{}{}/{}",
+        r.game.search_path_marker(),
         encode_league_path(&r.league),
         r.search_id
     )
@@ -119,6 +193,10 @@ pub fn encode_league_path(league: &str) -> String {
 ///
 /// 返回的是解压出来的原始文本,不重新序列化 —— 直接塞进 `search_request_body`
 /// 再 POST,和网页发出去的字节一模一样,少一处走样的机会。
+///
+/// PoE2 的 id 一定解得开;PoE1 的看形状(见模块头注释):自描述的长 id 解得开,
+/// 老式短把手只会得到 [`SearchIdError::NotBase64`] / [`SearchIdError::NotGzip`],
+/// 那时候才去服务端换。
 pub fn decode_search_id(id: &str) -> Result<String, SearchIdError> {
     let raw = decode_base64_relaxed(id.trim()).ok_or(SearchIdError::NotBase64)?;
 
@@ -141,6 +219,7 @@ pub fn decode_search_id(id: &str) -> Result<String, SearchIdError> {
 }
 
 /// 查询 JSON → 搜索 id,[`decode_search_id`] 的逆:先 gzip,再 base64url(不填 `=`)。
+/// 同样**只对 PoE2 成立** —— PoE1 的 id 只有服务端发得出来。
 ///
 /// 为什么要在本地造 id:交易站没有"帮我存一条查询"的接口(见本文件开头),
 /// 而"一键蹲价"要做的正是**在观察自己的查询上多加一格词缀筛选,再变成一条
@@ -294,7 +373,7 @@ fn host_looks_sane(head: &str) -> bool {
 }
 
 /// marker 之后应当是 `<联赛>/<id>`,最多再跟一个 `live`。
-fn parse_url_tail(tail: &str) -> Option<SearchRef> {
+fn parse_url_tail(game: Game, tail: &str) -> Option<SearchRef> {
     let mut parts = tail.split('/');
     let league_raw = parts.next()?;
     let search_id = parts.next()?;
@@ -311,6 +390,7 @@ fn parse_url_tail(tail: &str) -> Option<SearchRef> {
         return None;
     }
     Some(SearchRef {
+        game,
         league,
         search_id: search_id.to_string(),
     })
@@ -491,6 +571,7 @@ mod search_ref_tests {
     #[test]
     fn page_urls_round_trip() {
         let r = SearchRef {
+            game: Game::Poe2,
             league: "Forbidden Rites".to_string(),
             search_id: "abcd1234".to_string(),
         };
@@ -504,6 +585,72 @@ mod search_ref_tests {
         let live = live_page_url(&r);
         assert!(live.ends_with("/live"));
         assert_eq!(parse(&live).unwrap(), r);
+    }
+
+    /// PoE1 的链接少一段 `poe2/`、多一个字符的差别(`trade` 而不是 `trade2`),
+    /// 但它是**另一套接口**,所以粘进来的那一刻就得认出来是哪一代。
+    #[test]
+    fn a_poe1_url_is_recognised_as_poe1() {
+        let r = parse("https://www.pathofexile.com/trade/search/Standard/Rj3mL5Sw").unwrap();
+        assert_eq!(r.game, Game::Poe1);
+        assert_eq!(r.league, "Standard");
+        assert_eq!(r.search_id, "Rj3mL5Sw");
+
+        // 和 PoE2 那边一样宽容:没有 scheme、联赛百分号编码、结尾 `/live` 都认。
+        let r =
+            parse("www.pathofexile.com/trade/search/Hardcore%20Settlers/Rj3mL5Sw/live").unwrap();
+        assert_eq!(r.game, Game::Poe1);
+        assert_eq!(r.league, "Hardcore Settlers");
+
+        // PoE2 的链接绝不能被认成 PoE1:`trade2/search` 里没有 `trade/search`。
+        let r = parse("https://www.pathofexile.com/trade2/search/poe2/Standard/abcd1234").unwrap();
+        assert_eq!(r.game, Game::Poe2);
+    }
+
+    /// 光秃秃一个 id 认不出代数,只能沿用这个程序原来那一代(PoE2)——
+    /// 猜错的后果是发到另一套接口上,而用户随时可以改粘完整链接。
+    #[test]
+    fn a_bare_id_stays_on_poe2() {
+        assert_eq!(parse("  H4sIAAAA-_09  ").unwrap().game, Game::Poe2);
+        assert_eq!(parse("Rj3mL5Sw").unwrap().game, Game::Poe2);
+    }
+
+    /// 两代各回各的页面地址,而且都能被自己再读回来。
+    #[test]
+    fn page_urls_follow_the_game() {
+        let poe1 = SearchRef {
+            game: Game::Poe1,
+            league: "Standard".to_string(),
+            search_id: "Rj3mL5Sw".to_string(),
+        };
+        assert_eq!(
+            search_page_url(&poe1),
+            "https://www.pathofexile.com/trade/search/Standard/Rj3mL5Sw"
+        );
+        assert_eq!(
+            live_page_url(&poe1),
+            "https://www.pathofexile.com/trade/search/Standard/Rj3mL5Sw/live"
+        );
+        assert_eq!(parse(&search_page_url(&poe1)).unwrap(), poe1);
+        assert_eq!(parse(&live_page_url(&poe1)).unwrap(), poe1);
+    }
+
+    /// 存进 `settings.json` 的写法是 `"poe1"` / `"poe2"`,而**缺这个键**
+    /// 读出来是 PoE2 —— 盘上已经有的那份文件里一条都没写。
+    #[test]
+    fn the_game_serialises_as_a_plain_word_and_defaults_to_poe2() {
+        assert_eq!(
+            serde_json::to_string(&Game::Poe1).unwrap(),
+            r#""poe1""#.to_string()
+        );
+        assert_eq!(Game::default(), Game::Poe2);
+        assert_eq!(Game::Poe1.to_string(), "poe1");
+        assert_eq!(Game::parse("poe1"), Game::Poe1);
+        assert_eq!(Game::parse("whatever"), Game::Poe2, "认不出来就退回默认");
+
+        let old: SearchRef =
+            serde_json::from_str(r#"{"league":"Standard","search_id":"abcd1234"}"#).unwrap();
+        assert_eq!(old.game, Game::Poe2);
     }
 
     #[test]
