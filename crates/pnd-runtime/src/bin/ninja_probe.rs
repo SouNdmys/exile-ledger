@@ -6,7 +6,12 @@
 //! cargo run -p pnd-runtime --bin ninja_probe -- --search --league forbiddenrites --class "Gemling Legionnaire"
 //! cargo run -p pnd-runtime --bin ninja_probe -- --search --skills "Lightning Arrow" --items "Wake of Destruction"
 //! cargo run -p pnd-runtime --bin ninja_probe -- --economy --league "Forbidden Rites"
+//! cargo run -p pnd-runtime --bin ninja_probe -- --character --account heygyus-0416 --name ResurrectForbidden
+//! cargo run -p pnd-runtime --bin ninja_probe -- --raw https://poe.ninja/poe1/api/data/index-state
 //! ```
+//!
+//! `--game poe1` 把上面这些全部指到 PoE1 那一半(默认是 poe2)。采样那几个模式
+//! 还只认 PoE2,给它 `--game poe1` 会直接报错——库的分区键还没按代分开。
 //!
 //! 上面四个只读不写。下面五个跑的是 `pnd_runtime::ninja_sampler` 那条真管线,
 //! 会往 `--db` 指的那个 `ninja.sqlite` 里写东西(不给就是默认库):
@@ -88,6 +93,29 @@
 //!
 //! `items` 分面里既有暗金名,也有 `Rare Ring` / `Magic Flask` 这种稀有度桶——
 //! 前十名全是桶,热门暗金榜要往下翻,或者直接用 `--items <暗金名>` 拿它的总数。
+//!
+//! # PoE1 那一半(2026-09-09 用本探针跑出来的)
+//!
+//! **是同一条管线,只差一个前缀**:`/poe1/api/…` 对 `/poe2/api/…`。
+//! (不带前缀的老路径 `https://poe.ninja/api/data/index-state` 是 404。)
+//!
+//! - `index-state` / `build-index-state`:JSON 形状一模一样。当季联赛是
+//!   Allflame(短名 `allflame`,snapshotName 也是 `allflame`),124,459 个角色。
+//!   注意 `snapshotVersions` 里同一个联赛会出现两条(两个 version),
+//!   `snapshot_for_url` 取的是先出现那条。
+//! - `search`:同一份 protobuf,**28 列一个不多一个不少**,列 id、group、
+//!   没消费的字段号全和 PoE2 对得上。字典引用 15 条(PoE2 是 7 条),多出来的
+//!   八张是 `secondascendancy` / `bandit` / `atlasskill` / `mastery` /
+//!   `runegraft` / `tattoo` / `vestigialmod` / `pantheon`;PoE1 没有 `spiritgems`。
+//!   条目数:class 28、gem 823、keypassive 625、item 1380、anointed 448。
+//! - `dictionary`:同一种 NDIC v2,但 PoE1 第一次让我们撞上了**两字节长度**
+//!   (`mastery` 表里有 8 条超过 127 字节)。老解析器读到就报错,现在修好了。
+//! - 经济:路径也只差前缀,但**分类名是单数**(`UniqueWeapon`,写复数就是 404),
+//!   而且物品榜的 JSON 是老那套:没有 `core`,每行直接写
+//!   `chaosValue`/`divineValue`/`exaltedValue`。交易所以 **chaos** 计价
+//!   (`core.primary` = "chaos",1 divine = 358.9 chaos)。
+//! - 角色详情:**今晚没跑到**(请求配额用完了)。要验就跑
+//!   `--game poe1 --character --league allflame`,它会先搜一个角色再抓详情。
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -96,8 +124,11 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use pnd_ninja::aggregate::{SlotModStat, unique_usage_from_facet};
-use pnd_ninja::client::NinjaClient;
-use pnd_ninja::economy::UNIQUE_TYPES;
+use pnd_ninja::client::{
+    Game, NinjaClient, character_url, currency_rates_url, index_state_url, search_url,
+    unique_prices_url,
+};
+use pnd_ninja::economy::{UNIQUE_TYPES, unique_types_for};
 use pnd_ninja::search::{SearchResponse, dictionary_key_for_facet};
 use pnd_runtime::ninja_sampler::{
     SamplerConfig, SamplerEvent, SamplerStage, plan_partitions, refresh_prices, run_sampler,
@@ -132,8 +163,14 @@ fn main() {
 /// 手搓参数解析:探针只有几个子命令和几个筛选,引一个 CLI 框架不值当。
 struct Args {
     mode: Option<&'static str>,
+    game: Game,
     league: Option<String>,
     league_name: Option<String>,
+    account: Option<String>,
+    name: Option<String>,
+    url: Option<String>,
+    out: Option<PathBuf>,
+    version: Option<String>,
     db: Option<PathBuf>,
     force: bool,
     limit: Option<u32>,
@@ -143,8 +180,14 @@ struct Args {
 fn parse_args() -> Result<Args, Box<dyn Error>> {
     let mut args = Args {
         mode: None,
+        game: Game::default(),
         league: None,
         league_name: None,
+        account: None,
+        name: None,
+        url: None,
+        out: None,
+        version: None,
         db: None,
         force: false,
         limit: None,
@@ -156,12 +199,33 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--index" => args.mode = Some("index"),
             "--search" => args.mode = Some("search"),
             "--economy" => args.mode = Some("economy"),
+            "--character" => args.mode = Some("character"),
+            "--raw" => {
+                args.mode = Some("raw");
+                args.url = Some(raw.next().ok_or("--raw needs a url")?);
+            }
+            "--out" => {
+                args.out = Some(PathBuf::from(raw.next().ok_or("--out needs a path")?));
+            }
             "--plan" => args.mode = Some("plan"),
             "--facets" => args.mode = Some("facets"),
             "--sample" => args.mode = Some("sample"),
             "--aggregate" => args.mode = Some("aggregate"),
             "--prices" => args.mode = Some("prices"),
             "--force" => args.force = true,
+            "--game" => {
+                let value = raw.next().ok_or("--game needs poe1 or poe2")?;
+                args.game = Game::parse(&value).ok_or_else(|| format!("unknown game {value}"))?;
+            }
+            "--account" => {
+                args.account = Some(raw.next().ok_or("--account needs a value")?);
+            }
+            "--name" => {
+                args.name = Some(raw.next().ok_or("--name needs a value")?);
+            }
+            "--version" => {
+                args.version = Some(raw.next().ok_or("--version needs a value")?);
+            }
             "--league" => {
                 args.league = Some(raw.next().ok_or("--league needs a value")?);
             }
@@ -188,10 +252,20 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args = parse_args()?;
+    let client = || NinjaClient::for_game(args.game);
     match args.mode {
-        Some("index") => print_index(&NinjaClient::new()),
-        Some("search") => print_search(&NinjaClient::new(), &args),
-        Some("economy") => print_economy(&NinjaClient::new(), &args),
+        Some("index") => print_index(&client(), &args),
+        Some("search") => print_search(&client(), &args),
+        Some("economy") => print_economy(&client(), &args),
+        Some("character") => print_character(&client(), &args),
+        Some("raw") => print_raw(&client(), &args),
+        // 采样管线还只认 PoE2:分区计划、`ninja.sqlite` 的键、界面读的表全是按
+        // 一代游戏写的。在这里挡住,比让它默默把 PoE1 的数据写进 PoE2 的表好。
+        Some(_) if args.game != Game::Poe2 => Err(
+            "the sampler modes are PoE2-only for now (--game poe1 works for --index / \
+                 --search / --character / --economy / --raw)"
+                .into(),
+        ),
         Some("plan") => print_plan(&args),
         Some("facets") => run_facets(&args),
         Some("sample") => run_sample(&args),
@@ -199,10 +273,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("prices") => run_prices(&args),
         _ => {
             eprintln!(
-                "usage: ninja_probe\n  \
+                "usage: ninja_probe [--game poe1|poe2]\n  \
                  --index\n  \
                  --search [--league <url>] [--class X] [--skills Y] [--items Z]\n  \
                  --economy [--league <name>]\n  \
+                 --character [--league <url>] [--account A] [--name N]\n  \
+                 --raw <url>\n  \
                  --plan [--league <url>]\n  \
                  --facets [--league <url>] [--db <path>] [--force]\n  \
                  --sample [--limit N] [--db <path>] [--force]\n  \
@@ -214,10 +290,246 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn print_index(client: &NinjaClient) -> Result<(), Box<dyn Error>> {
+/// 每一个请求都先把 URL 印出来。这些路径没有文档,报告里那一列 URL + 状态
+/// 就是"我们到底问了什么"的唯一证据。
+fn hit(url: &str) {
+    println!("GET {url}");
+}
+
+/// 一个还没有拼装函数的路径存不存在。404 本身就是答案,所以这里不把它当失败。
+fn print_raw(client: &NinjaClient, args: &Args) -> Result<(), Box<dyn Error>> {
+    let url = args.url.clone().ok_or("--raw needs a url")?;
+    hit(&url);
+    match client.raw_get(&url) {
+        Ok(bytes) => {
+            println!("  status 200, {} bytes", bytes.len());
+            if let Some(path) = &args.out {
+                std::fs::write(path, &bytes)?;
+                println!("  saved to {}", path.display());
+            }
+            describe_json(&bytes);
+        }
+        Err(error) => println!("  {error}"),
+    }
+    Ok(())
+}
+
+/// 把一份未知 JSON 的形状讲清楚:顶层键、`lines`/`items` 第一行的键。
+/// 不是 JSON 就印开头几十个字节 —— 那通常意味着我们拿到了一张 HTML 错误页。
+fn describe_json(bytes: &[u8]) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(160)]);
+        println!("  (not JSON) {head}");
+        return;
+    };
+    match &value {
+        serde_json::Value::Object(map) => {
+            println!("  top-level keys: {}", keys(map));
+            for key in ["lines", "currencyDetails", "items", "core"] {
+                match map.get(key) {
+                    Some(serde_json::Value::Array(rows)) => {
+                        println!("  {key}: {} rows", rows.len());
+                        if let Some(serde_json::Value::Object(first)) = rows.first() {
+                            println!("    first row keys: {}", keys(first));
+                            println!("    first row: {}", trim(&rows[0]));
+                        }
+                    }
+                    Some(serde_json::Value::Object(inner)) => {
+                        println!("  {key} keys: {}", keys(inner));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        serde_json::Value::Array(rows) => println!("  top-level array with {} rows", rows.len()),
+        other => println!("  scalar {other}"),
+    }
+}
+
+fn keys(map: &serde_json::Map<String, serde_json::Value>) -> String {
+    map.keys().cloned().collect::<Vec<_>>().join(", ")
+}
+
+/// 一行原文只印开头:探针是给人看的,一整条 4KB 的角色装备贴上来没人读得下去。
+fn trim(value: &serde_json::Value) -> String {
+    let text = value.to_string();
+    if text.len() <= 400 {
+        return text;
+    }
+    format!("{}…", &text[..400])
+}
+
+/// 这一轮该问哪个快照。
+///
+/// `--version` 是给探路省配额用的:给了它就**不问 index-state**,直接拿
+/// `--league` 当 overview 名(PoE1 的联赛短名和 snapshotName 恰好同名)。
+/// 平时不该用它 —— 快照一天变好几次,写死的 version 隔天就查不到东西。
+fn resolve_snapshot(
+    client: &NinjaClient,
+    args: &Args,
+) -> Result<(String, String, String), Box<dyn Error>> {
+    let league = args
+        .league
+        .clone()
+        .unwrap_or_else(|| default_build_league(args));
+    if let Some(version) = &args.version {
+        return Ok((league.clone(), version.clone(), league));
+    }
+    hit(&index_state_url(args.game));
     let index = client.index_state()?;
+    let snapshot = index
+        .snapshot_for_url(&league)
+        .ok_or_else(|| format!("no snapshot for league url {league}"))?;
+    Ok((
+        league,
+        snapshot.version.clone(),
+        snapshot.snapshot_name.clone(),
+    ))
+}
+
+/// 一个角色详情的原文形状。词缀统计要的就是 `items[].itemData.mods.explicit[]`,
+/// 所以这里印的是"那条路存不存在、长什么样",不是整包 JSON。
+fn print_character(client: &NinjaClient, args: &Args) -> Result<(), Box<dyn Error>> {
+    let (_league, version, snapshot_name) = resolve_snapshot(client, args)?;
+
+    let (account, name) = match (&args.account, &args.name) {
+        (Some(account), Some(name)) => (account.clone(), name.clone()),
+        _ => {
+            // 没给账号就自己去搜一个:探针不该逼人先跑一次别的模式抄个名字。
+            pause();
+            let filters: Vec<(&str, &str)> = Vec::new();
+            hit(&search_url(args.game, &version, &snapshot_name, &filters));
+            let response = client.search(&version, &snapshot_name, &filters)?;
+            let first = response
+                .character_refs(&[])
+                .first()
+                .cloned()
+                .ok_or("the search returned no characters")?;
+            println!("  picked {} / {}", first.account, first.name);
+            (first.account, first.name)
+        }
+    };
+
     pause();
+    let url = character_url(args.game, &version, &account, &name, &snapshot_name);
+    hit(&url);
+    let raw = client.character_raw(&version, &account, &name, &snapshot_name)?;
+    println!("  status 200, {} bytes", raw.len());
+    describe_character(raw.as_bytes());
+
+    println!();
+    println!("== the same bytes through the production model ==");
+    // 原文已经在手上,再打一个请求只为拿同一份 JSON 是浪费配额:
+    // `NinjaClient::character` 做的也就是把这段字节喂给同一个 `CharacterDetail`。
+    let detail: pnd_ninja::character::CharacterDetail = serde_json::from_str(&raw)?;
+    println!(
+        "  account {} name {} class {} level {} league {} items {} jewels {}",
+        detail.account,
+        detail.name,
+        detail.class,
+        detail.level,
+        detail.league,
+        detail.items.len(),
+        detail.jewels.len()
+    );
+    for entry in detail.items.iter().take(4) {
+        let data = &entry.item_data;
+        println!(
+            "  slot {:<3} {:<28} {:<26} rarity {:<8} frame {} inventoryId {:<12} \
+             mods e/i/c {}/{}/{}  explicitMods {}",
+            entry.item_slot,
+            data.name,
+            data.base_type,
+            data.rarity,
+            data.frame_type,
+            data.inventory_id,
+            data.mods.explicit.len(),
+            data.mods.implicit.len(),
+            data.mods.crafted.len(),
+            data.explicit_mods.len()
+        );
+    }
+    Ok(())
+}
+
+/// 只钻到 `items[0].itemData` 那一层:两代的差别如果有,就在这里。
+fn describe_character(bytes: &[u8]) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        println!("  (not JSON)");
+        return;
+    };
+    let Some(map) = value.as_object() else {
+        return;
+    };
+    println!("  top-level keys: {}", keys(map));
+    let Some(serde_json::Value::Array(items)) = map.get("items") else {
+        println!("  (no items array)");
+        return;
+    };
+    println!("  items: {} entries", items.len());
+    let Some(first) = items.first().and_then(|item| item.as_object()) else {
+        return;
+    };
+    println!("  items[0] keys: {}", keys(first));
+    let Some(data) = first.get("itemData").and_then(|data| data.as_object()) else {
+        println!("  (items[0] has no itemData)");
+        return;
+    };
+    println!("  items[0].itemData keys: {}", keys(data));
+    match data.get("mods").and_then(|mods| mods.as_object()) {
+        Some(mods) => {
+            println!("  items[0].itemData.mods keys: {}", keys(mods));
+            if let Some(serde_json::Value::Array(explicit)) = mods.get("explicit") {
+                println!(
+                    "    mods.explicit[0]: {}",
+                    trim(explicit.first().unwrap_or(&serde_json::Value::Null))
+                );
+            }
+        }
+        None => println!("  (items[0].itemData has no mods object)"),
+    }
+    if let Some(serde_json::Value::Array(explicit)) = data.get("explicitMods") {
+        println!(
+            "  items[0].itemData.explicitMods[0]: {}",
+            trim(explicit.first().unwrap_or(&serde_json::Value::Null))
+        );
+    }
+}
+
+/// 联赛短名的默认值分代:PoE2 盯的是计划里那个联赛,PoE1 没有默认盯的,
+/// 用 `standard` 兜底(它永远存在),真要看当季联赛就 `--league` 明说。
+fn default_build_league(args: &Args) -> String {
+    match args.game {
+        Game::Poe1 => "standard".to_owned(),
+        Game::Poe2 => DEFAULT_BUILD_LEAGUE.to_owned(),
+    }
+}
+
+fn default_economy_league(args: &Args) -> String {
+    match args.game {
+        Game::Poe1 => "Standard".to_owned(),
+        Game::Poe2 => DEFAULT_ECONOMY_LEAGUE.to_owned(),
+    }
+}
+
+fn print_index(client: &NinjaClient, args: &Args) -> Result<(), Box<dyn Error>> {
+    println!("game {}", args.game.as_str());
+    hit(&index_state_url(args.game));
+    let index = client.index_state()?;
+    println!("  status 200");
+    pause();
+    hit(&pnd_ninja::client::build_index_state_url(args.game));
     let builds = client.build_index_state()?;
+    println!("  status 200");
+    println!();
+    println!("== economy leagues ({}) ==", index.economy_leagues.len());
+    for league in &index.economy_leagues {
+        println!(
+            "  {:<24} url {:<24} display {:<24} hardcore {} indexed {}",
+            league.name, league.url, league.display_name, league.hardcore, league.indexed
+        );
+    }
+    println!();
 
     println!(
         "== snapshot versions ({}) ==",
@@ -261,8 +573,10 @@ fn print_search(client: &NinjaClient, args: &Args) -> Result<(), Box<dyn Error>>
     let league = args
         .league
         .clone()
-        .unwrap_or_else(|| DEFAULT_BUILD_LEAGUE.to_owned());
+        .unwrap_or_else(|| default_build_league(args));
 
+    println!("game {}", args.game.as_str());
+    hit(&index_state_url(args.game));
     let index = client.index_state()?;
     let snapshot = index
         .snapshot_for_url(&league)
@@ -287,6 +601,12 @@ fn print_search(client: &NinjaClient, args: &Args) -> Result<(), Box<dyn Error>>
     }
 
     pause();
+    hit(&search_url(
+        args.game,
+        &snapshot.version,
+        &snapshot.snapshot_name,
+        &filters,
+    ));
     let response = client.search(&snapshot.version, &snapshot.snapshot_name, &filters)?;
     println!();
     println!("total matching characters: {}", response.total);
@@ -294,7 +614,7 @@ fn print_search(client: &NinjaClient, args: &Args) -> Result<(), Box<dyn Error>>
     print_columns(&response);
     print_dictionaries(&response);
 
-    let dictionaries = fetch_dictionaries(client, &response)?;
+    let dictionaries = fetch_dictionaries(client, args.game, &response)?;
     print_facets(&response, &dictionaries);
     print_characters(&response, &dictionaries);
     Ok(())
@@ -353,6 +673,7 @@ fn print_dictionaries(response: &SearchResponse) {
 /// 按 sha1 抓一次就够:`skills`/`allskills`/`spiritgems` 共用同一张 gem 表。
 fn fetch_dictionaries(
     client: &NinjaClient,
+    game: Game,
     response: &SearchResponse,
 ) -> Result<BTreeMap<String, Vec<String>>, Box<dyn Error>> {
     let mut by_key: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -364,7 +685,16 @@ fn fetch_dictionaries(
             continue;
         }
         pause();
-        let entries = client.dictionary(&reference.sha1)?;
+        hit(&pnd_ninja::client::dictionary_url(game, &reference.sha1));
+        // 一张字典读不动就跳过它,别把整轮探针带走:探针的价值就在于"对面
+        // 又变成什么样了",而那个答案往往就写在后面还没打出来的那几张表里。
+        let entries = match client.dictionary(&reference.sha1) {
+            Ok(entries) => entries,
+            Err(error) => {
+                println!("  FAILED dictionary {}: {error}", reference.key);
+                continue;
+            }
+        };
         println!(
             "fetched dictionary {:<14} {} entries",
             reference.key,
@@ -421,10 +751,12 @@ fn print_economy(client: &NinjaClient, args: &Args) -> Result<(), Box<dyn Error>
     let league = args
         .league
         .clone()
-        .unwrap_or_else(|| DEFAULT_ECONOMY_LEAGUE.to_owned());
-    println!("league {league}");
+        .unwrap_or_else(|| default_economy_league(args));
+    println!("game {}  league {league}", args.game.as_str());
 
+    hit(&currency_rates_url(args.game, &league));
     let exchange = client.currency_rates(&league)?;
+    println!("  status 200");
     println!(
         "exchange base: primary {} secondary {}",
         exchange.core.primary, exchange.core.secondary
@@ -441,8 +773,9 @@ fn print_economy(client: &NinjaClient, args: &Args) -> Result<(), Box<dyn Error>
         None => println!("  (base currency is not divine, no conversion)"),
     }
 
-    for type_name in UNIQUE_TYPES {
+    for type_name in unique_types_for(args.game) {
         pause();
+        hit(&unique_prices_url(args.game, &league, type_name));
         let overview = client.unique_prices(&league, type_name)?;
         let mut lines = overview.lines.clone();
         lines.sort_by(|left, right| {

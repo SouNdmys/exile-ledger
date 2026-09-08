@@ -27,9 +27,59 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// 32MB 留了三个数量级的余量:超过它说明端点行为变了,该报错让人来看。
 const MAX_BODY_BYTES: u64 = 32 * 1024 * 1024;
 
-const BUILDS_BASE: &str = "https://poe.ninja/poe2/api/builds";
-const DATA_BASE: &str = "https://poe.ninja/poe2/api/data";
-const ECONOMY_BASE: &str = "https://poe.ninja/poe2/api/economy";
+/// poe.ninja 把两代游戏摆在**同一个站点的两个前缀**下:`/poe2/api/…` 和
+/// `/poe1/api/…`。
+///
+/// 2026-09-09 实测:`/api/data/index-state`(不带前缀的老路径)是 404,
+/// `/poe1/api/data/index-state` 是 200,而且顶层键和 PoE2 那份一模一样 ——
+/// 也就是说 builds 这半边两代是**同一条管线,只差一个前缀**。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Game {
+    Poe1,
+    /// 默认值刻意是 PoE2:今天在跑的采样就是它,换默认值等于悄悄改行为。
+    #[default]
+    Poe2,
+}
+
+impl Game {
+    /// 存进 `ninja.sqlite` 和打进日志的稳定写法。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Game::Poe1 => "poe1",
+            Game::Poe2 => "poe2",
+        }
+    }
+
+    /// 命令行 `--game` 收的写法。认不出来给 `None`,由调用方决定是报错还是用默认值。
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "poe1" | "1" => Some(Game::Poe1),
+            "poe2" | "2" => Some(Game::Poe2),
+            _ => None,
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            Game::Poe1 => "/poe1",
+            Game::Poe2 => "/poe2",
+        }
+    }
+
+    fn builds_base(self) -> String {
+        format!("https://poe.ninja{}/api/builds", self.prefix())
+    }
+
+    fn data_base(self) -> String {
+        format!("https://poe.ninja{}/api/data", self.prefix())
+    }
+
+    fn economy_base(self) -> String {
+        format!("https://poe.ninja{}/api/economy", self.prefix())
+    }
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum NinjaError {
@@ -51,21 +101,30 @@ pub enum NinjaError {
 }
 
 #[must_use]
-pub fn index_state_url() -> String {
-    format!("{DATA_BASE}/index-state")
+pub fn index_state_url(game: Game) -> String {
+    format!("{}/index-state", game.data_base())
 }
 
 #[must_use]
-pub fn build_index_state_url() -> String {
-    format!("{DATA_BASE}/build-index-state")
+pub fn build_index_state_url(game: Game) -> String {
+    format!("{}/build-index-state", game.data_base())
 }
 
 /// `filters` 是 `class`/`skills`/`items`/`keypassives`/`spiritgems`/`allskills`/
 /// `timeMachine`/`sort` 这些查询参数,多个条件是 AND。
+///
+/// PoE1 没有 spirit gem,那边少一个 `spiritgems`;多给一个不认识的筛选**不会**
+/// 被拒,服务端直接忽略(2026-09-09 实测)。
 #[must_use]
-pub fn search_url(version: &str, snapshot_name: &str, filters: &[(&str, &str)]) -> String {
+pub fn search_url(
+    game: Game,
+    version: &str,
+    snapshot_name: &str,
+    filters: &[(&str, &str)],
+) -> String {
     let mut url = format!(
-        "{BUILDS_BASE}/{}/search?overview={}",
+        "{}/{}/search?overview={}",
+        game.builds_base(),
         encode(version),
         encode(snapshot_name)
     );
@@ -76,17 +135,24 @@ pub fn search_url(version: &str, snapshot_name: &str, filters: &[(&str, &str)]) 
 }
 
 #[must_use]
-pub fn dictionary_url(sha1: &str) -> String {
-    format!("{BUILDS_BASE}/dictionary/{}", encode(sha1))
+pub fn dictionary_url(game: Game, sha1: &str) -> String {
+    format!("{}/dictionary/{}", game.builds_base(), encode(sha1))
 }
 
 /// 账号名里的 `#` 要换成 `-`。搜索响应给回来的账号名已经是换过的,
 /// 所以这个替换是幂等的:用户手输的 `heygyus#0416` 和列里的 `heygyus-0416`
 /// 都能走通同一条路。
 #[must_use]
-pub fn character_url(version: &str, account: &str, name: &str, snapshot_name: &str) -> String {
+pub fn character_url(
+    game: Game,
+    version: &str,
+    account: &str,
+    name: &str,
+    snapshot_name: &str,
+) -> String {
     format!(
-        "{BUILDS_BASE}/{}/character?account={}&name={}&overview={}&timeMachine=",
+        "{}/{}/character?account={}&name={}&overview={}&timeMachine=",
+        game.builds_base(),
         encode(version),
         encode(&account.replace('#', "-")),
         encode(name),
@@ -94,19 +160,27 @@ pub fn character_url(version: &str, account: &str, name: &str, snapshot_name: &s
     )
 }
 
-/// 经济接口要的是联赛**显示名**("Forbidden Rites"),不是 builds 那边的短名。
+/// 经济接口要的是联赛**显示名**("Forbidden Rites"、"Allflame"),
+/// 不是 builds 那边的短名。
+///
+/// 路径两代一样,只差前缀 —— 但返回的 JSON **不一样**:PoE1 的物品榜是老那套
+/// `chaosValue`/`divineValue`,见 [`crate::economy`]。
 #[must_use]
-pub fn currency_rates_url(league: &str) -> String {
+pub fn currency_rates_url(game: Game, league: &str) -> String {
     format!(
-        "{ECONOMY_BASE}/exchange/current/overview?league={}&type=Currency",
+        "{}/exchange/current/overview?league={}&type=Currency",
+        game.economy_base(),
         encode(league)
     )
 }
 
+/// PoE1 的分类名是**单数**(`UniqueWeapon`),PoE2 是复数(`UniqueWeapons`)。
+/// 写错不是空榜,是 404 —— 所以两张表都写死在 [`crate::economy::unique_types_for`]。
 #[must_use]
-pub fn unique_prices_url(league: &str, type_name: &str) -> String {
+pub fn unique_prices_url(game: Game, league: &str, type_name: &str) -> String {
     format!(
-        "{ECONOMY_BASE}/stash/current/item/overview?league={}&type={}",
+        "{}/stash/current/item/overview?league={}&type={}",
+        game.economy_base(),
         encode(league),
         encode(type_name)
     )
@@ -134,6 +208,7 @@ fn encode(value: &str) -> String {
 /// 每次现建 agent 会把 TLS 握手也做几百遍。
 pub struct NinjaClient {
     agent: ureq::Agent,
+    game: Game,
 }
 
 impl Default for NinjaClient {
@@ -143,8 +218,15 @@ impl Default for NinjaClient {
 }
 
 impl NinjaClient {
+    /// PoE2 的客户端。**签名刻意不带参数**:今天所有调用方问的都是 PoE2,
+    /// 让它们一个字都不用改,PoE1 的调用方走 [`NinjaClient::for_game`]。
     #[must_use]
     pub fn new() -> Self {
+        Self::for_game(Game::Poe2)
+    }
+
+    #[must_use]
+    pub fn for_game(game: Game) -> Self {
         // 关掉 `http_status_as_error`(和 `pnd-trade` 那个 agent 同一个理由):
         // ureq 3 默认把 4xx/5xx 变成一个只剩状态码的错误,响应头连同 429 的
         // `Retry-After` 一起被扔掉。我们要那一行,所以自己判状态。
@@ -154,7 +236,23 @@ impl NinjaClient {
             .build();
         Self {
             agent: config.into(),
+            game,
         }
+    }
+
+    /// 这个客户端问的是哪一代游戏。存储按它分表、日志按它标行。
+    #[must_use]
+    pub fn game(&self) -> Game {
+        self.game
+    }
+
+    /// 任意一个 poe.ninja URL 的原始字节,走的还是同一个 UA / 状态码 / 长度上限。
+    ///
+    /// 存在的唯一理由是**探路**:问一个我们还没有拼装函数的路径存不存在
+    /// (比如"PoE1 有没有 PoE2 那种 `/api/economy/…`"),404 本身就是答案。
+    /// 日常抓取一律走下面那些具名方法,别用这个绕过 URL 拼装。
+    pub fn raw_get(&self, url: &str) -> Result<Vec<u8>, NinjaError> {
+        self.get_bytes(url)
     }
 
     /// 所有请求的唯一出口:一个地方管 User-Agent、gzip、状态码和长度上限。
@@ -196,12 +294,12 @@ impl NinjaClient {
 
     /// 每轮采样的第一步:快照 `version` 一天变好几次,别的接口全要它。
     pub fn index_state(&self) -> Result<IndexState, NinjaError> {
-        self.get_json(&index_state_url())
+        self.get_json(&index_state_url(self.game))
     }
 
     /// 每个联赛的角色总数和职业占比。分区计划按这里的占比挑职业。
     pub fn build_index_state(&self) -> Result<BuildIndexState, NinjaError> {
-        self.get_json(&build_index_state_url())
+        self.get_json(&build_index_state_url(self.game))
     }
 
     /// 原始 protobuf 字节。单独暴露是为了让采样管线能先落盘、再解析——
@@ -212,7 +310,7 @@ impl NinjaClient {
         snapshot_name: &str,
         filters: &[(&str, &str)],
     ) -> Result<Vec<u8>, NinjaError> {
-        self.get_bytes(&search_url(version, snapshot_name, filters))
+        self.get_bytes(&search_url(self.game, version, snapshot_name, filters))
     }
 
     pub fn search(
@@ -227,7 +325,7 @@ impl NinjaClient {
 
     /// NDIC 字符串表。按 sha1 寻址、内容不可变,所以调用方可以放心永久缓存。
     pub fn dictionary(&self, sha1: &str) -> Result<Vec<String>, NinjaError> {
-        let bytes = self.get_bytes(&dictionary_url(sha1))?;
+        let bytes = self.get_bytes(&dictionary_url(self.game, sha1))?;
         parse_ndic(&bytes).map_err(|error| NinjaError::Decode(error.to_string()))
     }
 
@@ -240,7 +338,13 @@ impl NinjaClient {
         name: &str,
         snapshot_name: &str,
     ) -> Result<String, NinjaError> {
-        let bytes = self.get_bytes(&character_url(version, account, name, snapshot_name))?;
+        let bytes = self.get_bytes(&character_url(
+            self.game,
+            version,
+            account,
+            name,
+            snapshot_name,
+        ))?;
         String::from_utf8(bytes).map_err(|error| NinjaError::Decode(error.to_string()))
     }
 
@@ -251,15 +355,25 @@ impl NinjaClient {
         name: &str,
         snapshot_name: &str,
     ) -> Result<CharacterDetail, NinjaError> {
-        self.get_json(&character_url(version, account, name, snapshot_name))
+        self.get_json(&character_url(
+            self.game,
+            version,
+            account,
+            name,
+            snapshot_name,
+        ))
     }
 
     pub fn currency_rates(&self, league: &str) -> Result<ExchangeOverview, NinjaError> {
-        self.get_json(&currency_rates_url(league))
+        self.get_json(&currency_rates_url(self.game, league))
     }
 
+    /// 暗金参考价。PoE1 的原文形状和 PoE2 不一样,所以出口处统一摊平成一种
+    /// (见 [`ItemOverview::normalized_for`])——调用方不该关心是哪一代。
     pub fn unique_prices(&self, league: &str, type_name: &str) -> Result<ItemOverview, NinjaError> {
-        self.get_json(&unique_prices_url(league, type_name))
+        let overview: ItemOverview =
+            self.get_json(&unique_prices_url(self.game, league, type_name))?;
+        Ok(overview.normalized_for(self.game))
     }
 }
 
@@ -299,11 +413,11 @@ mod client_tests {
     #[test]
     fn data_urls_are_locked() {
         assert_eq!(
-            index_state_url(),
+            index_state_url(Game::Poe2),
             "https://poe.ninja/poe2/api/data/index-state"
         );
         assert_eq!(
-            build_index_state_url(),
+            build_index_state_url(Game::Poe2),
             "https://poe.ninja/poe2/api/data/build-index-state"
         );
     }
@@ -311,7 +425,7 @@ mod client_tests {
     #[test]
     fn search_url_without_filters_is_locked() {
         assert_eq!(
-            search_url(VERSION, "forbidden-rites", &[]),
+            search_url(Game::Poe2, VERSION, "forbidden-rites", &[]),
             "https://poe.ninja/poe2/api/builds/1508-20260906-55820/search?overview=forbidden-rites"
         );
     }
@@ -321,6 +435,7 @@ mod client_tests {
     fn search_url_encodes_filters_with_plus_for_space() {
         assert_eq!(
             search_url(
+                Game::Poe2,
                 VERSION,
                 "forbidden-rites",
                 &[
@@ -337,6 +452,7 @@ mod client_tests {
     fn search_url_percent_encodes_the_awkward_characters() {
         assert_eq!(
             search_url(
+                Game::Poe2,
                 VERSION,
                 "forbidden-rites",
                 &[("items", "Berek's Grip & Co")]
@@ -349,7 +465,7 @@ mod client_tests {
     #[test]
     fn dictionary_url_is_locked() {
         assert_eq!(
-            dictionary_url("4b3dfeccb2f4aa52ccc458925cd87f4575a4c25b"),
+            dictionary_url(Game::Poe2, "4b3dfeccb2f4aa52ccc458925cd87f4575a4c25b"),
             "https://poe.ninja/poe2/api/builds/dictionary/4b3dfeccb2f4aa52ccc458925cd87f4575a4c25b"
         );
     }
@@ -359,6 +475,7 @@ mod client_tests {
     fn character_url_turns_the_account_hash_into_a_dash() {
         assert_eq!(
             character_url(
+                Game::Poe2,
                 VERSION,
                 "heygyus#0416",
                 "ResurrectForbidden",
@@ -374,12 +491,14 @@ mod client_tests {
     fn character_url_is_idempotent_for_already_dashed_accounts() {
         assert_eq!(
             character_url(
+                Game::Poe2,
                 VERSION,
                 "heygyus-0416",
                 "ResurrectForbidden",
                 "forbidden-rites"
             ),
             character_url(
+                Game::Poe2,
                 VERSION,
                 "heygyus#0416",
                 "ResurrectForbidden",
@@ -391,15 +510,91 @@ mod client_tests {
     #[test]
     fn economy_urls_are_locked() {
         assert_eq!(
-            currency_rates_url("Forbidden Rites"),
+            currency_rates_url(Game::Poe2, "Forbidden Rites"),
             "https://poe.ninja/poe2/api/economy/exchange/current/overview\
              ?league=Forbidden+Rites&type=Currency"
         );
         assert_eq!(
-            unique_prices_url("Forbidden Rites", "UniqueAccessories"),
+            unique_prices_url(Game::Poe2, "Forbidden Rites", "UniqueAccessories"),
             "https://poe.ninja/poe2/api/economy/stash/current/item/overview\
              ?league=Forbidden+Rites&type=UniqueAccessories"
         );
+    }
+
+    /// builds 这半边两代**只差一个前缀**:`/poe1` 换 `/poe2`,路径、查询参数、
+    /// 账号名的 `#` → `-` 全都一样。
+    ///
+    /// 不带前缀的老路径(`https://poe.ninja/api/data/index-state`)是 404,
+    /// 2026-09-09 实测过 —— 所以这里钉的是 `/poe1`,不是空前缀。
+    #[test]
+    fn poe1_builds_urls_only_swap_the_prefix() {
+        assert_eq!(
+            index_state_url(Game::Poe1),
+            "https://poe.ninja/poe1/api/data/index-state"
+        );
+        assert_eq!(
+            build_index_state_url(Game::Poe1),
+            "https://poe.ninja/poe1/api/data/build-index-state"
+        );
+        assert_eq!(
+            search_url(
+                Game::Poe1,
+                "3260-20260908-1",
+                "keepers-of-the-flame",
+                &[("class", "Witch")]
+            ),
+            "https://poe.ninja/poe1/api/builds/3260-20260908-1/search\
+             ?overview=keepers-of-the-flame&class=Witch"
+        );
+        assert_eq!(
+            dictionary_url(Game::Poe1, "4b3dfeccb2f4aa52ccc458925cd87f4575a4c25b"),
+            "https://poe.ninja/poe1/api/builds/dictionary/\
+             4b3dfeccb2f4aa52ccc458925cd87f4575a4c25b"
+        );
+        assert_eq!(
+            character_url(
+                Game::Poe1,
+                "3260-20260908-1",
+                "sound#1234",
+                "Bob",
+                "keepers-of-the-flame"
+            ),
+            "https://poe.ninja/poe1/api/builds/3260-20260908-1/character\
+             ?account=sound-1234&name=Bob&overview=keepers-of-the-flame&timeMachine="
+        );
+    }
+
+    /// 经济这半边**路径**也只差前缀,差的是**分类名**:PoE1 是单数
+    /// `UniqueWeapon`,PoE2 是复数 `UniqueWeapons`。
+    ///
+    /// 2026-09-09 实测:`…/poe1/api/economy/stash/current/item/overview
+    /// ?league=Allflame&type=UniqueWeapons` 是 **404**,换成 `UniqueWeapon` 才 200。
+    /// 分类名写错不是"空榜",是直接 404。
+    #[test]
+    fn poe1_economy_urls_swap_the_prefix_and_use_singular_types() {
+        assert_eq!(
+            currency_rates_url(Game::Poe1, "Allflame"),
+            "https://poe.ninja/poe1/api/economy/exchange/current/overview\
+             ?league=Allflame&type=Currency"
+        );
+        assert_eq!(
+            unique_prices_url(Game::Poe1, "Allflame", "UniqueWeapon"),
+            "https://poe.ninja/poe1/api/economy/stash/current/item/overview\
+             ?league=Allflame&type=UniqueWeapon"
+        );
+    }
+
+    /// `--game` 收的就是这几个写法。
+    #[test]
+    fn a_game_parses_from_the_command_line_spelling() {
+        assert_eq!(Game::parse("poe1"), Some(Game::Poe1));
+        assert_eq!(Game::parse("POE2"), Some(Game::Poe2));
+        assert_eq!(Game::parse(" poe1 "), Some(Game::Poe1));
+        assert_eq!(Game::parse("poe3"), None);
+        assert_eq!(Game::Poe1.as_str(), "poe1");
+        assert_eq!(Game::Poe2.as_str(), "poe2");
+        // 默认是 PoE2:今天在跑的采样就是它,换默认值等于悄悄改行为。
+        assert_eq!(Game::default(), Game::Poe2);
     }
 
     #[test]

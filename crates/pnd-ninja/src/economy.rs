@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
+use crate::client::Game;
+
 /// 物品榜支持的暗金分类。poe.ninja 还有 `UniqueSanctumRelics`/`UniqueTablets`/
 /// `PrecursorTablets`,但那些和 build 的装备栏对不上,热门榜用不到。
 pub const UNIQUE_TYPES: [&str; 6] = [
@@ -23,6 +25,31 @@ pub const UNIQUE_TYPES: [&str; 6] = [
     "UniqueCharms",
     "UniqueJewels",
 ];
+
+/// PoE1 的同一张表:分类名是**单数**,而且没有 charm(PoE2 才有的部位)。
+///
+/// 名字写错的下场是 **404**,不是空榜:2026-09-09 实测,同一条路径
+/// `type=UniqueWeapons`(复数)404、`type=UniqueWeapon` 200。所以这两张表
+/// 宁可写死,也不按规律猜。
+///
+/// 只有 `UniqueWeapon` 是当场验过的,另外四个是照 poe.ninja 文档里的写法填的,
+/// 第一次跑 PoE1 采样时要盯一眼有没有 404。
+const UNIQUE_TYPES_POE1: [&str; 5] = [
+    "UniqueWeapon",
+    "UniqueArmour",
+    "UniqueAccessory",
+    "UniqueFlask",
+    "UniqueJewel",
+];
+
+/// 这一代该问哪些暗金分类。
+#[must_use]
+pub fn unique_types_for(game: Game) -> &'static [&'static str] {
+    match game {
+        Game::Poe1 => &UNIQUE_TYPES_POE1,
+        Game::Poe2 => &UNIQUE_TYPES,
+    }
+}
 
 /// 交易所总览的表头。`rates` 是"1 个 primary 换多少个它"。
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -70,27 +97,53 @@ pub struct RatesPerDivine {
 }
 
 impl ExchangeOverview {
-    /// 换算成"每 divine"。基准币不是 divine 时返回 `None`——与其按 `secondary`
-    /// 猜一遍换算链,不如让调用方知道这份数据它读不懂。
+    /// 换算成"每 divine"。
+    ///
+    /// 两代的基准币不一样:PoE2 以 divine 计价,PoE1 以 chaos 计价。
+    /// divine 基准那条路原样保留(它读的是 `core.rates`,那是 poe.ninja 自己
+    /// 算好的成交价,比拿 lines 相除准);别的基准走下面那条通用路。
     #[must_use]
     pub fn rates_per_divine(&self) -> Option<RatesPerDivine> {
         if self.core.primary != "divine" {
-            return None;
+            return self.rates_per_divine_from_lines();
         }
         // mirror 比 divine 值钱,所以它在 lines 里而不是 rates 里,而且方向是反的:
         // primaryValue 400 的意思是"1 个 mirror = 400 divine",要取倒数。
-        let mirror = self
-            .lines
-            .iter()
-            .find(|line| line.id == "mirror")
-            .map(|line| line.primary_value)
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .map(|value| 1.0 / value);
+        let mirror = self.line_value("mirror").map(|value| 1.0 / value);
         Some(RatesPerDivine {
             chaos: self.core.rates.get("chaos").copied(),
             exalted: self.core.rates.get("exalted").copied(),
             mirror,
         })
+    }
+
+    /// 基准币不是 divine 时的换算:拿 divine 那一行当锚点。
+    ///
+    /// `lines[x].primaryValue` 的意思恒为"1 个 x 值多少个基准币"。所以
+    /// "1 个 divine 换多少个 x" = divine 那行的值 ÷ x 那行的值。PoE1 实测:
+    /// divine 358.9、exalted 1.83 → 196.1 exalted,和 poe.ninja 自己写在
+    /// exalted 那行 `maxVolumeRate` 里的 196.7 对得上。
+    ///
+    /// 没有 divine 那一行就给 `None`:没有锚点,与其按 `secondary` 猜一条换算链,
+    /// 不如让调用方知道这份数据它读不懂。
+    fn rates_per_divine_from_lines(&self) -> Option<RatesPerDivine> {
+        let divine = self.line_value("divine")?;
+        let per_divine = |id: &str| self.line_value(id).map(|value| divine / value);
+        Some(RatesPerDivine {
+            chaos: per_divine("chaos"),
+            exalted: per_divine("exalted"),
+            mirror: per_divine("mirror"),
+        })
+    }
+
+    /// 一行的 `primaryValue`,除非它是 0 / NaN —— 那种值除下去只会得到
+    /// inf 或者 NaN,不如当成"这一轮没有行情"。
+    fn line_value(&self, id: &str) -> Option<f64> {
+        self.lines
+            .iter()
+            .find(|line| line.id == id)
+            .map(|line| line.primary_value)
+            .filter(|value| value.is_finite() && *value > 0.0)
     }
 }
 
@@ -146,6 +199,14 @@ pub struct UniquePriceLine {
     pub level_required: i32,
     #[serde(default)]
     pub primary_value: f64,
+    /// PoE1 专属:那边没有 `core.primary`,每行直接写死三种币的价钱。
+    /// PoE2 的原文里没有这三个字段,所以永远是 0 —— 别拿它们当"免费的换算表"。
+    #[serde(default)]
+    pub chaos_value: f64,
+    #[serde(default)]
+    pub divine_value: f64,
+    #[serde(default)]
+    pub exalted_value: f64,
     #[serde(default)]
     pub listing_count: i64,
     #[serde(default)]
@@ -161,6 +222,29 @@ pub struct ItemOverview {
     pub core: ItemCore,
     #[serde(default)]
     pub lines: Vec<UniquePriceLine>,
+}
+
+impl ItemOverview {
+    /// 把 PoE1 的物品榜摊平成 PoE2 那套 `core.primary` + `primaryValue`。
+    ///
+    /// 两代同一个路径、同一个客户端,返回的却是两种形状:PoE1 没有 `core`,
+    /// 价钱直接写在每行的 `chaosValue`/`divineValue`/`exaltedValue` 里。
+    /// 不摊平的话 serde 会老老实实把 `primaryValue` 填成默认值 0,整张榜
+    /// **静悄悄地全是 0**,一条报错都不给 —— 那是最难查的一种错。
+    ///
+    /// 基准币选 chaos:PoE1 的交易所本来就以 chaos 计价
+    /// (`core.primary` = "chaos"),两边同一个单位才对得上。
+    #[must_use]
+    pub fn normalized_for(mut self, game: Game) -> Self {
+        if game == Game::Poe2 {
+            return self;
+        }
+        self.core.primary = "chaos".to_owned();
+        for line in &mut self.lines {
+            line.primary_value = line.chaos_value;
+        }
+        self
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +290,33 @@ mod economy_tests {
         assert_eq!(rates.chaos, Some(25.21));
         // 1 mirror = 400 divine,所以 1 divine = 0.0025 mirror。
         assert_eq!(rates.mirror, Some(0.0025));
+    }
+
+    /// 2026-09-09 从 `/poe1/api/economy/exchange/current/overview?league=Allflame`
+    /// 原样剪下来的:`core` 一个字没动,102 行里只留了 chaos / divine / exalted /
+    /// mirror 四行,`items` 清空。
+    const POE1_EXCHANGE: &str = include_str!("../fixtures/poe1_exchange_overview.json");
+
+    /// PoE1 的交易所以 **chaos** 计价,PoE2 以 divine 计价 —— 同一个接口、同一种
+    /// 形状,基准币不同。
+    ///
+    /// 老代码只认 divine 基准,别的一律给 `None`,那样 PoE1 的价格一条都换算不出来。
+    /// 但这份原文其实说得清清楚楚:divine 那一行写着 358.9,意思就是"一个 divine
+    /// 值 358.9 个 chaos",拿它当锚点,别的币除一下就有了。
+    #[test]
+    fn a_chaos_based_overview_still_converts_to_per_divine() {
+        let overview: ExchangeOverview = serde_json::from_str(POE1_EXCHANGE).unwrap();
+        assert_eq!(overview.core.primary, "chaos");
+        assert_eq!(overview.core.secondary, "divine");
+        assert_eq!(overview.core.rates["divine"], 0.002_786);
+
+        let rates = overview.rates_per_divine().unwrap();
+        assert_eq!(rates.chaos, Some(358.9));
+        // 1 exalted = 1.83 chaos,所以 1 divine = 358.9 / 1.83 ≈ 196.1 exalted。
+        // poe.ninja 自己在 exalted 那行的 maxVolumeRate 里写的是 196.7,对得上。
+        assert!((rates.exalted.unwrap() - 196.12).abs() < 0.1);
+        // mirror 同理:358.9 / 415183 ≈ 0.00086,它那行的 maxVolumeRate 是 0.0008645。
+        assert!((rates.mirror.unwrap() - 0.000_864_4).abs() < 1e-7);
     }
 
     /// mirror 那天没成交,或者基准币换了——两种情况都不能瞎猜。
@@ -382,6 +493,88 @@ mod economy_tests {
                 "UniqueFlasks",
                 "UniqueCharms",
                 "UniqueJewels",
+            ]
+        );
+        assert_eq!(unique_types_for(Game::Poe2), UNIQUE_TYPES);
+    }
+
+    /// PoE1 物品榜的一行,字段名照抄 2026-09-09 探针从
+    /// `/poe1/api/economy/stash/current/item/overview?league=Allflame&type=UniqueWeapon`
+    /// 打出来的那张键表(第一行的值也是真的,icon / flavourText / 词缀文本剪掉了;
+    /// 第二行是手编的,专门放一个便宜货看小数)。
+    ///
+    /// 和 PoE2 的差别一眼可见:**没有 `core`**,价格直接写在每行的
+    /// `chaosValue` / `divineValue` / `exaltedValue` 里,没有 `primaryValue`,
+    /// 也没有 `levelRequired` / `category` / `corrupted`。
+    const POE1_ITEM_JSON: &str = r#"{
+      "lines": [
+        {"id":1,"name":"Foulborn Reefbane","baseType":"Fishing Rod","itemClass":3,"itemType":"Fishing Rod",
+         "detailsId":"foulborn-reefbane-otherworldly-lure-fishing-rod","variant":null,
+         "chaosValue":415183,"divineValue":1157,"exaltedValue":226876,
+         "count":4,"listingCount":6,
+         "sparkLine":{"totalChange":11.36,"data":[0.93,6.79,24.49]},
+         "mutatedModifiers":[]},
+        {"id":2,"name":"Goldrim","baseType":"Leather Cap","itemClass":10,"itemType":"Helmet",
+         "detailsId":"goldrim-leather-cap","chaosValue":2.5,"divineValue":0.007,"exaltedValue":1.37,
+         "count":100,"listingCount":842,"sparkLine":{"totalChange":0,"data":[null,null,0]}}
+      ]
+    }"#;
+
+    /// PoE1 的价格得摊平成 PoE2 那套(`core.primary` + `primaryValue`),
+    /// 存储和界面才不用为两代各写一遍。
+    ///
+    /// 不摊平的话 serde 会把 `primaryValue` 填成默认值 0 —— 整张 PoE1 暗金榜
+    /// 会**静悄悄地全是 0 分钱**,一条报错都不给。
+    #[test]
+    fn a_poe1_item_overview_is_flattened_onto_the_poe2_shape() {
+        let raw: ItemOverview = serde_json::from_str(POE1_ITEM_JSON).unwrap();
+        // 摊平之前:没有 core,价格读不出来。
+        assert_eq!(raw.core.primary, "");
+        assert_eq!(raw.lines[0].primary_value, 0.0);
+
+        let overview = raw.normalized_for(Game::Poe1);
+        assert_eq!(overview.core.primary, "chaos");
+        assert_eq!(overview.lines[0].name, "Foulborn Reefbane");
+        assert_eq!(overview.lines[0].base_type, "Fishing Rod");
+        assert_eq!(overview.lines[0].primary_value, 415_183.0);
+        assert_eq!(overview.lines[0].chaos_value, 415_183.0);
+        assert_eq!(overview.lines[0].divine_value, 1_157.0);
+        assert_eq!(overview.lines[0].listing_count, 6);
+        assert_eq!(overview.lines[1].primary_value, 2.5);
+        assert_eq!(overview.lines[1].spark_line.change_percent(), None);
+        // PoE1 没有这几个字段,摊平不会替它们编数出来。
+        assert_eq!(overview.lines[0].level_required, 0);
+        assert_eq!(overview.lines[0].category, "");
+        assert!(!overview.lines[0].corrupted);
+    }
+
+    /// PoE2 那边一个字都不许动:同一份原文摊平前后必须完全一样。
+    #[test]
+    fn flattening_leaves_a_poe2_overview_alone() {
+        let before: ItemOverview = serde_json::from_str(UNIQUE_WEAPONS).unwrap();
+        let after = before.clone().normalized_for(Game::Poe2);
+        assert_eq!(after.core.primary, before.core.primary);
+        assert_eq!(after.lines.len(), before.lines.len());
+        for (left, right) in after.lines.iter().zip(&before.lines) {
+            assert_eq!(left.name, right.name);
+            assert_eq!(left.primary_value, right.primary_value);
+            assert_eq!(left.chaos_value, 0.0, "PoE2 的原文里根本没有 chaosValue");
+        }
+    }
+
+    /// PoE1 的分类名是单数,而且没有 charm(那是 PoE2 才有的东西)。
+    /// 把 PoE2 那个复数名字拿去问 PoE1 会直接 404(2026-09-09 实测),
+    /// 所以这张表必须按代分开。
+    #[test]
+    fn poe1_unique_types_are_singular_and_have_no_charms() {
+        assert_eq!(
+            unique_types_for(Game::Poe1),
+            [
+                "UniqueWeapon",
+                "UniqueArmour",
+                "UniqueAccessory",
+                "UniqueFlask",
+                "UniqueJewel",
             ]
         );
     }
