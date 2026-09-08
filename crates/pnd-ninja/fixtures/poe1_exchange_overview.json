@@ -1,0 +1,89 @@
+{
+  "core": {
+    "items": [],
+    "rates": {
+      "divine": 0.002786
+    },
+    "primary": "chaos",
+    "secondary": "divine"
+  },
+  "lines": [
+    {
+      "id": "chaos",
+      "primaryValue": 1,
+      "volumePrimaryValue": 2458168,
+      "maxVolumeCurrency": "divine",
+      "maxVolumeRate": 358.9,
+      "sparkline": {
+        "totalChange": -1.14,
+        "data": [
+          -5.54,
+          -9.58,
+          -18.62,
+          -15.98,
+          -13.54,
+          -4.31,
+          -1.14
+        ]
+      }
+    },
+    {
+      "id": "divine",
+      "primaryValue": 358.9,
+      "volumePrimaryValue": 2458168,
+      "maxVolumeCurrency": "chaos",
+      "maxVolumeRate": 0.002786,
+      "sparkline": {
+        "totalChange": 1.16,
+        "data": [
+          5.89,
+          10.68,
+          23.15,
+          19.03,
+          15.76,
+          4.54,
+          1.16
+        ]
+      }
+    },
+    {
+      "id": "exalted",
+      "primaryValue": 1.83,
+      "volumePrimaryValue": 11306,
+      "maxVolumeCurrency": "divine",
+      "maxVolumeRate": 196.7,
+      "sparkline": {
+        "totalChange": -2.71,
+        "data": [
+          2.16,
+          -6.01,
+          -13.54,
+          -9.67,
+          -3.98,
+          -7.08,
+          -2.71
+        ]
+      }
+    },
+    {
+      "id": "mirror",
+      "primaryValue": 415183,
+      "volumePrimaryValue": 13424238,
+      "maxVolumeCurrency": "divine",
+      "maxVolumeRate": 0.0008645,
+      "sparkline": {
+        "totalChange": 11.36,
+        "data": [
+          0.93,
+          6.79,
+          24.49,
+          28.84,
+          18.58,
+          14.53,
+          11.36
+        ]
+      }
+    }
+  ],
+  "items": []
+}

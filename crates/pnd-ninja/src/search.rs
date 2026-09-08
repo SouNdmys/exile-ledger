@@ -569,6 +569,37 @@ mod search_tests {
         assert!(response.character_refs(&class_dictionary()).is_empty());
     }
 
+    /// PoE1 多出来八张字典(2026-09-09 实测,Allflame 的搜索响应带 15 条字典引用,
+    /// PoE2 只有 7 条):兜底那条"认不出就用它自己的名字"正好把它们全接住了,
+    /// 一个特例都不用加。
+    ///
+    /// 反过来 PoE1 **没有** `spiritgems`(那是 PoE2 才有的部位)。少一个分面不是
+    /// 错误:[`SearchResponse::facet`] 给 `None`,[`SearchResponse::resolve_facet`]
+    /// 给空表,整轮采样照跑。
+    #[test]
+    fn the_poe1_only_facets_fall_through_to_their_own_names() {
+        for facet in [
+            "secondascendancy",
+            "bandit",
+            "atlasskill",
+            "mastery",
+            "runegraft",
+            "tattoo",
+            "vestigialmod",
+            "pantheon",
+        ] {
+            assert_eq!(dictionary_key_for_facet(facet), facet);
+        }
+
+        let response = decode(&sample_response()).unwrap();
+        assert!(response.facet("spiritgems").is_none());
+        assert!(
+            response
+                .resolve_facet("spiritgems", &item_dictionary())
+                .is_empty()
+        );
+    }
+
     #[test]
     fn facet_names_map_to_dictionary_keys() {
         assert_eq!(dictionary_key_for_facet("class"), "class");
