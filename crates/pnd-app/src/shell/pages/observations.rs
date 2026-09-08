@@ -335,6 +335,20 @@ fn status_text(
         return text.status_polling.to_owned();
     };
     let mut parts = vec![live_text(status.live, text, now)];
+    // 秒推送来了多少条、其中多少条没去看。紧跟在 live 那一段后面:先说
+    // 连没连上,再说它到底在不在送货 —— 只看"已连接"看不出这一点,而
+    // 一条连着却一条都不送的 live 和一条没连上的,对用户是同一件坏事。
+    // 一条都没推来时整段不写:那是"刚起来"的常态。
+    if status.pushed_total > 0 {
+        parts.push(i18n::fill(
+            text.obs_pushed,
+            &[&status.pushed_total.to_string()],
+        ));
+        parts.push(i18n::fill(
+            text.obs_not_looked_at,
+            &[&status.sampled_out_total.to_string()],
+        ));
+    }
     if let Some(at) = status.next_discover_at {
         parts.push(i18n::fill(
             text.obs_next_discover_in,
@@ -344,10 +358,14 @@ fn status_text(
     // 在册一条挂单都没有的时候没有"下一条到点的",这一段就不写 ——
     // 写个 00:00 会让人以为它卡住了。
     if let Some(at) = status.next_recheck_at {
-        parts.push(i18n::fill(
-            text.obs_next_check_in,
-            &[&countdown_mmss(at - now)],
-        ));
+        // 在册的挂单积压着的时候,最早到点的那一条永远在过去 —— 倒计时就
+        // 永远写着 00:00,看起来像卡死了。到点了就直说"排队中":它确实在
+        // 排队,只是队比一分钟长。
+        parts.push(if at <= now {
+            text.obs_recheck_queued.to_owned()
+        } else {
+            i18n::fill(text.obs_next_check_in, &[&countdown_mmss(at - now)])
+        });
     }
     // 秒推的把手只活 14 秒:排队排过头就换不回挂单了。一条都没过期时不写
     // 这一段 —— 常态是 0,而写着"过期 0"只会让人以为这里有毛病。
@@ -1567,6 +1585,82 @@ mod observations_page_tests {
         let rows = observation_rows(&settings(), &status, &i18n::SIMPLIFIED_CHINESE, NOW);
         assert!(
             rows[0][5].text().contains("过期 3"),
+            "{}",
+            rows[0][5].text()
+        );
+    }
+
+    /// 秒推推来了多少条、其中多少条没去看,得写在状态格里。
+    ///
+    /// 只写"过期"的话,一条秒推正常在送货的观察,和一条一条都没推来的,
+    /// 屏幕上长得一模一样 —— 而"live 到底在不在干活"正是这一格该回答的事。
+    /// 一条都没推来时不写这一段:那是"刚起来"的常态,写着"已推 0"只会
+    /// 让人以为坏了。
+    #[test]
+    fn the_status_cell_says_how_much_live_pushed() {
+        let mut status = status();
+        let rows = observation_rows(&settings(), &status, &i18n::ENGLISH, NOW);
+        assert!(
+            !rows[0][5].text().contains("pushed"),
+            "一条都没推来时不写这一段:{}",
+            rows[0][5].text()
+        );
+
+        let live = status
+            .get_mut(&ObservationId("o-1".to_string()))
+            .expect("the first observation");
+        live.pushed_total = 218;
+        live.sampled_out_total = 145;
+        let english = observation_rows(&settings(), &status, &i18n::ENGLISH, NOW);
+        let cell = english[0][5].text();
+        assert!(cell.contains("218 pushed · 145 not looked at"), "{cell}");
+        // 紧跟在 live 那一段后面:先说连没连上,再说它送来了多少。
+        assert!(
+            cell.find("218 pushed") < cell.find("new listings in"),
+            "{cell}"
+        );
+
+        let chinese = observation_rows(&settings(), &status, &i18n::SIMPLIFIED_CHINESE, NOW);
+        assert!(
+            chinese[0][5].text().contains("已推 218 · 未看 145"),
+            "{}",
+            chinese[0][5].text()
+        );
+    }
+
+    /// 在册的挂单积压着的时候,最早该回头看的那一条永远在过去,倒计时就
+    /// 永远写着 00:00 —— 看起来像卡死了,其实是排着队在扫。到点了就直说
+    /// "排队中",别再写一个不会动的倒计时。
+    #[test]
+    fn a_recheck_that_is_already_due_says_it_is_queued() {
+        let mut overdue = status();
+        overdue
+            .get_mut(&ObservationId("o-1".to_string()))
+            .expect("the first observation")
+            .next_recheck_at = Some(NOW - 5);
+        let rows = observation_rows(&settings(), &overdue, &i18n::ENGLISH, NOW);
+        assert!(
+            rows[0][5].text().contains("recheck queued"),
+            "{}",
+            rows[0][5].text()
+        );
+        assert!(
+            !rows[0][5].text().contains("00:00"),
+            "{}",
+            rows[0][5].text()
+        );
+        let rows = observation_rows(&settings(), &overdue, &i18n::SIMPLIFIED_CHINESE, NOW);
+        assert!(
+            rows[0][5].text().contains("回查排队中"),
+            "{}",
+            rows[0][5].text()
+        );
+
+        // 还在未来的那一刻照旧是倒计时 —— 按了"立即回查"之后,秒针是唯一
+        // 能证明它真的动了的东西。
+        let rows = observation_rows(&settings(), &status(), &i18n::ENGLISH, NOW);
+        assert!(
+            rows[0][5].text().contains("next check in 01:30"),
             "{}",
             rows[0][5].text()
         );

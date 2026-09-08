@@ -227,6 +227,15 @@ catalogue! {
     obs_next_discover_in,
     /// "{} 后回查"
     obs_next_check_in,
+    /// 在册的挂单积压着的时候,最早该回头看的那一条永远在过去,倒计时就
+    /// 永远是 00:00 —— 看起来像卡死了,其实是排着队在扫。
+    obs_recheck_queued,
+    /// "已推 {}" —— 秒推一共送来过多少条挂单。这一格不写它的话,一条 live
+    /// 正常在送货的观察和一条一条都没推来的长得一模一样。
+    obs_pushed,
+    /// "未看 {}" —— 推来了却没去抓详情的条数(按抽样比例主动放掉的,
+    /// 加上抓取额度买不起、当场丢掉的)。
+    obs_not_looked_at,
     /// "出错:{}"
     obs_status_error,
     /// "过期 {}" —— 秒推来的把手只活 14 秒,排队排过头就换不回挂单了。
@@ -712,6 +721,9 @@ pub static ENGLISH: Text = Text {
     obs_recheck_requested: "Rechecking the listings on file now.",
     obs_next_discover_in: "new listings in {}",
     obs_next_check_in: "next check in {}",
+    obs_recheck_queued: "recheck queued",
+    obs_pushed: "{} pushed",
+    obs_not_looked_at: "{} not looked at",
     obs_status_error: "error: {}",
     obs_expired: "{} expired",
     obs_no_live_session: "Not logged in: new listings can only be found by polling, so anything sold within a minute is missed. Paste a POESESSID on the Settings page.",
@@ -1070,6 +1082,9 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     obs_recheck_requested: "这就把在册的挂单回查一遍。",
     obs_next_discover_in: "{} 后再找新的",
     obs_next_check_in: "{} 后回查",
+    obs_recheck_queued: "回查排队中",
+    obs_pushed: "已推 {}",
+    obs_not_looked_at: "未看 {}",
     obs_status_error: "出错:{}",
     obs_expired: "过期 {}",
     obs_no_live_session: "未登录:只能靠轮询发现,会漏掉一分钟内卖掉的单。去设置页粘一个 POESESSID。",
