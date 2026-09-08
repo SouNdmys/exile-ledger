@@ -16,6 +16,10 @@
 //! `--session` 从 `settings.json` 里读 POESESSID(环境变量 `POESESSID` 优先)。
 //! 那串东西**永远不会被打印出来**,只会以"带会话/匿名"一个词的形式出现;
 //! fetch 回来的 `whisper_token`/`hideout_token` 同理,只印长度和过期时间。
+//! 服务端推来的把手要是一张 JWT(poe2 就是),也只印头和声明,不印整串。
+//!
+//! `--fetch` 有次数上限([`MAX_PROBE_FETCHES`]):poe2 的推送几秒钟一次,
+//! 一次一 fetch 会把交易站泼满。
 //!
 //! 这个探针**只握手一次,不自动重连**:重连是 `live_worker.rs` 的活,
 //! 探针反复捅握手接口没有意义,只会平白多几次失败记录。握手失败时它会把
@@ -55,6 +59,20 @@ const HEARTBEAT_SECS: u64 = 60;
 /// (真正的 worker 会摇一个随机数,结果在 ±20% 里)。
 const MID_JITTER: f64 = 0.5;
 
+/// 印 JWT 声明时,一个字符串值最多留这么长。
+///
+/// 120 个字符放得下一个 64 位十六进制的挂单 id(公开信息,要看清),
+/// 也放得下几个拼在一起的;而任何一段真正的长内容都会在这里被截掉。
+const CLAIM_VALUE_CHARS: usize = 120;
+
+/// 一次探针跑最多发几次 fetch。
+///
+/// 有这个数是因为 poe2 的推送太密了:一条热闹的搜索每 2–10 秒就推一次
+/// (2026-09-08 实测两分钟 21 帧),而现在**每一帧都带着一个能 fetch 的把手**。
+/// 不封顶的话,一次 `--fetch` 五分钟就是几十个请求 —— 探针是来验一遍链路的,
+/// 不是来跑压力测试的。两次够看清"服务端认不认这张票"了。
+const MAX_PROBE_FETCHES: u32 = 2;
+
 fn main() -> ExitCode {
     let args = match Args::parse(std::env::args().skip(1)) {
         Ok(args) => args,
@@ -93,9 +111,9 @@ fn run(args: &Args) -> Result<(), String> {
     println!(
         "fetch        {}",
         if args.fetch {
-            "yes (new ids go through TradeClient::fetch)"
+            "yes (pushed handles go through TradeClient::fetch, capped)"
         } else {
-            "no (ids only)"
+            "no (handles only)"
         }
     );
     println!(
@@ -141,28 +159,43 @@ fn pump(
     let mut limiter = RateLimiter::default();
     let mut idle_secs = 0u64;
     let mut pushes = 0u32;
+    let mut receipts = 0u32;
+    let mut fetches = 0u32;
 
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
         match session.next() {
+            // 一次推送。poe2 的把手是一张 JWT(见 `pnd_trade::live::LiveMessage`),
+            // 探针是这条链路上唯一该把它拆开看的地方,所以**每一个**都拆:
+            // 头怎么签的、里面几个声明、这一帧多长 —— 只有看过才说得清。
             Ok(LiveMessage::New(ids)) => {
                 idle_secs = 0;
                 pushes += 1;
-                println!(
-                    "{} push       {} new listing(s): {}",
-                    stamp(),
-                    ids.len(),
-                    ids.join(", ")
-                );
-                if args.fetch && !ids.is_empty() {
+                println!("{} push       {} handle(s)", stamp(), ids.len());
+                for id in &ids {
+                    print_handle(id);
+                }
+                // 一条热闹的搜索几秒钟就推一次,一次一 fetch 就是往交易站上
+                // 泼请求。探针是来验一遍链路的,不是来跑压力测试的。
+                if args.fetch && !ids.is_empty() && fetches < MAX_PROBE_FETCHES {
+                    fetches += 1;
                     fetch_and_print(&client, &mut limiter, config, search_ref, &ids);
+                } else if args.fetch && fetches >= MAX_PROBE_FETCHES {
+                    println!(
+                        "{}            (already spent {MAX_PROBE_FETCHES} fetches, not asking again)",
+                        stamp()
+                    );
                 }
             }
-            // 连上之后服务端立刻发的订阅回执。探针是这条链路上唯一该把它
-            // 拆开看的地方:下一次真跑之后,我们就知道那张 JWT 是干什么用的了。
+            // 一张没装挂单的 `{"result":"<JWT>"}`。2026-09-08 的取证跑里
+            // 一张也没见过,所以见到了更要看清楚 —— 接口又变了。
             Ok(LiveMessage::Subscribed { token }) => {
                 idle_secs = 0;
-                println!("{} subscribed the server acknowledged this search", stamp());
-                print_subscription_token(&token);
+                receipts += 1;
+                println!(
+                    "{} receipt    a result token with nothing to fetch",
+                    stamp()
+                );
+                print_result_frame(&token);
             }
             // 已经是"键名 + 值长度"的描述,不是原文 —— 不认识的消息里
             // 可能有凭证,屏幕和日志都不该替服务端保管它。
@@ -194,7 +227,11 @@ fn pump(
     } else {
         "--minutes elapsed"
     };
-    println!("\n{} done       {reason} — {pushes} push(es) seen", stamp());
+    println!(
+        "\n{} done       {reason} — {pushes} push(es), {receipts} empty receipt(s), \
+         {fetches} fetch(es)",
+        stamp()
+    );
     Ok(())
 }
 
@@ -243,7 +280,14 @@ fn fetch_and_print(
             return;
         }
         if !response.is_success() {
-            println!("{}            fetch -> status {}", stamp(), response.status);
+            // 带上 body:GGG 的 `{"error":{"code":…,"message":"…"}}` 才是
+            // "为什么不认"的答案,光一个状态码说不清。
+            println!(
+                "{}            fetch -> status {} {}",
+                stamp(),
+                response.status,
+                body_excerpt(&response.body)
+            );
             return;
         }
         // 服务端有没有认出会话:Rules 里没有 `Account` 就说明 cookie 白带了。
@@ -268,6 +312,29 @@ fn fetch_and_print(
             Err(error) => println!("{}            fetch body unreadable: {error}", stamp()),
         }
     }
+}
+
+/// 一个"挂单把手"印出来是什么样。
+///
+/// 短的(64 位十六进制的真挂单 id,poe1 那种)原样写;长的是一张 result
+/// token,只拆开印形状 —— 整串绝不上屏,它是一张能换回挂单的票。
+fn print_handle(id: &str) {
+    if jwt_claims(id).is_none() {
+        println!("{}            id       {id}", stamp());
+        return;
+    }
+    print_result_frame(id);
+}
+
+/// 一段响应体的开头,压成一行 —— 够看清一句 GGG 的错误 JSON。
+fn body_excerpt(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let flattened: String = text
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .take(CLAIM_VALUE_CHARS)
+        .collect();
+    format!("{:?}", flattened.trim())
 }
 
 fn print_listing(listing: &ListingSummary) {
@@ -311,18 +378,22 @@ fn describe_token(token: Option<&str>) -> String {
     pnd_runtime::describe_token(token, now_secs())
 }
 
-/// 把订阅回执那张 JWT 拆开印出来:长度、还有多久过期、header、payload。
+/// 把一条 `{"result":"<JWT>"}` 帧拆开印出来:原始长度、还有多久过期、
+/// header、声明。
 ///
-/// **签名那一段从不解码、也不打印。** 这里印的是"这张票是发给谁的、什么时候
-/// 作废",不是那张票本身 —— 有了它就能冒充这次订阅。
+/// **签名那一段从不解码、也不打印。** 这里印的是"这张票是发给谁的、装了
+/// 什么、什么时候作废",不是那张票本身 —— 有了它就能冒充这次订阅。
 ///
-/// 为什么要印:2026-09-07 那次真跑里,这条消息整条掉进了状态栏(当时它还是
-/// `Other`),只看得见前几十个字符。下一次跑完,我们就能凭 `iss`/`exp`
-/// 这些声明说清楚它到底是什么,而不是靠猜。
-fn print_subscription_token(token: &str) {
+/// 为什么要印:2026-09-07 那天用户挂了一上午 live,日志里记下 3008 条
+/// `keys=["result"]`、一条 `new` 都没有,长度在 915/1038/1155 之间跳。
+/// 长度会跳就说明里面装的是**条数不定的东西**(多半就是新挂单 id),
+/// 而当时我们把它当成"订阅回执"一律丢掉了。要把它认出来,先得看清楚
+/// 声明长什么样、id 藏在哪个键里 —— 这个函数就是那双眼睛。
+fn print_result_frame(token: &str) {
     println!(
-        "{}            token    {}",
+        "{}            result_len {}   token {}",
         stamp(),
+        token.chars().count(),
         describe_token(Some(token))
     );
     println!(
@@ -331,7 +402,7 @@ fn print_subscription_token(token: &str) {
         section(jwt_header(token))
     );
     println!(
-        "{}            payload  {}",
+        "{}            claims   {}",
         stamp(),
         section(jwt_claims(token))
     );
@@ -341,12 +412,61 @@ fn print_subscription_token(token: &str) {
     );
 }
 
-/// 解得开就印 JSON 原文,解不开就照实说一句 —— 别装作没这一段。
+/// 解得开就印 JSON,解不开就照实说一句 —— 别装作没这一段。
+///
+/// 印之前先过 [`redact`]:声明里可能有账号那一类的东西,而这个探针的输出
+/// 是要贴进对话和记录的。
 fn section(value: Option<serde_json::Value>) -> String {
     value.map_or_else(
         || "(not readable base64url JSON)".to_string(),
-        |value| value.to_string(),
+        |value| redact(value).to_string(),
     )
+}
+
+/// 把一段 JSON 里的字符串值削短,好让它能安全地贴出来。
+///
+/// 两条规矩:长得像 uuid 的只报长度(交易站用 uuid 当账号那一类的标识,
+/// 而我们要看的挂单 id 是 64 位十六进制,不带横杠,不会被这条误伤);
+/// 其余的截到 [`CLAIM_VALUE_CHARS`] 个字符。数字和布尔原样留着 ——
+/// `iat`/`exp` 正是要看的东西。
+fn redact(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => Value::String(redact_string(&text)),
+        Value::Array(items) => Value::Array(items.into_iter().map(redact).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| (key, redact(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn redact_string(text: &str) -> String {
+    if looks_like_uuid(text) {
+        return format!("<uuid-shaped, {} chars>", text.chars().count());
+    }
+    let chars = text.chars().count();
+    if chars <= CLAIM_VALUE_CHARS {
+        return text.to_string();
+    }
+    format!(
+        "{}… (+{} chars)",
+        text.chars().take(CLAIM_VALUE_CHARS).collect::<String>(),
+        chars - CLAIM_VALUE_CHARS
+    )
+}
+
+/// `8-4-4-4-12` 的十六进制,也就是一个 uuid 的长相。
+fn looks_like_uuid(text: &str) -> bool {
+    let groups: Vec<&str> = text.split('-').collect();
+    let lengths: Vec<usize> = groups.iter().map(|group| group.len()).collect();
+    lengths == [8, 4, 4, 4, 12]
+        && groups
+            .iter()
+            .all(|group| group.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 // ---------------------------------------------------------------------

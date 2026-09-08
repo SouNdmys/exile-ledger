@@ -36,6 +36,8 @@ use thiserror::Error;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
+use crate::jwt::jwt_claims;
+
 /// Live Search 的 WebSocket 根路径(poe2 在 `trade2` 下,和 poe1 是两套)。
 const WS_BASE: &str = "wss://www.pathofexile.com/api/trade2/live/poe2";
 
@@ -65,6 +67,19 @@ const BODY_EXCERPT_CHARS: usize = 200;
 /// 20 个字符放得下 `true`、`1757203200`、`"ok"` 这种一眼能懂的东西,
 /// 而放不下任何一个 token —— JWT 光是头一段就比它长。
 const SAFE_VALUE_CHARS: usize = 20;
+
+/// 一个"挂单把手"短过这么多字符,就可以原样写进日志。
+///
+/// 真的挂单 id 是 64 个十六进制字符,公开信息;而 trade2 推来的把手是一张
+/// 九百多字符的 JWT。100 这条线把两者分得干干净净。
+const SAFE_ID_CHARS: usize = 100;
+
+/// result token 里"装着挂单"的那个声明。
+///
+/// 2026-09-08 实测:这个声明是一段 273–408 字节的密文(熵 7.9 bit/字节,
+/// 前四个字节固定是 `de f5 02 00`,任何标准解压都不认),我们读不懂 ——
+/// **也不需要读懂**,服务端读得懂就够了(见 [`LiveMessage::New`])。
+const PAYLOAD_CLAIM: &str = "d";
 
 // ---------------------------------------------------------------------
 // 配置
@@ -151,13 +166,35 @@ pub fn live_ws_url(league: &str, search_id: &str) -> String {
 /// 而这个类型会出现在日志和 `assert_eq!` 的失败输出里。
 #[derive(Clone, PartialEq, Eq)]
 pub enum LiveMessage {
-    /// `{"new":["id1","id2",…]}` —— 有新挂单,按 10 个一批去 fetch。
-    /// 空表也是合法的推送,照样回 `New(vec![])`。
-    New(Vec<String>),
-    /// 刚连上时服务端立刻回的 `{"result":"<JWT>"}` —— 这条搜索的订阅回执。
+    /// 有新挂单,拿这几个"把手"去 fetch。空表也是合法的推送。
     ///
-    /// 实测那个 JWT 的 payload 里 `iss` 就是搜索 id。我们不用它做任何事
-    /// (推送本身不需要它),但认出来是必须的:早先它落进 `Other`,
+    /// 把手有两种,来自服务端的两种帧:
+    ///
+    /// 1. `{"new":["id1","id2",…]}` —— 把手就是挂单 id 本身(64 位十六进制)。
+    ///    poe1 的老形状。
+    /// 2. `{"result":"<JWT>"}` —— **poe2 实际在用的形状**。整张 token 就是
+    ///    那个把手:原样填进 `…/fetch/<把手>?query=<搜索id>`,服务端回的就是
+    ///    这一帧对应的那几件新挂单。
+    ///
+    /// 第二种是 2026-09-08 用 `live_probe` 当场量出来的。那天之前我们把它当成
+    /// "订阅回执"整条丢掉,于是**秒推一件也没记下来**,全靠十分钟一次的轮询
+    /// 兜底。当时的证据:主人挂了一上午,日志里 3008 条 `keys=["result"]`、
+    /// 零条 `new`。取证跑里那张 JWT 的声明只有三个 —— `d`(读不懂的密文)、
+    /// `exp`(签发后 14 秒)、`iss`(这条搜索,服务端自己重新 gzip 过的 id),
+    /// **没有一个挂单 id**。id 不在票里,票本身就是票根:拿去换。
+    ///
+    /// 一帧只给一个把手。token 长度会跳(915 / 1038 / 1155 字符),差值正好
+    /// 对得上"这一帧里有 1 / 2 / 3 件" —— 也就是说一个把手换回来的可能不止
+    /// 一件。把十个把手用逗号拼进一个 URL 没有人验过,所以不要那么干。
+    ///
+    /// **有效期只有 14 秒。** 排队排久了这张票就废了,回来的是一次失败,
+    /// 不是一件挂单。
+    New(Vec<String>),
+    /// 一张 `{"result":"<JWT>"}`,但里面没装挂单(没有 `d` 那个声明)。
+    ///
+    /// 取证跑里一张也没见过 —— 真正的连接回执是另一条消息(`{"auth":true}`,
+    /// 落在 [`LiveMessage::Other`] 里)。留着这条路是因为"`result` 里没东西"
+    /// 也不该被当成错误,更不该整串抄进日志:早先它落进 `Other`,
     /// 于是**整串 token 被原样写进了状态栏**。
     Subscribed { token: String },
     /// 读超时:这段时间服务端什么都没说。连接是好的,只是没货。
@@ -173,7 +210,11 @@ pub enum LiveMessage {
 impl fmt::Debug for LiveMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LiveMessage::New(ids) => f.debug_tuple("New").field(ids).finish(),
+            // 把手可能是一张九百多字符的 token,而这行会进日志。
+            LiveMessage::New(ids) => {
+                let rendered: Vec<String> = ids.iter().map(|id| describe_id(id)).collect();
+                f.debug_tuple("New").field(&rendered).finish()
+            }
             // 只说有多长,绝不说是什么。
             LiveMessage::Subscribed { token } => f
                 .debug_struct("Subscribed")
@@ -205,14 +246,44 @@ pub fn parse_live_message(text: &str) -> Result<LiveMessage, ProtocolError> {
             .collect();
         return Ok(LiveMessage::New(ids));
     }
-    // 只有"`result` 是个字符串"才算订阅回执:哪天服务端拿这个键装别的东西
+    // 只有"`result` 是个字符串"才当票看:哪天服务端拿这个键装别的东西
     // (对象、数组),它就该老老实实走下面那条"不认识"的路。
     if let Some(token) = value.get("result").and_then(Value::as_str) {
+        // 装了挂单的票就是一次推送,票本身就是去 fetch 的把手
+        // (见 [`LiveMessage::New`]);空票还是回执。
+        if carries_listings(token) {
+            return Ok(LiveMessage::New(vec![token.to_string()]));
+        }
         return Ok(LiveMessage::Subscribed {
             token: token.to_string(),
         });
     }
     Ok(LiveMessage::Other(describe_live_message(text)))
+}
+
+/// 这张 result token 里装没装挂单。
+///
+/// 只看 [`PAYLOAD_CLAIM`] 在不在、是不是一段非空字符串 —— **不验签、
+/// 不看 `exp`**。验签我们没有钥匙;`exp` 过没过期是发出去之后才知道的事
+/// (服务端会拒),在这里提前判死只会把一条本来能救的推送丢掉。
+fn carries_listings(token: &str) -> bool {
+    let Some(claims) = jwt_claims(token) else {
+        return false;
+    };
+    claims
+        .get(PAYLOAD_CLAIM)
+        .and_then(Value::as_str)
+        .is_some_and(|payload| !payload.is_empty())
+}
+
+/// 一个把手 → 能不能原样写进日志。见 [`SAFE_ID_CHARS`]。
+fn describe_id(id: &str) -> String {
+    let chars = id.chars().count();
+    if chars < SAFE_ID_CHARS {
+        id.to_string()
+    } else {
+        format!("<{chars} chars>")
+    }
 }
 
 /// 一条消息的"体检报告":有哪些键、每个值多长。**不回显长值。**
@@ -755,6 +826,69 @@ mod live_tests {
             parse_live_message(r#"{"result":{"a":1}}"#).unwrap(),
             LiveMessage::Other(r#"keys=["result"] result_len=1"#.to_string())
         );
+    }
+
+    // ---- result 帧 ---------------------------------------------------
+
+    /// 2026-09-08 取证跑里真实的一帧,**值全换成了占位符**:`d` 那段密文、
+    /// `iss` 那个搜索 id 都不是原来的,签名是一句假话(解析器从不验签)。
+    /// 留下来的是形状:`ES256` 的头,外加 `d`/`exp`/`iss` 三个声明 —— 那次
+    /// 跑里 30 帧全长这样,一帧不差。
+    const RESULT_TOKEN: &str = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.\
+eyJkIjoiM3ZVQ0FQTEFDRUhPTERFUnBsYWNlaG9sZGVyMDEyMzQ1Njc4OWFiY2RlZisvIiwiZXhwIjoxNzg4ODUxMTQ2\
+LCJpc3MiOiJINHNJQUFBQUFBQUFBMVdPcGxhY2Vob2xkZXJzZWFyY2hpZCJ9.ZHVtbXktc2lnbmF0dXJl";
+
+    /// 同一张票,但没有 `d` 那个声明。
+    const RECEIPT_TOKEN: &str = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.\
+eyJleHAiOjE3ODg4NTExNDYsImlzcyI6Ikg0c0lBQUFBQUFBQUExV09wbGFjZWhvbGRlcnNlYXJjaGlkIn0.\
+ZHVtbXktc2lnbmF0dXJl";
+
+    /// 带 `d` 的 result 帧就是"有新挂单",而那张票**本身**就是去 fetch 的把手。
+    ///
+    /// 2026-09-08 实测:把整张 token 当挂单 id 填进
+    /// `…/api/trade2/fetch/<token>?query=<搜索id>`,服务端回的就是那几件新挂单
+    /// (拿我们自己的搜索 id 和 token 自己的 `iss` 各试一次,两次都认)。
+    #[test]
+    fn a_result_frame_is_a_push_and_the_token_is_the_fetch_handle() {
+        assert_eq!(
+            parse_live_message(&format!(r#"{{"result":"{RESULT_TOKEN}"}}"#)).unwrap(),
+            LiveMessage::New(vec![RESULT_TOKEN.to_string()])
+        );
+    }
+
+    /// 一帧只换一次 fetch:把手是"这一帧的那几件",不是"某一件"。
+    /// 十个把手拼进一个 URL 是另一回事,谁也没验过 —— 所以一帧就是一个。
+    #[test]
+    fn one_frame_hands_over_exactly_one_handle() {
+        let LiveMessage::New(ids) =
+            parse_live_message(&format!(r#"{{"result":"{RESULT_TOKEN}"}}"#)).unwrap()
+        else {
+            panic!("expected New");
+        };
+        assert_eq!(ids.len(), 1);
+    }
+
+    /// 没有 `d` 的 result 就没有挂单可抓,还是那张回执。
+    #[test]
+    fn a_result_token_without_a_payload_claim_stays_a_receipt() {
+        assert_eq!(
+            parse_live_message(&format!(r#"{{"result":"{RECEIPT_TOKEN}"}}"#)).unwrap(),
+            LiveMessage::Subscribed {
+                token: RECEIPT_TOKEN.to_string()
+            }
+        );
+    }
+
+    /// 把手是一张几百字符的 token,而 `New` 的 `Debug` 会进日志。
+    /// 长的只许报长度 —— 和 [`LiveMessage::Subscribed`] 一个规矩。
+    #[test]
+    fn a_long_handle_never_shows_up_in_debug_output() {
+        let message = LiveMessage::New(vec![RESULT_TOKEN.to_string(), "aaa111".to_string()]);
+        let debug = format!("{message:?}");
+        assert!(!debug.contains(RESULT_TOKEN), "{debug}");
+        assert!(debug.contains("chars"), "{debug}");
+        // 真正的挂单 id(64 位十六进制)是公开的,照常看得见。
+        assert!(debug.contains("aaa111"), "{debug}");
     }
 
     #[test]

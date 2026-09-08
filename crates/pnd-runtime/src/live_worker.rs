@@ -453,8 +453,9 @@ fn pump(
             // 读超时:这段时间服务端什么都没说,连接还好着。回到循环顶上
             // 就是为了看一眼取消标志。
             Ok(LiveMessage::Idle) => {}
-            // 连上时的订阅回执。**只报形状,不报内容** —— 那串是服务端发的
-            // JWT,早先它被原样抄进日志,整条 token 就进了状态栏。
+            // 一张没装挂单的 `{"result":"<JWT>"}`(装了的走上面那条
+            // [`LiveMessage::New`])。**只报形状,不报内容** —— 那串是服务端
+            // 发的 JWT,早先它被原样抄进日志,整条 token 就进了状态栏。
             Ok(LiveMessage::Subscribed { token }) => {
                 let line = format!(
                     "live {}: server message keys=[\"result\"] result_len={}",
@@ -853,8 +854,52 @@ pub(crate) mod live_worker_tests {
         assert!(states(&seen)[1].is_connected());
     }
 
-    /// 服务端一连上就发 `{"result":"<JWT>"}`。日志里只许出现形状,
-    /// 绝不许出现那串 token —— 这是 2026-09-07 那次真跑里状态栏泄露的东西。
+    /// poe2 真正的推送长这样:`{"result":"<JWT>"}`,一条 `new` 都没有。
+    /// worker 得把它当推送转告 actor,而不是当一条日志咽下去 ——
+    /// 咽下去的后果就是 2026-09-07 那一上午:3008 帧,秒推一件也没记下来。
+    ///
+    /// token 是 2026-09-08 取证跑里那一帧,值换成了占位符
+    /// (和 `pnd-trade/src/live.rs` 的 `RESULT_TOKEN` 是同一张)。
+    #[test]
+    fn a_result_frame_reaches_the_actor_as_a_push() {
+        const TOKEN: &str = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.\
+eyJkIjoiM3ZVQ0FQTEFDRUhPTERFUnBsYWNlaG9sZGVyMDEyMzQ1Njc4OWFiY2RlZisvIiwiZXhwIjoxNzg4ODUxMTQ2\
+LCJpc3MiOiJINHNJQUFBQUFBQUFBMVdPcGxhY2Vob2xkZXJzZWFyY2hpZCJ9.ZHVtbXktc2lnbmF0dXJl";
+
+        let connector = Arc::new(ScriptedConnector::new());
+        connector.push(Step::Raw(format!(r#"{{"result":"{TOKEN}"}}"#)));
+
+        let seen = drive(
+            worker_config("w-1", "cookie"),
+            Arc::clone(&connector),
+            |seen| {
+                seen.iter()
+                    .any(|event| matches!(event, LiveEvent::New { .. }))
+            },
+        );
+
+        let pushes: Vec<Vec<String>> = seen
+            .iter()
+            .filter_map(|event| match event {
+                LiveEvent::New { ids, .. } => Some(ids.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pushes,
+            vec![vec![TOKEN.to_string()]],
+            "整张 token 就是去 fetch 的把手"
+        );
+        // 而且它不该同时又被写成一行日志。
+        assert!(
+            !seen.iter().any(|event| matches!(event, LiveEvent::Log(_))),
+            "{seen:#?}"
+        );
+    }
+
+    /// 一张没装挂单的 result token(以及别的不认识的消息)只上日志,
+    /// 而日志里只许出现形状,绝不许出现那串 token ——
+    /// 这是 2026-09-07 那次真跑里状态栏泄露的东西。
     #[test]
     fn the_connect_receipt_is_logged_by_shape_never_by_value() {
         let token = format!(
