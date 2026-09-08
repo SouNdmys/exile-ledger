@@ -40,10 +40,11 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use pnd_domain::Game;
 use pnd_ninja::aggregate::aggregate_mods;
 use pnd_ninja::character::CharacterDetail;
 use pnd_ninja::client::{NinjaClient, NinjaError};
-use pnd_ninja::economy::UNIQUE_TYPES;
+use pnd_ninja::economy::unique_types_for;
 use pnd_ninja::index_state::{IndexState, LeagueBuild};
 use pnd_ninja::plan::{
     Partition, PartitionTier, SampleOptions, SampledCharacter, class_skill_partitions,
@@ -234,7 +235,13 @@ pub fn stage_plan(stop_after: SamplerStage) -> Vec<SamplerStep> {
 /// 跑一轮采样要知道的全部东西。
 #[derive(Debug, Clone)]
 pub struct SamplerConfig {
+    /// 这一轮问哪一代游戏。它一个字段管三件事:客户端指哪个前缀、
+    /// 库写哪个文件、参考价问哪张分类表。
+    pub game: Game,
     /// builds 接口用的联赛短名,例如 `forbiddenrites`。
+    ///
+    /// **留空 = "用当季挑战联赛"**:那时候由 index-state 自己说了算
+    /// (见 [`resolve_league_url`])。
     pub league_url: String,
     /// 经济接口用的联赛显示名,例如 `Forbidden Rites`。两个接口要的就是不同的东西。
     pub league_name: String,
@@ -257,15 +264,29 @@ pub struct SamplerConfig {
 }
 
 impl SamplerConfig {
-    /// 常用的一组:盯 Forbidden Rites、跑到分面、不强制、默认库。
+    /// 常用的一组:PoE2、跑到分面、不强制、默认库。
+    ///
+    /// **签名刻意不带 `game`**:老调用方问的一直是 PoE2,让它们一个字都不用改。
     #[must_use]
     pub fn new(league_url: impl Into<String>, league_name: impl Into<String>) -> SamplerConfig {
+        SamplerConfig::for_game(Game::Poe2, league_url, league_name)
+    }
+
+    /// 某一代的那一组。库的默认路径跟着游戏走 —— 两代混进一个文件,
+    /// 分区键长得一模一样,混进去就再也分不开了。
+    #[must_use]
+    pub fn for_game(
+        game: Game,
+        league_url: impl Into<String>,
+        league_name: impl Into<String>,
+    ) -> SamplerConfig {
         SamplerConfig {
+            game,
             league_url: league_url.into(),
             league_name: league_name.into(),
             tuning: NinjaTuning::default(),
             user_agent: String::new(),
-            db_path: pnd_storage::default_ninja_db_path(),
+            db_path: pnd_storage::default_ninja_db_path_for(game),
             stop_after: SamplerStage::Facets,
             force: false,
             max_characters: None,
@@ -333,6 +354,10 @@ pub enum SamplerError {
     /// index-state 或者 build-index-state 里没有这个联赛短名——多半是名字打错了。
     #[error("poe.ninja has no build league called {0}")]
     UnknownLeague(String),
+    /// 设置里那个联赛留空(意思是"用当季挑战联赛"),而 index-state 里
+    /// 一条挑战联赛都挑不出来。宁可停在这里,也不要退回 Standard 去采一天。
+    #[error("poe.ninja did not name a current {0} challenge league — set the league by hand")]
+    NoChallengeLeague(Game),
     #[error("could not start the sampler thread: {0}")]
     Spawn(String),
 }
@@ -402,11 +427,23 @@ pub fn budget_eta_secs(remaining: u32, hourly_budget: u32) -> u64 {
 /// index-state 每条快照都同时带着显示名和短名 —— **手上有它就别再猜**:
 /// 猜法只是规律,没有任何接口承诺过,猜错一次的代价是整轮采样以
 /// `UnknownLeague` 收场,而正确答案就在刚读回来的那份 JSON 里。
-fn resolve_league_url(index: &IndexState, league_name: &str, guessed: &str) -> String {
+///
+/// 两个名字**都空**是另一件事:那是设置里那个联赛留着没填,意思是
+/// "用当季挑战联赛"。联赛三个月换一次名字,让人每赛季回设置页改一次字符串
+/// 是纯手工活,而 index-state 自己就说得出当季那个叫什么。挑不出来时给
+/// `None` —— 退回 Standard 等于把一整天的请求配额喂给一份没人看的数据。
+fn resolve_league_url(index: &IndexState, league_name: &str, guessed: &str) -> Option<String> {
+    if !league_name.is_empty()
+        && let Some(url) = index.league_url_for_name(league_name)
+    {
+        return Some(url.to_owned());
+    }
+    if !guessed.is_empty() {
+        return Some(guessed.to_owned());
+    }
     index
-        .league_url_for_name(league_name)
-        .unwrap_or(guessed)
-        .to_owned()
+        .current_challenge_league()
+        .map(|league| league.url.clone())
 }
 
 /// 滑动窗口有多宽。配额是"每滚动一小时多少个",不是"每个整点清零"。
@@ -757,7 +794,15 @@ pub fn run_sampler(
     emit: &dyn Fn(SamplerEvent),
 ) -> Result<(), SamplerError> {
     let store = NinjaStore::open(&config.db_path)?;
-    let latest = store.latest_snapshot(&config.league_url)?;
+    // 联赛名留空时还不知道这一轮会落在哪个短名上(要等 index-state),所以
+    // 拿库里最近的那一轮当"上一轮"。这个库只装一代,一代通常只盯一个联赛,
+    // 所以"最近那一轮"就是它 —— 少了这一步,留空的那条路每次都从零开始,
+    // "24 小时内不重跑"和断点续跑一起失效。
+    let latest = if config.league_url.is_empty() {
+        store.latest_snapshot_any()?
+    } else {
+        store.latest_snapshot(&config.league_url)?
+    };
     if !config.force
         && let Some(reason) = should_skip(
             latest.as_ref(),
@@ -876,6 +921,9 @@ struct Sampler<'a> {
     /// 经济接口用的联赛显示名。设置里留空时用 index-state 里的那个,
     /// 免得 `--league someotherleague` 拿着 "Forbidden Rites" 去问价格。
     league_name: String,
+    /// 库里所有行按它分。一开始就是 `config.league_url`;只有配置里那个
+    /// **留空**(= "用当季挑战联赛")时,才在读到 index-state 之后填进来。
+    league_url: String,
 }
 
 impl<'a> Sampler<'a> {
@@ -886,7 +934,7 @@ impl<'a> Sampler<'a> {
         emit: &'a dyn Fn(SamplerEvent),
     ) -> Sampler<'a> {
         Sampler {
-            client: NinjaClient::new(),
+            client: NinjaClient::for_game(config.game),
             pacer: Pacer::new(
                 config.tuning.max_requests_per_hour,
                 Duration::from_millis(config.tuning.min_request_gap_ms),
@@ -905,6 +953,7 @@ impl<'a> Sampler<'a> {
             version: String::new(),
             snapshot_name: String::new(),
             league_name: config.league_name.clone(),
+            league_url: config.league_url.clone(),
         }
     }
 
@@ -1023,7 +1072,18 @@ impl<'a> Sampler<'a> {
         let index = self.fetch(NinjaClient::index_state)?;
         // 手上有 index-state 了,就别再用猜出来的短名(见 `resolve_league_url`)。
         let league_url =
-            resolve_league_url(&index, &self.config.league_name, &self.config.league_url);
+            resolve_league_url(&index, &self.config.league_name, &self.config.league_url)
+                .ok_or(SamplerError::NoChallengeLeague(self.config.game))?;
+        // 设置里那个联赛留空时,这一轮所有的库行都按刚认出来的这个短名存 ——
+        // 否则它们会全挤在 `""` 这个键上,界面再也找不回来。设置里填了名字的
+        // 那条路一个字都不变:老库里的行就是按那个键存的。
+        if self.league_url.is_empty() {
+            self.league_url = league_url.clone();
+            self.note(format!(
+                "{} league resolved to {league_url} from index-state",
+                self.config.game
+            ));
+        }
         let fresh = index
             .snapshot_for_url(&league_url)
             .ok_or_else(|| SamplerError::UnknownLeague(league_url.clone()))?
@@ -1073,7 +1133,7 @@ impl<'a> Sampler<'a> {
         // `started_at` 每次开工都刷新:"这份数据多新"问的是最后一次真的去问了
         // poe.ninja 是什么时候,不是这个 version 第一次被看见是什么时候。
         self.store.upsert_snapshot(&SnapshotRow {
-            league_url: self.config.league_url.clone(),
+            league_url: self.league_url.clone(),
             version: version.clone(),
             snapshot_name: snapshot_name.clone(),
             total_characters: league.total,
@@ -1101,7 +1161,7 @@ impl<'a> Sampler<'a> {
 
     fn partition_stage(&mut self, league: &LeagueBuild) -> Result<(), SamplerError> {
         self.stage = SamplerStage::Facets;
-        let league_url = self.config.league_url.clone();
+        let league_url = self.league_url.clone();
         let version = self.version.clone();
 
         let mut done = count(self.store.partition_keys(&league_url, &version)?.len());
@@ -1163,7 +1223,7 @@ impl<'a> Sampler<'a> {
             first_pass_partitions(league, &response, gems, items, &options)
         };
         self.store
-            .enqueue_partitions(&self.config.league_url, &self.version, &partitions)?;
+            .enqueue_partitions(&self.league_url, &self.version, &partitions)?;
         let matched = self.store_partition("", PartitionTier::Whole, &response)?;
         self.progress(
             1,
@@ -1194,7 +1254,7 @@ impl<'a> Sampler<'a> {
                 class_skill_partitions(&class, &response, gems, &options)
             };
             self.store
-                .enqueue_partitions(&self.config.league_url, &self.version, &partitions)?;
+                .enqueue_partitions(&self.league_url, &self.version, &partitions)?;
         }
         Ok(matched)
     }
@@ -1214,7 +1274,7 @@ impl<'a> Sampler<'a> {
         };
         let matched = count(characters.len());
         self.store.complete_partition(
-            &self.config.league_url,
+            &self.league_url,
             &self.version,
             key,
             response.total,
@@ -1228,11 +1288,14 @@ impl<'a> Sampler<'a> {
     // ---- 第 5 步:参考价 ----------------------------------------------
 
     fn prices_stage(&mut self) -> Result<(), SamplerError> {
-        let league_url = self.config.league_url.clone();
+        let league_url = self.league_url.clone();
         let league_name = self.league_name.clone();
-        let total = count(UNIQUE_TYPES.len());
+        // 分类表按代取:PoE1 的名字是**单数**,拿 PoE2 那张复数表去问是 404,
+        // 而 404 在下面被当成"这一类跳过" —— 于是整页价格空着,一句错也不报。
+        let types = unique_types_for(self.config.game);
+        let total = count(types.len());
         let mut done = 0u32;
-        for type_name in UNIQUE_TYPES {
+        for type_name in types {
             check_cancel(self.cancel)?;
             self.mark_progress(done, total);
             let name = league_name.clone();
@@ -1263,7 +1326,7 @@ impl<'a> Sampler<'a> {
 
     fn character_stage(&mut self) -> Result<(), SamplerError> {
         self.stage = SamplerStage::Characters;
-        let league_url = self.config.league_url.clone();
+        let league_url = self.league_url.clone();
         // 一个请求都还没发就先建一份统计。词缀表是按 version 存的,而换一天
         // 就是换一个 version:不先建,词缀页会从今天开工那一刻起空到收工。
         self.checkpoint()?;
@@ -1337,7 +1400,7 @@ impl<'a> Sampler<'a> {
     /// 重建一次词缀统计,顺便报一句"采到哪了、这一小时还剩多少预算"。
     fn checkpoint(&mut self) -> Result<(), SamplerError> {
         self.rebuild_mods()?;
-        let league_url = self.config.league_url.clone();
+        let league_url = self.league_url.clone();
         let (_, characters, _) = self.store.character_counts(&league_url)?;
         let target = self.config.tuning.sample_target;
         let now = Instant::now();
@@ -1374,7 +1437,7 @@ impl<'a> Sampler<'a> {
     ///
     /// 返回 (算进去几个人, 出了几行统计, 几份原文读不动)。
     fn rebuild_mods(&mut self) -> Result<(usize, usize, u32), SamplerError> {
-        let league_url = self.config.league_url.clone();
+        let league_url = self.league_url.clone();
         let raw = self.store.done_character_details(&league_url)?;
 
         let mut details: Vec<CharacterDetail> = Vec::with_capacity(raw.len());
@@ -1404,7 +1467,7 @@ impl<'a> Sampler<'a> {
     fn finish_stage(&mut self, stage: SamplerStage) -> Result<(), SamplerError> {
         self.reached = highest_stage(self.reached, stage);
         self.store.set_stage(
-            &self.config.league_url,
+            &self.league_url,
             &self.version,
             self.reached.to_snapshot(),
             now_secs(),
@@ -1594,18 +1657,18 @@ mod ninja_sampler_tests {
 
         // 猜出来的 `forbiddenrites` 是错的,但显示名对得上。
         assert_eq!(
-            resolve_league_url(&index, "Forbidden Rites", "forbiddenrites"),
-            "fr2"
+            resolve_league_url(&index, "Forbidden Rites", "forbiddenrites").as_deref(),
+            Some("fr2")
         );
         // 大小写不该影响(用户在设置里怎么打的都算)。
         assert_eq!(
-            resolve_league_url(&index, "forbidden rites", "forbiddenrites"),
-            "fr2"
+            resolve_league_url(&index, "forbidden rites", "forbiddenrites").as_deref(),
+            Some("fr2")
         );
         // 这一轮没索引这个联赛:名字查不到,只能用猜的那个。
         assert_eq!(
-            resolve_league_url(&index, "Runes of Aldur", "runesofaldur"),
-            "runesofaldur"
+            resolve_league_url(&index, "Runes of Aldur", "runesofaldur").as_deref(),
+            Some("runesofaldur")
         );
     }
 
@@ -2206,6 +2269,185 @@ mod ninja_sampler_tests {
             pacer.before_request(&cancel),
             Err(SamplerError::Cancelled)
         ));
+    }
+
+    /// 一轮 PoE1 采样问的是 PoE1 的接口,写的是 PoE1 那个库文件。
+    ///
+    /// 两件事都必须钉死,因为**搞错任何一件都不会报错**:客户端指错代,拿回来的
+    /// 是另一代的榜单(联赛名对不上,一整轮全是空);库写错文件,PoE1 的行会混进
+    /// PoE2 那张表里,而两代的分区键长得一模一样,混进去就再也分不开了。
+    ///
+    /// 客户端那一半靠一个"假请求"来问:`fetch` 收的是一个拿得到客户端的闭包,
+    /// 所以让它什么都别抓、只报一句"你问的是哪一代"就行 —— 一个网络请求都不发。
+    #[test]
+    fn a_poe1_run_talks_to_poe1_and_writes_only_the_poe1_store() {
+        let dir = std::env::temp_dir().join(format!("pnd-sampler-poe1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut config = SamplerConfig::for_game(Game::Poe1, "allflame", "Allflame");
+        config.db_path = dir.join(pnd_storage::ninja_db_file_name(Game::Poe1));
+        assert_eq!(config.game, Game::Poe1);
+
+        let store = NinjaStore::open_for(Game::Poe1, &dir).expect("store");
+        let cancel = AtomicBool::new(false);
+        let emit = |_: SamplerEvent| {};
+        let mut sampler = Sampler::new(store, &config, &cancel, &emit);
+
+        let asked = sampler
+            .fetch(|client: &NinjaClient| Ok(client.game()))
+            .expect("假请求");
+        assert_eq!(asked, Game::Poe1, "客户端得指向 PoE1");
+
+        sampler
+            .store
+            .upsert_snapshot(&SnapshotRow {
+                league_url: "allflame".to_owned(),
+                version: "1707-20260908-44259".to_owned(),
+                snapshot_name: "allflame".to_owned(),
+                total_characters: 124_459,
+                stage: SnapshotStage::Facets,
+                started_at: 1_000,
+                finished_at: None,
+            })
+            .expect("write");
+        assert!(dir.join("ninja-poe1.sqlite").is_file());
+        assert!(
+            !dir.join("ninja.sqlite").exists(),
+            "PoE1 的一轮不该碰 PoE2 那个库"
+        );
+
+        drop(sampler);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PoE2 那条路一个字都没变:不带参数的构造还是 PoE2 + 老文件名。
+    #[test]
+    fn the_default_config_is_still_a_poe2_run() {
+        let config = SamplerConfig::new("forbiddenrites", "Forbidden Rites");
+        assert_eq!(config.game, Game::Poe2);
+        assert_eq!(config.db_path, pnd_storage::default_ninja_db_path());
+    }
+
+    /// 两代的暗金分类表不是同一张:PoE1 是单数、少一个 charm。
+    ///
+    /// 拿 PoE2 那张表去问 PoE1 不是"空榜",是 **404**(2026-09-09 实测),
+    /// 而参考价那一步对 404 的处置是"跳过这一类" —— 于是 PoE1 的暗金页会
+    /// 一列价格都没有,却一句错也不报。
+    #[test]
+    fn each_game_asks_for_its_own_unique_categories() {
+        assert_eq!(unique_types_for(Game::Poe2).len(), 6);
+        assert!(unique_types_for(Game::Poe2).contains(&"UniqueWeapons"));
+        assert_eq!(unique_types_for(Game::Poe1).len(), 5);
+        assert!(unique_types_for(Game::Poe1).contains(&"UniqueWeapon"));
+    }
+
+    /// 设置里 PoE1 联赛留空 = "用当季挑战联赛",而不是"没有联赛"。
+    #[test]
+    fn an_empty_league_setting_resolves_to_the_current_challenge_league() {
+        let index = IndexState {
+            build_leagues: vec![
+                pnd_ninja::index_state::LeagueRef {
+                    name: "Allflame".to_owned(),
+                    url: "allflame".to_owned(),
+                    ..pnd_ninja::index_state::LeagueRef::default()
+                },
+                pnd_ninja::index_state::LeagueRef {
+                    name: "Standard".to_owned(),
+                    url: "standard".to_owned(),
+                    ..pnd_ninja::index_state::LeagueRef::default()
+                },
+            ],
+            snapshot_versions: vec![SnapshotVersion {
+                url: "allflame".to_owned(),
+                name: "Allflame".to_owned(),
+                ..SnapshotVersion::default()
+            }],
+            ..IndexState::default()
+        };
+
+        // 两个名字都空:去 index-state 问当季挑战联赛。
+        assert_eq!(
+            resolve_league_url(&index, "", ""),
+            Some("allflame".to_owned())
+        );
+        // 填了名字就以填的为准,当季那条不许压过用户的话。
+        assert_eq!(
+            resolve_league_url(&index, "Standard", "standard"),
+            Some("standard".to_owned())
+        );
+        // 一条挑战联赛都挑不出来时给 `None` —— 采到 Standard 去是一整天的
+        // 请求配额喂给一份没人看的数据。
+        assert_eq!(resolve_league_url(&IndexState::default(), "", ""), None);
+    }
+
+    /// 分区计划从**这一份响应真的带回来的分面**里长出来,不假设两代一样。
+    ///
+    /// PoE1 没有 `spiritgems`,却多八张 PoE2 没有的字典(`bandit`、`tattoo`……)。
+    /// 计划里要是写死"去拿 spiritgems 那一栏",PoE1 这一轮就会在一个不存在的
+    /// 分面上算出一张空清单。
+    #[test]
+    fn the_partition_plan_tolerates_facets_only_one_game_has() {
+        use pnd_ninja::plan::{SampleOptions, first_pass_partitions};
+
+        // 一份 PoE1 形状的响应:有 items、没有 skills / spiritgems,
+        // 外加一个 PoE2 根本没有的 `bandit` 分面。
+        let poe1 = SearchResponse {
+            total: 124_459,
+            facets: vec![
+                Facet {
+                    name: "items".to_owned(),
+                    kind: "item".to_owned(),
+                    entries: vec![FacetEntry {
+                        index: 0,
+                        count: 9_000,
+                    }],
+                },
+                Facet {
+                    name: "bandit".to_owned(),
+                    kind: "bandit".to_owned(),
+                    entries: vec![FacetEntry {
+                        index: 0,
+                        count: 5_000,
+                    }],
+                },
+            ],
+            dictionaries: Vec::new(),
+            columns: Vec::new(),
+        };
+        let league = LeagueBuild {
+            league_url: "allflame".to_owned(),
+            total: 124_459,
+            statistics: vec![pnd_ninja::index_state::ClassShare {
+                class: "Champion".to_owned(),
+                percentage: 12.0,
+                trend: 0,
+            }],
+            ..LeagueBuild::default()
+        };
+        let items = vec!["Headhunter".to_owned()];
+        let plan = first_pass_partitions(&league, &poe1, &[], &items, &SampleOptions::default());
+
+        let keys: Vec<&str> = plan.iter().map(|entry| entry.key.as_str()).collect();
+        assert!(keys.contains(&""), "全联赛那条永远在");
+        assert!(keys.contains(&"class=Champion"));
+        assert!(keys.contains(&"items=Headhunter"));
+        // 没有 skills 分面就一条技能分区都不排,而不是排一堆问不出东西的。
+        assert!(!keys.iter().any(|key| key.starts_with("skills=")));
+        // 我们不认识的分面也不会把这一步弄炸。
+        assert_eq!(facet_rows(&poe1, &HashMap::new()).len(), 2);
+    }
+
+    /// 两个 crate 只许有**一个** `Game`。
+    ///
+    /// 一度有两个:`pnd_domain::Game`(交易站那半边用)和 `pnd_ninja::client::Game`
+    /// (poe.ninja 那半边用)。写法一模一样,所以谁也不会在编译期报错,直到有一
+    /// 天要把设置里那一个传给采样管线 —— 那时候才发现它们是两个互不认识的类型。
+    /// 这条测试把"它们是同一个类型"钉死:赋值过得去就是同一个。
+    #[test]
+    fn the_two_crates_share_one_game_enum() {
+        let from_domain: pnd_ninja::client::Game = pnd_domain::Game::Poe1;
+        assert_eq!(from_domain.as_str(), "poe1");
+        assert_eq!(pnd_ninja::client::Game::default(), pnd_domain::Game::Poe2);
     }
 
     #[test]

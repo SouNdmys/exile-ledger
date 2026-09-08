@@ -1,0 +1,104 @@
+{
+  "itemData": {
+    "vestigial": false,
+    "vestigialMods": [],
+    "searing": false,
+    "tangled": false,
+    "id": "0000000000000000",
+    "inventoryId": "Ring",
+    "name": "Sorrow Twirl",
+    "frameTypeId": "Rare",
+    "frameType": 2,
+    "ilvl": 83,
+    "icon": "",
+    "w": 1,
+    "h": 1,
+    "x": 0,
+    "y": 0,
+    "typeLine": "Amethyst Ring",
+    "baseType": "Amethyst Ring",
+    "identified": true,
+    "corrupted": false,
+    "fractured": true,
+    "synthesised": false,
+    "duplicated": false,
+    "mods": {
+      "implicit": [
+        {
+          "id": "ChaosResistImplicitRing1",
+          "stats": {
+            "base_chaos_damage_resistance_%": 22
+          }
+        }
+      ],
+      "fractured": [
+        {
+          "id": "Strength9",
+          "stats": {
+            "additional_strength": 52
+          }
+        }
+      ],
+      "explicit": [
+        {
+          "id": "FireResist5",
+          "stats": {
+            "base_fire_damage_resistance_%": 35
+          }
+        },
+        {
+          "id": "ChaosResist3",
+          "stats": {
+            "base_chaos_damage_resistance_%": 20
+          }
+        },
+        {
+          "id": "IncreasedLife7",
+          "stats": {
+            "base_maximum_life": 101
+          }
+        },
+        {
+          "id": "IncreasedEnergyShield2",
+          "stats": {
+            "base_maximum_energy_shield": 4
+          }
+        }
+      ],
+      "crafted": [
+        {
+          "id": "JunMaster2ReduceGlobalFlatManaCostNonChannelling3",
+          "stats": {
+            "skill_mana_cost_+_with_non_channelling_skills": -7
+          }
+        }
+      ]
+    },
+    "implicitMods": [
+      "+22% to Chaos Resistance"
+    ],
+    "explicitMods": [
+      "+4 to maximum Energy Shield",
+      "+101 to maximum Life",
+      "+35% to Fire Resistance",
+      "+20% to Chaos Resistance"
+    ],
+    "mutatedMods": [],
+    "mutated": false,
+    "scourgeMods": [],
+    "crucibleMods": [],
+    "fracturedMods": [
+      "+62 to Strength"
+    ],
+    "craftedMods": [
+      "Non-Channelling Skills have -7 to Total Mana Cost"
+    ],
+    "enchantMods": [],
+    "utilityMods": [],
+    "league": "Allflame",
+    "replica": false,
+    "verified": false,
+    "rarity": "Rare"
+  },
+  "itemSlot": 8
+}

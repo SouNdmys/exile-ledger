@@ -9,6 +9,9 @@ rust-version.workspace = true
 description = "poe.ninja client: build search protobuf, NDIC dictionaries, economy rates"
 
 [dependencies]
+# `Game`(哪一代流放之路)只许有一份。它先在这里生出来过一次,但交易站那半边
+# 也要同一个概念,而两个长得一样却互不认识的枚举比多一条依赖边贵得多。
+pnd-domain = { path = "../pnd-domain" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

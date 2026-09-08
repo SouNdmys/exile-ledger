@@ -27,58 +27,32 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// 32MB 留了三个数量级的余量:超过它说明端点行为变了,该报错让人来看。
 const MAX_BODY_BYTES: u64 = 32 * 1024 * 1024;
 
-/// poe.ninja 把两代游戏摆在**同一个站点的两个前缀**下:`/poe2/api/…` 和
-/// `/poe1/api/…`。
+/// 哪一代流放之路。**和交易站那半边是同一个类型**([`pnd_domain::Game`]):
+/// 设置页选的那一个要能直接喂给采样管线,中间不该有一次翻译。
 ///
-/// 2026-09-09 实测:`/api/data/index-state`(不带前缀的老路径)是 404,
-/// `/poe1/api/data/index-state` 是 200,而且顶层键和 PoE2 那份一模一样 ——
-/// 也就是说 builds 这半边两代是**同一条管线,只差一个前缀**。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Game {
-    Poe1,
-    /// 默认值刻意是 PoE2:今天在跑的采样就是它,换默认值等于悄悄改行为。
-    #[default]
-    Poe2,
+/// poe.ninja 把两代摆在**同一个站点的两个前缀**下:`/poe2/api/…` 和
+/// `/poe1/api/…`。2026-09-09 实测:`/api/data/index-state`(不带前缀的老路径)
+/// 是 404,`/poe1/api/data/index-state` 是 200,而且顶层键和 PoE2 那份一模一样
+/// —— 也就是说 builds 这半边两代是**同一条管线,只差一个前缀**。
+pub use pnd_domain::Game;
+
+fn prefix(game: Game) -> &'static str {
+    match game {
+        Game::Poe1 => "/poe1",
+        Game::Poe2 => "/poe2",
+    }
 }
 
-impl Game {
-    /// 存进 `ninja.sqlite` 和打进日志的稳定写法。
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Game::Poe1 => "poe1",
-            Game::Poe2 => "poe2",
-        }
-    }
+fn builds_base(game: Game) -> String {
+    format!("https://poe.ninja{}/api/builds", prefix(game))
+}
 
-    /// 命令行 `--game` 收的写法。认不出来给 `None`,由调用方决定是报错还是用默认值。
-    #[must_use]
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "poe1" | "1" => Some(Game::Poe1),
-            "poe2" | "2" => Some(Game::Poe2),
-            _ => None,
-        }
-    }
+fn data_base(game: Game) -> String {
+    format!("https://poe.ninja{}/api/data", prefix(game))
+}
 
-    fn prefix(self) -> &'static str {
-        match self {
-            Game::Poe1 => "/poe1",
-            Game::Poe2 => "/poe2",
-        }
-    }
-
-    fn builds_base(self) -> String {
-        format!("https://poe.ninja{}/api/builds", self.prefix())
-    }
-
-    fn data_base(self) -> String {
-        format!("https://poe.ninja{}/api/data", self.prefix())
-    }
-
-    fn economy_base(self) -> String {
-        format!("https://poe.ninja{}/api/economy", self.prefix())
-    }
+fn economy_base(game: Game) -> String {
+    format!("https://poe.ninja{}/api/economy", prefix(game))
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -102,12 +76,12 @@ pub enum NinjaError {
 
 #[must_use]
 pub fn index_state_url(game: Game) -> String {
-    format!("{}/index-state", game.data_base())
+    format!("{}/index-state", data_base(game))
 }
 
 #[must_use]
 pub fn build_index_state_url(game: Game) -> String {
-    format!("{}/build-index-state", game.data_base())
+    format!("{}/build-index-state", data_base(game))
 }
 
 /// `filters` 是 `class`/`skills`/`items`/`keypassives`/`spiritgems`/`allskills`/
@@ -124,7 +98,7 @@ pub fn search_url(
 ) -> String {
     let mut url = format!(
         "{}/{}/search?overview={}",
-        game.builds_base(),
+        builds_base(game),
         encode(version),
         encode(snapshot_name)
     );
@@ -136,7 +110,7 @@ pub fn search_url(
 
 #[must_use]
 pub fn dictionary_url(game: Game, sha1: &str) -> String {
-    format!("{}/dictionary/{}", game.builds_base(), encode(sha1))
+    format!("{}/dictionary/{}", builds_base(game), encode(sha1))
 }
 
 /// 账号名里的 `#` 要换成 `-`。搜索响应给回来的账号名已经是换过的,
@@ -152,7 +126,7 @@ pub fn character_url(
 ) -> String {
     format!(
         "{}/{}/character?account={}&name={}&overview={}&timeMachine=",
-        game.builds_base(),
+        builds_base(game),
         encode(version),
         encode(&account.replace('#', "-")),
         encode(name),
@@ -169,7 +143,7 @@ pub fn character_url(
 pub fn currency_rates_url(game: Game, league: &str) -> String {
     format!(
         "{}/exchange/current/overview?league={}&type=Currency",
-        game.economy_base(),
+        economy_base(game),
         encode(league)
     )
 }
@@ -180,7 +154,7 @@ pub fn currency_rates_url(game: Game, league: &str) -> String {
 pub fn unique_prices_url(game: Game, league: &str, type_name: &str) -> String {
     format!(
         "{}/stash/current/item/overview?league={}&type={}",
-        game.economy_base(),
+        economy_base(game),
         encode(league),
         encode(type_name)
     )
@@ -584,15 +558,13 @@ mod client_tests {
         );
     }
 
-    /// `--game` 收的就是这几个写法。
+    /// `Game` 本身归 `pnd-domain` 管(解析、serde、Display 都在那儿测)。
+    /// 这一条只钉住这个 crate 用得着的那一半:两个写法各自对应哪个前缀。
     #[test]
-    fn a_game_parses_from_the_command_line_spelling() {
-        assert_eq!(Game::parse("poe1"), Some(Game::Poe1));
-        assert_eq!(Game::parse("POE2"), Some(Game::Poe2));
-        assert_eq!(Game::parse(" poe1 "), Some(Game::Poe1));
-        assert_eq!(Game::parse("poe3"), None);
+    fn each_game_keeps_its_own_url_prefix() {
+        assert_eq!(prefix(Game::Poe1), "/poe1");
+        assert_eq!(prefix(Game::Poe2), "/poe2");
         assert_eq!(Game::Poe1.as_str(), "poe1");
-        assert_eq!(Game::Poe2.as_str(), "poe2");
         // 默认是 PoE2:今天在跑的采样就是它,换默认值等于悄悄改行为。
         assert_eq!(Game::default(), Game::Poe2);
     }

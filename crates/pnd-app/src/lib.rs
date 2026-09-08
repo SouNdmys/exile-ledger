@@ -48,10 +48,16 @@ pub fn watch_db_path() -> PathBuf {
     redirect(&pnd_storage::default_watch_db_path(), DATA_DIR_ENV)
 }
 
-/// ninja 采样缓存的位置。界面这一侧只读它,采样线程另开一条连接写它。
+/// ninja 采样缓存的位置(PoE2)。界面这一侧只读它,采样线程另开一条连接写它。
 #[must_use]
 pub fn ninja_db_path() -> PathBuf {
-    redirect(&pnd_storage::default_ninja_db_path(), DATA_DIR_ENV)
+    ninja_db_path_for(pnd_domain::Game::Poe2)
+}
+
+/// 这一代的 ninja 采样缓存放在哪。两代各一个文件,同一个数据目录。
+#[must_use]
+pub fn ninja_db_path_for(game: pnd_domain::Game) -> PathBuf {
+    redirect(&pnd_storage::default_ninja_db_path_for(game), DATA_DIR_ENV)
 }
 
 /// 日志文件的位置。

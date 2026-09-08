@@ -27,7 +27,7 @@ use gpui_component::select::{SearchableVec, SelectEvent, SelectItem, SelectState
 use gpui_component::table::{TableEvent, TableState};
 use gpui_component::{IndexPath, Selectable as _, Sizable as _, Size, StyledExt as _};
 
-use pnd_domain::{CurrencyRates, ObservationId, WatchId};
+use pnd_domain::{CurrencyRates, Game, ObservationId, WatchId};
 use pnd_platform_win::{AlertCardService, LoginService};
 use pnd_runtime::{
     MatchedListing, ObservationStatus, RuntimeHandle, SamplerHandle, WatchStatus, now_secs,
@@ -284,8 +284,11 @@ pub struct AppShell {
     /// 界面这一侧的 `watch.sqlite` 连接(actor 那条在别的线程上,不能共用)。
     /// 提醒记录页和市场观察页共用它 —— 两页读的是同一个库文件。
     pub(crate) alerts_store: Option<WatchStore>,
-    /// ninja 两页自己的一条库连接。采样线程另开一条,WAL 让两边互不打断。
-    pub(crate) ninja_store: Option<NinjaStore>,
+    /// ninja 两页自己的库连接,**每代一条**:两代各写各的文件,页面读的是
+    /// 开关选中那一代的那条。采样线程另开一条,WAL 让两边互不打断。
+    ///
+    /// 一代打不开只是那一代的两页空着,另一代照常。
+    pub(crate) ninja_stores: BTreeMap<Game, NinjaStore>,
     /// 正在跑的那一轮采样。`None` = 这个进程还没按过刷新。
     ///
     /// 句柄的 `Drop` 会取消并等线程收摊,所以它挂在这儿就等于"关窗即停手"。
@@ -461,17 +464,22 @@ impl AppShell {
                 None
             }
         };
-        // ninja 那个库是纯缓存:打不开只是两页空着,剩下的功能一个都不少。
-        let ninja_store = match NinjaStore::open(crate::ninja_db_path()) {
-            Ok(store) => Some(store),
-            Err(error) => {
-                startup.push(format!("could not open the ninja cache: {error}"));
-                if notice.is_empty() {
-                    notice = text.ninja_store_missing.to_owned();
+        // ninja 那两个库是纯缓存:打不开只是那一代的两页空着,剩下的功能一个都不少。
+        // 两代都开:开关一按就要能立刻读到另一份,而 SQLite 的连接本来就便宜。
+        let mut ninja_stores = BTreeMap::new();
+        for game in [Game::Poe1, Game::Poe2] {
+            match NinjaStore::open(crate::ninja_db_path_for(game)) {
+                Ok(store) => {
+                    ninja_stores.insert(game, store);
                 }
-                None
+                Err(error) => {
+                    startup.push(format!("could not open the {game} ninja cache: {error}"));
+                    if notice.is_empty() {
+                        notice = text.ninja_store_missing.to_owned();
+                    }
+                }
             }
-        };
+        }
         boot_log.extend(startup);
 
         // 120ms 心跳。频率照兄弟项目:比一帧慢得多,又快到让"点了按钮"和
@@ -597,7 +605,9 @@ impl AppShell {
             .detach();
         }
 
-        let ninja = NinjaData::empty(pnd_ninja::index_state::league_url_guess(&settings.league));
+        // 开局按设置里选中的那一代建视图。PoE1 的联赛可以是空的("用当季挑战
+        // 联赛"),那时短名由 `resync_ninja_league` 回头去问库。
+        let ninja = NinjaData::empty(ninja::ninja_league_url(&settings, settings.ninja_game));
 
         let mut shell = Self {
             focus_handle: cx.focus_handle(),
@@ -619,7 +629,7 @@ impl AppShell {
             login_phase: LoginPhase::default(),
             login_line: String::new(),
             alerts_store,
-            ninja_store,
+            ninja_stores,
             sampler: None,
             sampler_busy: false,
             sampler_line: String::new(),
@@ -681,7 +691,7 @@ impl AppShell {
             shell.push_log(line);
         }
         shell.refresh_alerts();
-        shell.reload_ninja();
+        shell.resync_ninja_league();
         shell.reload_observation();
         shell
     }

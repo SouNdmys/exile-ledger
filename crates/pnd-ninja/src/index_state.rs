@@ -65,6 +65,25 @@ impl IndexState {
             .find(|snapshot| snapshot.url == url)
     }
 
+    /// 当季挑战联赛。设置里的联赛留空时,采样拿它当答案。
+    ///
+    /// 存在的理由是**联赛三个月换一次名字**:让人每赛季回设置页改一次字符串
+    /// 是纯手工活,而正确答案就写在 `buildLeagues` 里 —— poe.ninja 把当季那个
+    /// 排在第一条,它的 HC / SSF / 极限变体紧随其后,常驻联赛排在它们后面。
+    ///
+    /// 规矩就一条:**第一条不是 Standard / Hardcore 的**。挑不出来时给 `None`,
+    /// 而不是退回 Standard —— 采到 Standard 去等于把一整天的请求配额喂给
+    /// 一份没人看的数据,不如让调用方报一句"没认出联赛"。
+    #[must_use]
+    pub fn current_challenge_league(&self) -> Option<&LeagueRef> {
+        self.build_leagues.iter().find(|league| {
+            !league.name.is_empty()
+                && !league.hardcore
+                && !league.name.eq_ignore_ascii_case("standard")
+                && !league.name.eq_ignore_ascii_case("hardcore")
+        })
+    }
+
     /// 显示名 → 接口用的短名,**问 poe.ninja 自己要答案**。
     ///
     /// `snapshotVersions` 每一条都同时带着两个名字,所以只要这一轮拿到过
@@ -212,6 +231,52 @@ mod index_state_tests {
         // 这一轮没被索引的联赛给 `None`,而不是一个查不到东西的猜测。
         assert_eq!(state.league_url_for_name("Fate of the Vaal"), None);
         assert_eq!(IndexState::default().league_url_for_name("Standard"), None);
+    }
+
+    /// 线上 PoE1 那份 index-state 的 `buildLeagues` 开头(2026-09-09 实测,
+    /// 只删掉了后面十几条私人联赛)。当季挑战联赛排在第一条,它的
+    /// HC / SSF / 极限变体紧随其后,再后面才是 Standard。
+    const POE1_BUILD_LEAGUES_JSON: &str = r#"{
+        "buildLeagues": [
+            {"name":"Allflame","url":"allflame","displayName":"Allflame"},
+            {"name":"Hardcore Allflame","url":"allflamehc","displayName":"Hardcore Allflame"},
+            {"name":"SSF Allflame","url":"allflamessf","displayName":"SSF Allflame"},
+            {"name":"Ruthless Allflame","url":"allflamer","displayName":"Ruthless Allflame"},
+            {"name":"Standard","url":"standard","displayName":"Standard"},
+            {"name":"Hardcore","url":"hardcore","displayName":"Hardcore"},
+            {"name":"Liga druzey (PL83546)","url":"pl83546","displayName":"Liga druzey"}
+        ]
+    }"#;
+
+    /// 设置里 PoE1 联赛留空时,采样得自己认出**当季挑战联赛**是哪个。
+    ///
+    /// 联赛三个月换一次名字,让人每赛季回设置页改一次字符串是纯粹的手工活;
+    /// 而正确答案就写在 index-state 的 `buildLeagues` 第一条上。规矩就一条:
+    /// **第一条不是 Standard / Hardcore 的**。
+    #[test]
+    fn an_empty_league_setting_resolves_to_the_current_challenge_league() {
+        let state: IndexState = serde_json::from_str(POE1_BUILD_LEAGUES_JSON).unwrap();
+        let league = state.current_challenge_league().expect("该认出 Allflame");
+        assert_eq!(league.url, "allflame");
+        assert_eq!(league.name, "Allflame");
+
+        // PoE2 那份用的是同一条规矩(它的 `hardcore` 字段是真写着的)。
+        let poe2: IndexState = serde_json::from_str(INDEX_STATE_JSON).unwrap();
+        assert_eq!(
+            poe2.current_challenge_league()
+                .map(|entry| entry.url.as_str()),
+            Some("forbiddenrites")
+        );
+
+        // 只剩常驻联赛的时候给 `None`,而不是把 Standard 当成挑战联赛 ——
+        // 采到 Standard 去是一整天的请求配额喂给了错的数据。
+        let permanent: IndexState = serde_json::from_str(
+            r#"{"buildLeagues":[{"name":"Standard","url":"standard"},
+                                {"name":"Hardcore","url":"hardcore","hardcore":true}]}"#,
+        )
+        .unwrap();
+        assert!(permanent.current_challenge_league().is_none());
+        assert!(IndexState::default().current_challenge_league().is_none());
     }
 
     #[test]

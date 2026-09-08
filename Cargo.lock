@@ -4185,6 +4185,7 @@ dependencies = [
 name = "pnd-ninja"
 version = "0.1.0"
 dependencies = [
+ "pnd-domain",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

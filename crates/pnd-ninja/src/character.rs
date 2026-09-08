@@ -262,6 +262,13 @@ pub struct ModGroups {
     pub desecrated: Vec<ModEntry>,
     #[serde(default)]
     pub rune: Vec<ModEntry>,
+    /// PoE1 专属:裂隙词缀(那边好装备上到处都是)。PoE2 的原文里没有这一组,
+    /// 所以那边永远是空的 —— 少声明它的代价不是报错,是整组静悄悄不进统计。
+    #[serde(default)]
+    pub fractured: Vec<ModEntry>,
+    /// PoE1 专属:迷宫附魔。同上。
+    #[serde(default)]
+    pub enchant: Vec<ModEntry>,
 }
 
 /// 一件装备。`inventory_id`("Ring"/"BodyArmour"/……)是词缀统计的分组键;
@@ -301,6 +308,9 @@ pub struct ItemData {
     pub rune_mods: Vec<String>,
     #[serde(default)]
     pub enchant_mods: Vec<String>,
+    /// PoE1 专属,配 [`ModGroups::fractured`]。
+    #[serde(default)]
+    pub fractured_mods: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -340,7 +350,9 @@ pub struct CharacterDetail {
     pub jewels: Vec<ItemEntry>,
     #[serde(default)]
     pub flasks: Vec<ItemEntry>,
-    #[serde(default)]
+    /// PoE1 把这个键写成 `keyStones`(大写 S),PoE2 写成 `keystones`。
+    /// 两个都收,不然 PoE1 那一份的关键天赋整个读不出来。
+    #[serde(default, alias = "keyStones")]
     pub keystones: Vec<Keystone>,
     #[serde(default)]
     pub updated_utc: String,
@@ -654,6 +666,54 @@ mod character_tests {
         // 显示文本整个缺席时也不能 panic。
         assert!(pair_mod_displays(&mods, &[])[0][0].display.is_empty());
         assert!(pair_mod_displays(&[], &lines).is_empty());
+    }
+
+    /// 线上真实剪下来的一只 PoE1 稀有戒指(2026-09-09,Allflame,已抹掉账号名)。
+    const POE1_RING_JSON: &str = include_str!("../fixtures/character_item_poe1_ring.json");
+
+    /// PoE1 的角色详情和 PoE2 是**同一种形状**:`mods` 下按类型分组的结构化词缀
+    /// (`{"id":…,"stats":{…}}`)配一份给人看的显示文本数组。
+    ///
+    /// 但它多两组我们原来没声明的:`fractured`(裂隙词缀,PoE1 好装备上到处都是)
+    /// 和 `enchant`(迷宫附魔)。少声明一组的下场不是报错,是**那一组静悄悄地
+    /// 不进统计** —— 词缀页上 PoE1 的裂隙词缀一条都不会出现,而没有任何东西
+    /// 会告诉你它们被丢了。
+    #[test]
+    fn a_poe1_item_keeps_its_fractured_and_enchant_mod_groups() {
+        let item = serde_json::from_str::<ItemEntry>(POE1_RING_JSON)
+            .unwrap()
+            .item_data;
+        assert_eq!(item.inventory_id, "Ring");
+        assert_eq!(item.rarity, "Rare");
+        // 老早就认识的三组照旧。
+        assert_eq!(item.mods.implicit.len(), 1);
+        assert_eq!(item.mods.explicit.len(), 4);
+        assert_eq!(item.mods.crafted.len(), 1);
+
+        // 这两组是 PoE1 才有的。
+        assert_eq!(item.mods.fractured.len(), 1);
+        assert_eq!(item.mods.fractured[0].id, "Strength9");
+        assert_eq!(
+            item.mods.fractured[0].numeric_stats(),
+            vec![("additional_strength".to_owned(), 52.0)]
+        );
+        assert_eq!(item.fractured_mods, ["+62 to Strength"]);
+        // 这只戒指没有附魔,但那一组得存在(同一份原文里 `enchantMods` 是空数组)。
+        assert!(item.mods.enchant.is_empty());
+        assert!(item.enchant_mods.is_empty());
+    }
+
+    /// PoE1 的关键天赋键叫 `keyStones`(大写 S),PoE2 叫 `keystones`。
+    /// 两个都得认,不然 PoE1 那一份整个读不出来。
+    #[test]
+    fn keystones_are_read_under_either_spelling() {
+        let poe2: CharacterDetail =
+            serde_json::from_str(r#"{"keystones":[{"name":"Dance with Death"}]}"#).unwrap();
+        assert_eq!(poe2.keystones[0].name, "Dance with Death");
+
+        let poe1: CharacterDetail =
+            serde_json::from_str(r#"{"keyStones":[{"name":"Unwavering Stance"}]}"#).unwrap();
+        assert_eq!(poe1.keystones[0].name, "Unwavering Stance");
     }
 
     #[test]

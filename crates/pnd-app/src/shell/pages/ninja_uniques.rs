@@ -11,16 +11,16 @@
 use gpui::{Context, ParentElement, SharedString, Styled, div, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::switch::Switch;
-use gpui_component::{Disableable as _, Sizable as _, Size, StyledExt as _};
+use gpui_component::{Disableable as _, Selectable as _, Sizable as _, Size, StyledExt as _};
 
-use pnd_domain::{Currency, CurrencyRates};
+use pnd_domain::{Currency, CurrencyRates, Game};
 use pnd_runtime::now_secs;
 
 use super::watches::milli_text;
 use super::{Cell, TableContent, Tone, column, number_column};
 use crate::i18n::{self, Text};
 use crate::shell::link::ago_text;
-use crate::shell::ninja::{NinjaData, UniqueRow, partition_label, percent_text};
+use crate::shell::ninja::{NinjaData, UniqueRow, game_league_text, partition_label, percent_text};
 use crate::shell::{AppShell, Choice, hint, page_heading, panel, picker, table};
 use crate::theme::*;
 
@@ -232,13 +232,20 @@ fn change_cell(change: Option<f64>, text: &'static Text) -> Cell {
     }
 }
 
-/// 抬头那一行:哪个联赛、哪一版快照、采了多少人、这份缓存多旧。
+/// 抬头那一行:哪一代、哪个联赛、哪一版快照、采了多少人、这份缓存多旧。
 ///
-/// 四件事挤在一行,是因为看榜的人第一个问题永远是"这数是什么时候的"——
-/// 一张不知道多旧的热度榜没法拿来做决定。
+/// 五件事挤在一行,是因为看榜的人第一个问题永远是"这数是什么时候的"——
+/// 一张不知道多旧的热度榜没法拿来做决定。代号排在最前面:这一页顶上有个
+/// 游戏开关,按一下整张表就换了内容,抬头不跟着换就是一句假话。
 #[must_use]
-pub fn header_line(league: &str, data: &NinjaData, text: &'static Text, now: i64) -> String {
-    let mut parts = vec![league.to_owned()];
+pub fn header_line(
+    game: Game,
+    league: &str,
+    data: &NinjaData,
+    text: &'static Text,
+    now: i64,
+) -> String {
+    let mut parts = vec![game_league_text(game, league, text)];
     match &data.snapshot {
         Some(row) => {
             parts.push(i18n::fill(text.uniques_snapshot, &[&row.version]));
@@ -253,6 +260,39 @@ pub fn header_line(league: &str, data: &NinjaData, text: &'static Text, now: i64
         None => parts.push(text.uniques_no_snapshot.to_owned()),
     }
     parts.join(" · ")
+}
+
+/// 两页共用的游戏开关:PoE2 / PoE1 两个按钮,选中的那个高亮。
+///
+/// 做成两个按钮而不是下拉,是因为只有两个选项:下拉要点两下才换得了,
+/// 而且不点开就看不见另一个选项存在。
+///
+/// `prefix` 是元素 id 的前缀 —— 两页各有一套按钮,id 撞了的话框架会把它们
+/// 当成同一个控件,点哪一页都只有一页有反应。
+pub fn game_switch(
+    prefix: &'static str,
+    selected: Game,
+    text: &'static Text,
+    cx: &mut Context<AppShell>,
+) -> gpui::Div {
+    div()
+        .h_flex()
+        .items_center()
+        .gap(px(2.))
+        .children([Game::Poe2, Game::Poe1].into_iter().map(|game| {
+            let id = match game {
+                Game::Poe1 => "-game-poe1",
+                Game::Poe2 => "-game-poe2",
+            };
+            Button::new(SharedString::from(format!("{prefix}{id}")))
+                .ghost()
+                .with_size(Size::Small)
+                .selected(game == selected)
+                .label(crate::shell::ninja::game_word(game, text))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.switch_ninja_game(game, cx);
+                }))
+        }))
 }
 
 impl AppShell {
@@ -282,7 +322,14 @@ impl AppShell {
         let busy = self.sampler_busy;
         let show_all = self.uniques_show_all;
         let hidden = hidden_count(&self.ninja.uniques, show_all);
-        let header = header_line(&self.settings.league, &self.ninja, text, now_secs());
+        let game = self.ninja_game();
+        let header = header_line(
+            game,
+            crate::shell::ninja::ninja_league_name(&self.settings, game),
+            &self.ninja,
+            text,
+            now_secs(),
+        );
         panel()
             .flex_none()
             .gap(px(8.))
@@ -302,6 +349,7 @@ impl AppShell {
                             .text_color(c(TEXT_DATA))
                             .child(SharedString::from(header)),
                     )
+                    .child(game_switch("uniques", game, text, cx))
                     .child(
                         Button::new("uniques-refresh")
                             .primary()
@@ -616,16 +664,41 @@ mod ninja_uniques_tests {
             started_at: 1_000,
             finished_at: Some(2_000),
         });
-        let line = header_line("Forbidden Rites", &data, &i18n::ENGLISH, 2_000 + 3 * 3_600);
+        let line = header_line(
+            Game::Poe2,
+            "Forbidden Rites",
+            &data,
+            &i18n::ENGLISH,
+            2_000 + 3 * 3_600,
+        );
         assert_eq!(
             line,
-            "Forbidden Rites · snapshot 1733-20260906-24495 · 74 characters sampled · 3 h ago"
+            "PoE2 · Forbidden Rites · snapshot 1733-20260906-24495 · 74 characters sampled · 3 h ago"
         );
 
         // 一次都没采过的时候也得说话,而不是留一串空的分隔点。
         let empty = NinjaData::empty("forbiddenrites".to_owned());
-        let line = header_line("Forbidden Rites", &empty, &i18n::ENGLISH, 5_000);
-        assert_eq!(line, "Forbidden Rites · no snapshot yet");
+        let line = header_line(Game::Poe2, "Forbidden Rites", &empty, &i18n::ENGLISH, 5_000);
+        assert_eq!(line, "PoE2 · Forbidden Rites · no snapshot yet");
+    }
+
+    /// 切到 PoE1 时抬头要跟着换代、跟着换联赛。
+    ///
+    /// 这一行是两页上唯一说得清"表里这些数字属于谁"的地方:开关按下去之后
+    /// 表格整份换了内容,抬头还写着 PoE2 的联赛,那就是一句假话。
+    #[test]
+    fn the_header_follows_the_game_switch() {
+        let empty = NinjaData::empty("allflame".to_owned());
+        assert_eq!(
+            header_line(Game::Poe1, "Allflame", &empty, &i18n::ENGLISH, 5_000),
+            "PoE1 · Allflame · no snapshot yet"
+        );
+        // PoE1 的联赛设置留空("用当季挑战联赛")、又一次都没采过:
+        // 只写代号,不留一个空荡荡的分隔点。
+        assert_eq!(
+            header_line(Game::Poe1, "", &NinjaData::default(), &i18n::ENGLISH, 5_000),
+            "PoE1 · no snapshot yet"
+        );
     }
 
     /// 下拉里的值必须是库里那个分区键(界面拿它回去查),显示的却是人话。

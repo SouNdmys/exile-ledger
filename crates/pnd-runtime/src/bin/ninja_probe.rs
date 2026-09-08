@@ -10,8 +10,9 @@
 //! cargo run -p pnd-runtime --bin ninja_probe -- --raw https://poe.ninja/poe1/api/data/index-state
 //! ```
 //!
-//! `--game poe1` 把上面这些全部指到 PoE1 那一半(默认是 poe2)。采样那几个模式
-//! 还只认 PoE2,给它 `--game poe1` 会直接报错——库的分区键还没按代分开。
+//! `--game poe1` 把上面这些全部指到 PoE1 那一半(默认是 poe2)。**采样那几个模式
+//! 现在也认 PoE1**:两代各写各的库文件(`ninja.sqlite` / `ninja-poe1.sqlite`),
+//! 所以 `--db` 不给时也不会互相盖。PoE1 的 `--league` 不给就用当季挑战联赛。
 //!
 //! 上面四个只读不写。下面五个跑的是 `pnd_runtime::ninja_sampler` 那条真管线,
 //! 会往 `--db` 指的那个 `ninja.sqlite` 里写东西(不给就是默认库):
@@ -114,8 +115,20 @@
 //!   而且物品榜的 JSON 是老那套:没有 `core`,每行直接写
 //!   `chaosValue`/`divineValue`/`exaltedValue`。交易所以 **chaos** 计价
 //!   (`core.primary` = "chaos",1 divine = 358.9 chaos)。
-//! - 角色详情:**今晚没跑到**(请求配额用完了)。要验就跑
-//!   `--game poe1 --character --league allflame`,它会先搜一个角色再抓详情。
+//! - 角色详情:**和 PoE2 是同一种形状**(2026-09-09 实测,Allflame,
+//!   快照 1707-20260908-44259,182KB)。`items[].itemData.mods` 底下还是
+//!   `{"id":…,"stats":{…}}` 这种结构化词缀,配一份纯字符串的 `explicitMods`
+//!   显示文本 —— 也就是说词缀统计那条链路两代通用。三处小差别:
+//!   * `mods` 多两组 PoE1 才有的:`fractured`(裂隙)和 `enchant`(迷宫附魔),
+//!     各配 `fracturedMods` / `enchantMods`。**漏声明不会报错,那一组只是
+//!     静悄悄不进统计**,所以 `ModGroups` 现在把七组全列上了。
+//!   * 关键天赋那个键叫 `keyStones`(大写 S),PoE2 叫 `keystones`。
+//!   * 另有 `crucibleMods` / `scourgeMods` / `mutatedMods` / `vestigialMods`
+//!     等几个只有显示文本、没有结构化对应物的数组,一律忽略。
+//!
+//!   顶层还多出 `atlasTreeName`、`banditChoice`、`masteries`、`tattoos`、
+//!   `runegrafts`、`pantheonMajor/Minor`、`clusterJewels` 这些 PoE1 独有的字段,
+//!   我们不声明,serde 照常忽略。
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -128,7 +141,7 @@ use pnd_ninja::client::{
     Game, NinjaClient, character_url, currency_rates_url, index_state_url, search_url,
     unique_prices_url,
 };
-use pnd_ninja::economy::{UNIQUE_TYPES, unique_types_for};
+use pnd_ninja::economy::unique_types_for;
 use pnd_ninja::search::{SearchResponse, dictionary_key_for_facet};
 use pnd_runtime::ninja_sampler::{
     SamplerConfig, SamplerEvent, SamplerStage, plan_partitions, refresh_prices, run_sampler,
@@ -215,7 +228,14 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--force" => args.force = true,
             "--game" => {
                 let value = raw.next().ok_or("--game needs poe1 or poe2")?;
-                args.game = Game::parse(&value).ok_or_else(|| format!("unknown game {value}"))?;
+                // 不走 `Game::parse`:那一个认不出来就退回 PoE2(设置文件读得宽容
+                // 是对的)。探针反过来 —— 打错一个字母还照跑,只会让人对着一份
+                // PoE2 的输出琢磨半天 PoE1 为什么长这样。
+                args.game = match value.trim().to_ascii_lowercase().as_str() {
+                    "poe1" | "1" => Game::Poe1,
+                    "poe2" | "2" => Game::Poe2,
+                    other => return Err(format!("unknown game {other}").into()),
+                };
             }
             "--account" => {
                 args.account = Some(raw.next().ok_or("--account needs a value")?);
@@ -259,13 +279,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("economy") => print_economy(&client(), &args),
         Some("character") => print_character(&client(), &args),
         Some("raw") => print_raw(&client(), &args),
-        // 采样管线还只认 PoE2:分区计划、`ninja.sqlite` 的键、界面读的表全是按
-        // 一代游戏写的。在这里挡住,比让它默默把 PoE1 的数据写进 PoE2 的表好。
-        Some(_) if args.game != Game::Poe2 => Err(
-            "the sampler modes are PoE2-only for now (--game poe1 works for --index / \
-                 --search / --character / --economy / --raw)"
-                .into(),
-        ),
         Some("plan") => print_plan(&args),
         Some("facets") => run_facets(&args),
         Some("sample") => run_sample(&args),
@@ -415,6 +428,12 @@ fn print_character(client: &NinjaClient, args: &Args) -> Result<(), Box<dyn Erro
     hit(&url);
     let raw = client.character_raw(&version, &account, &name, &snapshot_name)?;
     println!("  status 200, {} bytes", raw.len());
+    // `--out` 在这里也管用:一份角色详情要花一个请求配额,而配额一小时才
+    // 一百来个。落一次盘,后面所有"这个字段到底长什么样"的问题都能离线问。
+    if let Some(path) = &args.out {
+        std::fs::write(path, raw.as_bytes())?;
+        println!("  saved to {}", path.display());
+    }
     describe_character(raw.as_bytes());
 
     println!();
@@ -820,10 +839,12 @@ fn show(value: Option<f64>) -> String {
 /// `--facets --league somethingelse` 也能问到对的价格,不用记两个名字。
 /// 只有 `--prices` 不读 index-state,那时候必须给得出名字。
 fn sampler_config(args: &Args, stop_after: SamplerStage) -> SamplerConfig {
-    let league_url = args
-        .league
-        .clone()
-        .unwrap_or_else(|| DEFAULT_BUILD_LEAGUE.to_owned());
+    // PoE1 不给默认联赛:留空的意思是"用当季挑战联赛",而那正是采样管线
+    // 自己会从 index-state 里认出来的东西(`--league` 明说了就以它为准)。
+    let league_url = args.league.clone().unwrap_or_else(|| match args.game {
+        Game::Poe1 => String::new(),
+        Game::Poe2 => DEFAULT_BUILD_LEAGUE.to_owned(),
+    });
     let league_name = args.league_name.clone().unwrap_or_else(|| {
         if league_url == DEFAULT_BUILD_LEAGUE {
             DEFAULT_ECONOMY_LEAGUE.to_owned()
@@ -831,7 +852,7 @@ fn sampler_config(args: &Args, stop_after: SamplerStage) -> SamplerConfig {
             String::new()
         }
     });
-    let mut config = SamplerConfig::new(league_url, league_name);
+    let mut config = SamplerConfig::for_game(args.game, league_url, league_name);
     config.stop_after = stop_after;
     config.force = args.force;
     config.max_characters = args.limit;
@@ -871,10 +892,9 @@ fn print_event(event: &SamplerEvent) {
             eta_secs / 3_600,
             (eta_secs % 3_600) / 60
         ),
-        SamplerEvent::Prices { types_done } => println!(
-            "[prices]     {types_done}/{} unique types refreshed",
-            UNIQUE_TYPES.len()
-        ),
+        SamplerEvent::Prices { types_done } => {
+            println!("[prices]     {types_done} unique types refreshed");
+        }
         SamplerEvent::Finished { version } => println!("[finished]   version {version}"),
         SamplerEvent::Failed(reason) => println!("[failed]     {reason}"),
     }

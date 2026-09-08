@@ -13,15 +13,18 @@
 //! 统计误差比它本身还大,铺出来只会误导。想看就把开关打开。
 
 use gpui::{Context, ParentElement, SharedString, Styled, div, px};
-use gpui_component::StyledExt as _;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::switch::Switch;
+use gpui_component::{Disableable as _, Sizable as _, Size, StyledExt as _};
 
 use pnd_ninja::aggregate::SlotModStat;
 
+use super::ninja_uniques::game_switch;
 use super::{Cell, TableContent, column, number_column};
 use crate::i18n::{self, Text};
-use crate::shell::ninja::{mod_share_percent, percent_text};
+use crate::shell::ninja::{game_league_text, mod_share_percent, percent_text};
 use crate::shell::{AppShell, Choice, hint, page_heading, panel, picker, table};
+use crate::theme::*;
 
 /// 占比低于这个数的词缀默认不显示(计划里定的阈值)。
 pub const MIN_SHARE_PERCENT: f64 = 2.0;
@@ -342,16 +345,62 @@ impl AppShell {
             .child(self.mods_footer(cx))
     }
 
+    /// 抬头 + 四个筛选器。
+    ///
+    /// 抬头和暗金页同一套(游戏开关 + 联赛 + 刷新):两页读的是同一份采样缓存,
+    /// 只有开关在一页上有、另一页上没有的话,从这一页切过去还得先回那一页去按。
     fn mods_controls(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let text = self.text();
-        let show_all = self.mods_show_all;
+        let busy = self.sampler_busy;
+        let game = self.ninja_game();
+        let header = game_league_text(
+            game,
+            crate::shell::ninja::ninja_league_name(&self.settings, game),
+            text,
+        );
         panel()
             .flex_none()
-            .flex_row()
-            .items_center()
             .gap(px(8.))
             .px(px(10.))
             .py(px(8.))
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .font_family(FONT_MONO)
+                            .text_size(fs(FS_11))
+                            .text_color(c(TEXT_DATA))
+                            .child(SharedString::from(header)),
+                    )
+                    .child(game_switch("mods", game, text, cx))
+                    .child(
+                        Button::new("mods-refresh")
+                            .primary()
+                            .label(text.uniques_refresh)
+                            .with_size(Size::Small)
+                            // 一个库上同时跑两条采样线程只会互相等锁。
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.start_ninja_sampling(cx);
+                            })),
+                    ),
+            )
+            .child(self.mods_filters_row(cx))
+    }
+
+    /// 四个筛选器加一个"显示全部"。
+    fn mods_filters_row(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        let text = self.text();
+        let show_all = self.mods_show_all;
+        div()
+            .h_flex()
+            .items_center()
+            .gap(px(8.))
             .child(picker(text.mods_class_label, &self.mods_class_select, 190.))
             .child(picker(text.mods_slot_label, &self.mods_slot_select, 170.))
             .child(picker(

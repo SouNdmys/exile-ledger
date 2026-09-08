@@ -21,9 +21,9 @@ use std::path::PathBuf;
 
 use gpui::Context;
 
-use pnd_domain::Currency;
+use pnd_domain::{Currency, Game};
 use pnd_ninja::aggregate::SlotModStat;
-use pnd_ninja::economy::UNIQUE_TYPES;
+use pnd_ninja::economy::unique_types_for;
 use pnd_ninja::index_state::league_url_guess;
 use pnd_ninja::plan::query_from_key;
 use pnd_runtime::{SamplerConfig, SamplerEvent, SamplerHandle, SamplerStage};
@@ -98,6 +98,60 @@ impl NinjaData {
     #[must_use]
     pub fn version(&self) -> Option<&str> {
         self.snapshot.as_ref().map(|row| row.version.as_str())
+    }
+}
+
+/// 这一代在设置里叫什么联赛。
+///
+/// `settings.league` 的意思一个字没变 —— 它一直是 **PoE2** 那个联赛;PoE1 另有
+/// 一个 `poe1_league`。两代的联赛名从来对不上,混用的下场是每个接口都 404。
+#[must_use]
+pub fn ninja_league_name(settings: &AppSettings, game: Game) -> &str {
+    match game {
+        Game::Poe1 => &settings.poe1_league,
+        Game::Poe2 => &settings.league,
+    }
+}
+
+/// 这一代该按哪个联赛短名读缓存。
+///
+/// 设置里留空(PoE1 的默认)时**交白卷**:那意思是"用当季挑战联赛",而
+/// 认出当季那个要读 index-state,那是采样线程的活,界面这一侧不联网。
+/// 空串到了 [`AppShell::reload_ninja`] 那儿会退回去问库:采样跑过一轮之后,
+/// 库里那行快照上就写着答案。
+#[must_use]
+pub fn ninja_league_url(settings: &AppSettings, game: Game) -> String {
+    let name = ninja_league_name(settings, game);
+    if name.is_empty() {
+        String::new()
+    } else {
+        league_url_guess(name)
+    }
+}
+
+/// 抬头和状态行上的"哪一代 · 哪个联赛"。
+///
+/// 和表格里那个 [`league_cell_text`](crate::shell::pages::league_cell_text) 不同:
+/// 那儿 PoE2 是常态,写出来只会让每一行都变长。这两页顶上却有一个游戏开关 ——
+/// "我现在看的是哪一代"是第一个问题,省掉它就等于让人靠按钮的高亮去猜表里
+/// 那些数字属于谁。
+#[must_use]
+pub fn game_league_text(game: Game, league: &str, text: &'static Text) -> String {
+    let word = game_word(game, text);
+    if league.is_empty() {
+        // PoE1 留空、还没采过:只写代号,不留一个空荡荡的分隔点。
+        word.to_owned()
+    } else {
+        i18n::fill(text.common_game_league, &[word, league])
+    }
+}
+
+/// 游戏开关上那两个字。
+#[must_use]
+pub fn game_word(game: Game, text: &'static Text) -> &'static str {
+    match game {
+        Game::Poe1 => text.common_game_poe1,
+        Game::Poe2 => text.common_game_poe2,
     }
 }
 
@@ -249,10 +303,11 @@ pub fn load_uniques(
 /// 停在中间会让词缀热度页永远是空的。24 小时内已经跑到这一步的话,
 /// 采样管线自己会跳过,一个请求都不发。
 #[must_use]
-pub fn sampler_config(settings: &AppSettings, db_path: PathBuf) -> SamplerConfig {
+pub fn sampler_config(settings: &AppSettings, game: Game, db_path: PathBuf) -> SamplerConfig {
     SamplerConfig {
-        league_url: league_url_guess(&settings.league),
-        league_name: settings.league.clone(),
+        game,
+        league_url: ninja_league_url(settings, game),
+        league_name: ninja_league_name(settings, game).to_owned(),
         tuning: settings.ninja.clone(),
         user_agent: settings.user_agent(),
         db_path,
@@ -294,7 +349,7 @@ pub fn eta_text(seconds: u64, text: &'static Text) -> String {
 /// 纯函数带测试:这一句是采样跑起来之后用户唯一看得见的东西,而采样一跑
 /// 就是半小时,没人有空回头核对每一条事件长什么样。
 #[must_use]
-pub fn sampler_status(event: &SamplerEvent, text: &'static Text) -> String {
+pub fn sampler_status(event: &SamplerEvent, game: Game, text: &'static Text) -> String {
     match event {
         SamplerEvent::Started { version, .. } => i18n::fill(text.ninja_status_started, &[version]),
         SamplerEvent::Skipped { reason } => i18n::fill(text.ninja_status_skipped, &[reason]),
@@ -330,9 +385,13 @@ pub fn sampler_status(event: &SamplerEvent, text: &'static Text) -> String {
                 &eta_text(*eta_secs, text),
             ],
         ),
+        // 分母跟着游戏走:PoE2 六类,PoE1 五类(那边没有护符,而且分类名是单数)。
         SamplerEvent::Prices { types_done } => i18n::fill(
             text.ninja_status_prices,
-            &[&types_done.to_string(), &UNIQUE_TYPES.len().to_string()],
+            &[
+                &types_done.to_string(),
+                &unique_types_for(game).len().to_string(),
+            ],
         ),
         SamplerEvent::Finished { .. } => text.ninja_status_finished.to_owned(),
         SamplerEvent::Failed(reason) => i18n::fill(text.ninja_status_failed, &[reason]),
@@ -385,8 +444,41 @@ impl AppShell {
         changed
     }
 
+    /// 现在这两页盯着哪一代。设置里那个键就是开关的状态。
+    pub(crate) fn ninja_game(&self) -> Game {
+        self.settings.ninja_game
+    }
+
+    /// 选中那一代的库连接。两代各一个文件,所以这里挑的是"读哪一份缓存"。
+    pub(crate) fn ninja_store(&self) -> Option<&NinjaStore> {
+        self.ninja_stores.get(&self.ninja_game())
+    }
+
+    /// 换一代:换一份缓存视图,并把这个选择记进 `settings.json`。
+    ///
+    /// **不动采样线程** —— 正在跑的那一轮属于它自己那一代,切一下开关就把它
+    /// 掐掉,等于把已经花掉的请求配额扔了(一小时才一百来个)。
+    ///
+    /// 存盘失败只记一行日志:这一个开关是"我现在想看哪一代",看得成比记得住
+    /// 重要,只读模式下也该切得动。
+    pub(crate) fn switch_ninja_game(&mut self, game: Game, cx: &mut Context<Self>) {
+        if self.settings.ninja_game == game {
+            return;
+        }
+        self.settings.ninja_game = game;
+        if !self.read_only
+            && let Err(error) = self.settings_store.save(&self.settings)
+        {
+            self.push_log(format!("settings save failed: {error}"));
+        }
+        // 短名清空,`resync_ninja_league` 才会认为"这一代的视图还没建"。
+        self.ninja = NinjaData::empty(String::new());
+        self.resync_ninja_league();
+        cx.notify();
+    }
+
     fn on_sampler_event(&mut self, event: &SamplerEvent) {
-        let line = sampler_status(event, self.text());
+        let line = sampler_status(event, self.ninja_game(), self.text());
         // 进度事件一秒一条,全记进日志会把日志冲掉;状态行上照样看得见。
         if !matches!(event, SamplerEvent::Progress { .. }) {
             self.push_log(format!("ninja: {line}"));
@@ -407,10 +499,17 @@ impl AppShell {
         if self.sampler_busy {
             return;
         }
-        let config = sampler_config(&self.settings, crate::ninja_db_path());
+        let game = self.ninja_game();
+        let config = sampler_config(&self.settings, game, crate::ninja_db_path_for(game));
         self.push_log(format!(
-            "ninja: sampling {} ({}) into {}",
-            config.league_name,
+            "ninja: sampling {} {} ({}) into {}",
+            config.game,
+            // 联赛留空 = "用当季挑战联赛",采样线程读到 index-state 才知道是哪个。
+            if config.league_name.is_empty() {
+                "<current challenge league>"
+            } else {
+                &config.league_name
+            },
             config.league_url,
             config.db_path.display()
         ));
@@ -429,7 +528,7 @@ impl AppShell {
         let league_url = self.ninja.league_url.clone();
         let wanted = self.ninja.selected_partition.clone();
         let class = self.ninja.selected_class.clone();
-        let loaded = match &self.ninja_store {
+        let loaded = match self.ninja_store() {
             Some(store) => load(store, &league_url, &wanted, &class),
             None => return,
         };
@@ -452,7 +551,7 @@ impl AppShell {
         let Some(version) = self.ninja.version().map(ToOwned::to_owned) else {
             return;
         };
-        let loaded = match &self.ninja_store {
+        let loaded = match self.ninja_store() {
             Some(store) => load_uniques(store, &league_url, &version, &partition),
             None => return,
         };
@@ -474,7 +573,7 @@ impl AppShell {
         let Some(version) = self.ninja.version().map(ToOwned::to_owned) else {
             return;
         };
-        let loaded = match &self.ninja_store {
+        let loaded = match self.ninja_store() {
             Some(store) => load_mods(store, &league_url, &version, &class),
             None => return,
         };
@@ -490,10 +589,27 @@ impl AppShell {
         }
     }
 
-    /// 联赛改了就换一份缓存视图 —— 库里的行是按联赛短名分的。
+    /// 联赛(或者游戏)改了就换一份缓存视图 —— 库里的行是按联赛短名分的。
+    ///
+    /// 设置里那个联赛留空(PoE1 的默认,意思是"用当季挑战联赛")时,短名只能
+    /// **回头问库**:界面不联网,而采样线程跑过一轮之后,库里那行快照上就写着
+    /// 它当时认出来的短名。一次都没采过就留空 —— 两页照样画得出来,只是写一句
+    /// "还没采过"。
     pub(crate) fn resync_ninja_league(&mut self) {
-        let league_url = league_url_guess(&self.settings.league);
-        if league_url == self.ninja.league_url {
+        let game = self.ninja_game();
+        let mut league_url = ninja_league_url(&self.settings, game);
+        if league_url.is_empty()
+            && let Some(store) = self.ninja_store()
+        {
+            league_url = match store.latest_snapshot_any() {
+                Ok(row) => row.map(|row| row.league_url).unwrap_or_default(),
+                Err(error) => {
+                    self.push_log(format!("could not read the ninja cache: {error}"));
+                    String::new()
+                }
+            };
+        }
+        if league_url == self.ninja.league_url && !self.ninja.league_url.is_empty() {
             return;
         }
         self.ninja = NinjaData::empty(league_url);
@@ -596,7 +712,7 @@ mod ninja_tests {
                 SamplerEvent::Failed("no network".to_owned()),
             ] {
                 assert!(
-                    !sampler_status(&event, text).trim().is_empty(),
+                    !sampler_status(&event, Game::Poe2, text).trim().is_empty(),
                     "{language}: {event:?} 没有话说"
                 );
             }
@@ -614,6 +730,7 @@ mod ninja_tests {
                 total: 61,
                 note: String::new(),
             },
+            Game::Poe2,
             text,
         );
         assert_eq!(bare, "facets 15/61");
@@ -625,6 +742,7 @@ mod ninja_tests {
                 total: 2_000,
                 note: "KingPinUwU".to_owned(),
             },
+            Game::Poe2,
             text,
         );
         assert_eq!(noted, "characters 120/2000 · KingPinUwU");
@@ -634,6 +752,7 @@ mod ninja_tests {
                 &SamplerEvent::Skipped {
                     reason: "cached 3h00m ago".to_owned()
                 },
+                Game::Poe2,
                 text
             )
             .contains("cached 3h00m ago")
@@ -655,11 +774,11 @@ mod ninja_tests {
             eta_secs: 66_600,
         };
         assert_eq!(
-            sampler_status(&event, &i18n::SIMPLIFIED_CHINESE),
+            sampler_status(&event, Game::Poe2, &i18n::SIMPLIFIED_CHINESE),
             "已采 150/2000 · 本小时已用 88/100 · 预计还需 18 小时 30 分"
         );
         assert_eq!(
-            sampler_status(&event, &i18n::ENGLISH),
+            sampler_status(&event, Game::Poe2, &i18n::ENGLISH),
             "150 / 2000 sampled · 88 / 100 requests this hour · about 18 h 30 min to go"
         );
 
@@ -711,6 +830,69 @@ mod ninja_tests {
         }));
     }
 
+    /// 两代各读各的联赛设置。
+    ///
+    /// `settings.league` 的意思一个字没变 —— 它一直是 PoE2 那个联赛;PoE1 另有
+    /// 一个 `poe1_league`。混用的下场是每个接口都 404:两代的联赛名从来对不上。
+    #[test]
+    fn each_game_reads_its_own_league_setting() {
+        let settings = AppSettings {
+            league: "Forbidden Rites".to_owned(),
+            poe1_league: "Allflame".to_owned(),
+            ..AppSettings::default()
+        };
+        assert_eq!(ninja_league_name(&settings, Game::Poe2), "Forbidden Rites");
+        assert_eq!(ninja_league_name(&settings, Game::Poe1), "Allflame");
+        assert_eq!(ninja_league_url(&settings, Game::Poe2), "forbiddenrites");
+        assert_eq!(ninja_league_url(&settings, Game::Poe1), "allflame");
+
+        // PoE1 留空 = "用当季挑战联赛"。界面不联网,所以它交白卷,由采样线程
+        // (它读得到 index-state)去认;认出来之前库里也就没有这一代的行。
+        let blank = AppSettings::default();
+        assert_eq!(ninja_league_name(&blank, Game::Poe1), "");
+        assert_eq!(ninja_league_url(&blank, Game::Poe1), "");
+        // PoE2 那一侧不受影响。
+        assert_eq!(ninja_league_url(&blank, Game::Poe2), "forbiddenrites");
+    }
+
+    /// 抬头上"哪一代 · 哪个联赛"两件事都要写出来。
+    ///
+    /// 和表格里那个 `league_cell_text` 不同:那儿 PoE2 是常态所以省略前缀,
+    /// 而这两页顶上有个游戏开关 —— "我现在看的是哪一代"是第一个问题,
+    /// 省掉它就等于让人靠按钮的高亮去猜表里的数字属于谁。
+    #[test]
+    fn the_league_label_names_the_game_too() {
+        let zh = &i18n::SIMPLIFIED_CHINESE;
+        assert_eq!(
+            game_league_text(Game::Poe1, "Allflame", zh),
+            "PoE1 · Allflame"
+        );
+        assert_eq!(
+            game_league_text(Game::Poe2, "Forbidden Rites", zh),
+            "PoE2 · Forbidden Rites"
+        );
+        // 联赛还不知道(PoE1 留空、还没采过)时只写代号,不留一个空荡荡的分隔点。
+        assert_eq!(game_league_text(Game::Poe1, "", zh), "PoE1");
+        assert_eq!(
+            game_league_text(Game::Poe1, "Allflame", &i18n::ENGLISH),
+            "PoE1 · Allflame"
+        );
+    }
+
+    /// 参考价那一句的分母跟着游戏走:PoE2 六类,PoE1 五类。
+    #[test]
+    fn the_price_line_counts_this_games_categories() {
+        let text = &i18n::ENGLISH;
+        assert!(
+            sampler_status(&SamplerEvent::Prices { types_done: 6 }, Game::Poe2, text)
+                .contains("6 / 6")
+        );
+        assert!(
+            sampler_status(&SamplerEvent::Prices { types_done: 5 }, Game::Poe1, text)
+                .contains("5 / 5")
+        );
+    }
+
     /// 界面这一侧永远跑整轮:停在分面那一步的话,词缀热度页永远是空的。
     /// 联赛的两个名字也必须各归各位,混用就是每个接口都 404。
     #[test]
@@ -722,7 +904,8 @@ mod ninja_tests {
         settings.ninja.refresh_hours = 12;
         settings.ninja.sample_target = 500;
 
-        let config = sampler_config(&settings, PathBuf::from(r"C:\tmp\ninja.sqlite"));
+        let config = sampler_config(&settings, Game::Poe2, PathBuf::from(r"C:\tmp\ninja.sqlite"));
+        assert_eq!(config.game, Game::Poe2);
         assert_eq!(config.league_url, "forbiddenrites");
         assert_eq!(config.league_name, "Forbidden Rites");
         assert_eq!(config.stop_after, SamplerStage::Aggregated);
@@ -732,6 +915,18 @@ mod ninja_tests {
         assert_eq!(config.tuning.refresh_hours, 12);
         assert_eq!(config.tuning.sample_target, 500);
         assert_eq!(config.db_path, PathBuf::from(r"C:\tmp\ninja.sqlite"));
+
+        // 切到 PoE1:联赛换成 PoE1 那个,库换成 PoE1 那个文件。
+        settings.poe1_league = "Allflame".to_owned();
+        let poe1 = sampler_config(
+            &settings,
+            Game::Poe1,
+            PathBuf::from(r"C:\tmp\ninja-poe1.sqlite"),
+        );
+        assert_eq!(poe1.game, Game::Poe1);
+        assert_eq!(poe1.league_url, "allflame");
+        assert_eq!(poe1.league_name, "Allflame");
+        assert_eq!(poe1.db_path, PathBuf::from(r"C:\tmp\ninja-poe1.sqlite"));
     }
 
     /// 库是空的时候读出来的是一份空缓存,而不是一个错。
@@ -818,6 +1013,7 @@ mod ninja_tests {
         // 抬头那句话直接印这个数(格式由 `ninja_uniques` 那边的测试守)。
         assert!(
             crate::shell::pages::ninja_uniques::header_line(
+                Game::Poe2,
                 "Forbidden Rites",
                 &data,
                 &i18n::SIMPLIFIED_CHINESE,

@@ -234,17 +234,23 @@ fn aggregate_one_class(details: &[&CharacterDetail], class: &str) -> Vec<SlotMod
         .collect()
 }
 
-/// 五组词缀,顺序无所谓——输出最后会重排。
+/// 七组词缀,顺序无所谓——输出最后会重排。
 ///
 /// 每组带着**自己那一份显示文本**:`mods.explicit` 配 `explicitMods`。
 /// 配错组就等于把工艺词缀的话挂到天生词缀上。
-fn mod_groups(item: &ItemData) -> [(&'static str, &[ModEntry], &[String]); 5] {
+///
+/// 两代各有自己独占的组(PoE2 的 `desecrated`/`rune`,PoE1 的
+/// `fractured`/`enchant`),这里一并列全:对面没有那一组时它就是个空数组,
+/// 白列一行的代价是零,而漏列一行的代价是那一组**静悄悄地不进统计**。
+fn mod_groups(item: &ItemData) -> [(&'static str, &[ModEntry], &[String]); 7] {
     [
         ("implicit", &item.mods.implicit, &item.implicit_mods),
         ("explicit", &item.mods.explicit, &item.explicit_mods),
         ("crafted", &item.mods.crafted, &item.crafted_mods),
         ("desecrated", &item.mods.desecrated, &item.desecrated_mods),
         ("rune", &item.mods.rune, &item.rune_mods),
+        ("fractured", &item.mods.fractured, &item.fractured_mods),
+        ("enchant", &item.mods.enchant, &item.enchant_mods),
     ]
 }
 
@@ -346,6 +352,44 @@ pub fn unique_usage_from_facet(entries: &[(String, u64)], total: u64) -> Vec<Uni
 #[cfg(test)]
 mod aggregate_tests {
     use super::*;
+
+    /// PoE1 的裂隙词缀和迷宫附魔也要进统计。
+    ///
+    /// 它们是 `mods` 下 PoE1 才有的两组。分组表漏掉一组不会报错 —— 那一组只是
+    /// **静悄悄地不出现在词缀页上**,而裂隙词缀恰恰是 PoE1 好装备上最贵的那一条。
+    #[test]
+    fn a_poe1_items_fractured_and_enchant_mods_reach_the_stats() {
+        let poe1: CharacterDetail = serde_json::from_str(
+            r#"{
+              "account": "someone-0000", "name": "Someone", "class": "Champion",
+              "items": [
+                {"itemSlot": 8, "itemData": {"inventoryId": "Ring", "rarity": "Rare",
+                  "mods": {
+                    "fractured": [{"id": "Strength9", "stats": {"additional_strength": 52}}],
+                    "enchant": [{"id": "EnchantmentLife1", "stats": {"base_maximum_life": 40}}]},
+                  "fracturedMods": ["+52 to Strength"],
+                  "enchantMods": ["+40 to maximum Life"]}}
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let stats = aggregate_mods(&[poe1]);
+        let find = |kind: &str, stat_id: &str| {
+            stats
+                .iter()
+                .find(|row| row.mod_kind == kind && row.stat_id == stat_id && row.class.is_empty())
+        };
+        let fractured = find("fractured", "additional_strength").expect("裂隙词缀得进统计");
+        assert_eq!(fractured.slot, "Ring");
+        assert_eq!(fractured.characters, 1);
+        assert_eq!(fractured.p50, Some(52.0));
+        // 显示文本也得配上它自己那一份数组,不能挂到别组的话上。
+        assert_eq!(fractured.display, "+# to Strength");
+
+        let enchant = find("enchant", "base_maximum_life").expect("附魔也得进统计");
+        assert_eq!(enchant.display, "+# to maximum Life");
+    }
 
     /// 两个手写角色。形状照着线上响应剪的,只是把装备砍到刚好够验每条规则:
     ///

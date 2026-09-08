@@ -28,6 +28,8 @@ use crate::theme::*;
 pub struct SettingsForm {
     pub language: ChoiceSelect,
     pub league: Entity<InputState>,
+    /// PoE1 那个联赛。空串合法:它的意思是"用当季挑战联赛"。
+    pub poe1_league: Entity<InputState>,
     pub poesessid: Entity<InputState>,
     pub poll_interval: Entity<InputState>,
     pub poll_interval_when_live: Entity<InputState>,
@@ -107,6 +109,11 @@ impl SettingsForm {
         let league = input(
             settings.league.clone(),
             text.settings_league_placeholder,
+            false,
+        );
+        let poe1_league = input(
+            settings.poe1_league.clone(),
+            text.settings_poe1_league_placeholder,
             false,
         );
         // 会话 cookie 默认打码:它就摆在一个游戏旁边的窗口里,肩后随时有人。
@@ -191,6 +198,7 @@ impl SettingsForm {
         Self {
             language,
             league,
+            poe1_league,
             poesessid,
             poll_interval,
             poll_interval_when_live,
@@ -219,6 +227,7 @@ impl SettingsForm {
     ) {
         for (input, placeholder) in [
             (&self.league, text.settings_league_placeholder),
+            (&self.poe1_league, text.settings_poe1_league_placeholder),
             (&self.poesessid, text.settings_poesessid_placeholder),
             (
                 &self.custom_sound_path,
@@ -271,6 +280,7 @@ impl SettingsForm {
     ) {
         for (input, value) in [
             (&self.league, settings.league.clone()),
+            (&self.poe1_league, settings.poe1_league.clone()),
             (&self.poesessid, settings.poesessid.clone()),
             (
                 &self.poll_interval,
@@ -348,6 +358,13 @@ impl AppShell {
                 field_row()
                     .child(field_label(text.settings_league))
                     .child(input_box(240., &form.league, read_only)),
+                field_row()
+                    .child(field_label(text.settings_poe1_league))
+                    .child(input_box(240., &form.poe1_league, read_only)),
+                // 留空是有意义的一档,不是"忘了填",所以这句话必须写在框旁边。
+                field_row()
+                    .child(field_label(""))
+                    .child(hint(text.settings_poe1_league_hint)),
             ],
         );
 
@@ -662,6 +679,7 @@ impl AppShell {
     fn collect_form(&mut self, cx: &mut Context<Self>) {
         let form = &self.settings_form;
         let league = text_of(&form.league, cx);
+        let poe1_league = text_of(&form.poe1_league, cx);
         let poesessid = text_of(&form.poesessid, cx);
         let poll_interval = number_of(
             &form.poll_interval,
@@ -716,6 +734,10 @@ impl AppShell {
         if !league.is_empty() {
             self.settings.league = league;
         }
+        // PoE1 那个反过来:**留空是一档有意义的选择**("用当季挑战联赛"),
+        // 所以清空框子就该真的清掉它,不能像上面那样保持原样 —— 否则填过一次
+        // 之后就再也回不到"跟着当季走"了。
+        self.settings.poe1_league = poe1_league;
         self.settings.poesessid = poesessid;
         self.settings.watcher.poll_interval_seconds = poll_interval;
         self.settings.watcher.poll_interval_when_live_seconds = poll_interval_when_live;

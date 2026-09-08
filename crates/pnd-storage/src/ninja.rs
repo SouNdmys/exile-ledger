@@ -21,6 +21,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use pnd_domain::Game;
 use pnd_ninja::aggregate::SlotModStat;
 use pnd_ninja::economy::UniquePriceLine;
 use pnd_ninja::plan::{Partition, PartitionTier, SampledCharacter, is_rarity_bucket};
@@ -327,6 +328,16 @@ pub struct NinjaStore {
 }
 
 impl NinjaStore {
+    /// 这一代游戏在 `data_dir` 下的那个库。
+    ///
+    /// 分库不分表:表结构一个字都没动,两代各写各的文件。这个库整个是可以
+    /// 随手删的缓存,所以"PoE1 的数据出问题就删 PoE1 那个文件"是它该有的
+    /// 粒度;反过来给十几张表都加一列 `game` 要改一遍主键、还要迁移老库,
+    /// 为一份删得起的缓存付这个价不值。
+    pub fn open_for(game: Game, data_dir: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open(data_dir.as_ref().join(crate::ninja_db_file_name(game)))
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
         // 第一次启动时 `%LOCALAPPDATA%\PoeNinjaData` 还不存在,SQLite 不会替你建目录。
@@ -370,6 +381,27 @@ impl NinjaStore {
                  FROM ninja_snapshots WHERE league_url = ?1
                  ORDER BY started_at DESC, version DESC LIMIT 1",
                 params![league_url],
+                snapshot_from_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// 这个库里最近开的那一轮,**不管是哪个联赛**。
+    ///
+    /// 存在的理由是"联赛名留空 = 用当季挑战联赛":那时候调用方手上还没有短名
+    /// (要等 index-state 才知道),却已经需要回答"上一轮跑到哪了"和"该按哪个
+    /// 短名读缓存"。一个库只装一代、一代通常只盯一个联赛,所以"最近那一轮"
+    /// 就是答案。
+    pub fn latest_snapshot_any(&self) -> Result<Option<SnapshotRow>, StorageError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT league_url, version, snapshot_name, total_characters, stage,
+                        started_at, finished_at
+                 FROM ninja_snapshots
+                 ORDER BY started_at DESC, version DESC LIMIT 1",
+                [],
                 snapshot_from_row,
             )
             .optional()?;
@@ -1109,6 +1141,92 @@ mod ninja_tests {
 
     fn store() -> NinjaStore {
         NinjaStore::open_in_memory().expect("open")
+    }
+
+    /// 两代各一个库文件,**PoE2 那个的路径一个字都不许变**。
+    ///
+    /// 分文件而不是给每张表加一列 `game`,理由是这个库整个都是可以随手删的
+    /// 缓存:分文件等于"PoE1 的数据出问题就删 PoE1 那个文件",而加一列意味着
+    /// 十几张表的主键全要改一遍、老库还得迁移 —— 为一份删得起的缓存付这个价
+    /// 不值。PoE2 的文件名保持原样,是因为本机那个库里已经躺着一整轮采样,
+    /// 换个名字等于让它明天从头再采一天。
+    #[test]
+    fn each_game_gets_its_own_database_file() {
+        let dir = std::env::temp_dir().join(format!("pnd-ninja-games-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let poe2 = NinjaStore::open_for(Game::Poe2, &dir).expect("poe2");
+        assert!(dir.join("ninja.sqlite").is_file(), "PoE2 还是老文件名");
+        assert!(!dir.join("ninja-poe1.sqlite").exists());
+
+        let poe1 = NinjaStore::open_for(Game::Poe1, &dir).expect("poe1");
+        assert!(dir.join("ninja-poe1.sqlite").is_file());
+
+        // 两边真的是两份数据:写进 PoE1 的快照不会从 PoE2 那边读出来。
+        poe1.upsert_snapshot(&SnapshotRow {
+            league_url: "allflame".to_owned(),
+            version: "1707-20260908-44259".to_owned(),
+            snapshot_name: "allflame".to_owned(),
+            total_characters: 124_459,
+            stage: SnapshotStage::Facets,
+            started_at: 1_000,
+            finished_at: None,
+        })
+        .expect("write");
+        assert!(poe1.latest_snapshot("allflame").expect("read").is_some());
+        assert!(poe2.latest_snapshot("allflame").expect("read").is_none());
+
+        drop(poe1);
+        drop(poe2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 联赛名留空时,库自己说得出"最近跑的是哪个联赛"。
+    ///
+    /// 界面读缓存要一个联赛短名,而"用当季挑战联赛"那条路上,短名只有采样
+    /// 线程读过 index-state 之后才知道。库里那一行就是它留下的答案。
+    #[test]
+    fn the_store_can_name_the_league_it_most_recently_sampled() {
+        let store = store();
+        assert!(store.latest_snapshot_any().expect("read").is_none());
+
+        store
+            .upsert_snapshot(&SnapshotRow {
+                league_url: "allflame".to_owned(),
+                version: "old".to_owned(),
+                snapshot_name: "allflame".to_owned(),
+                total_characters: 124_459,
+                stage: SnapshotStage::Facets,
+                started_at: 1_000,
+                finished_at: None,
+            })
+            .expect("old");
+        store
+            .upsert_snapshot(&SnapshotRow {
+                league_url: "allflamehc".to_owned(),
+                version: "new".to_owned(),
+                snapshot_name: "hardcore-allflame".to_owned(),
+                total_characters: 9_000,
+                stage: SnapshotStage::Facets,
+                started_at: 5_000,
+                finished_at: None,
+            })
+            .expect("new");
+
+        let latest = store.latest_snapshot_any().expect("read").expect("row");
+        assert_eq!(latest.league_url, "allflamehc", "最近开的那一轮");
+        assert_eq!(latest.version, "new");
+    }
+
+    /// 默认路径也分代,而且两个都落在同一个数据目录下。
+    #[test]
+    fn the_default_paths_sit_side_by_side_in_one_folder() {
+        let poe2 = crate::default_ninja_db_path_for(Game::Poe2);
+        let poe1 = crate::default_ninja_db_path_for(Game::Poe1);
+        assert_eq!(poe2, crate::default_ninja_db_path(), "老调用方一个字不用改");
+        assert_eq!(poe2.file_name().unwrap(), "ninja.sqlite");
+        assert_eq!(poe1.file_name().unwrap(), "ninja-poe1.sqlite");
+        assert_eq!(poe1.parent(), poe2.parent());
     }
 
     fn snapshot(stage: SnapshotStage, started_at: i64) -> SnapshotRow {

@@ -316,7 +316,20 @@ pub struct AppSettings {
     pub schema_version: u32,
     /// `zh` 或 `en`。存字符串不存枚举:以后加语言只是多一个值,不动 schema。
     pub ui_language: String,
+    /// **PoE2** 那个联赛的显示名。蹲价、观察、ninja 两页的 PoE2 一侧都用它。
     pub league: String,
+    /// ninja 两页现在盯着哪一代。页面上那个两档开关写的就是它。
+    ///
+    /// 老的 `settings.json` 里没有这个键,缺了就是 PoE2 —— 那是这个程序
+    /// 一开始唯一采样的那一代,换默认值等于悄悄改行为。
+    pub ninja_game: Game,
+    /// PoE1 那个联赛的显示名。
+    ///
+    /// **空串不是"没配好",是"用当季挑战联赛"**:联赛三个月换一次名字,
+    /// 让人每赛季回设置页改一次字符串是纯手工活,而 poe.ninja 的 index-state
+    /// 自己就说得出当季那个叫什么(`IndexState::current_challenge_league`)。
+    /// 填了就以填的为准 —— 想看 Standard 或者硬核的人得有话语权。
+    pub poe1_league: String,
     /// 明文存本机。程序不登录、不存密码、不把它写进日志。
     pub poesessid: String,
     pub watches: Vec<WatchEntry>,
@@ -337,6 +350,8 @@ impl Default for AppSettings {
             schema_version: CURRENT_SCHEMA_VERSION,
             ui_language: "zh".to_string(),
             league: "Forbidden Rites".to_string(),
+            ninja_game: Game::default(),
+            poe1_league: String::new(),
             poesessid: String::new(),
             watches: Vec::new(),
             observations: Vec::new(),
@@ -723,6 +738,44 @@ mod settings_tests {
         assert_eq!(settings.ninja.max_requests_per_hour, 100);
         assert_eq!(settings.ninja.min_request_gap_ms, 2000);
         assert_eq!(settings.user_agent_mode, UserAgentMode::Identified);
+    }
+
+    /// ninja 两页盯的是哪一代,以及 PoE1 那个联赛名。
+    ///
+    /// 默认 PoE2 + 空串:老的 `settings.json` 里没有这两个键,读出来必须还是
+    /// 今天在跑的那一代。`poe1_league` 留空**不是"没配好"**,而是"用当季挑战
+    /// 联赛" —— 联赛三个月换一次名字,让人每赛季回来改一次字符串是纯手工活,
+    /// 而 index-state 自己就说得出当季那个叫什么(见
+    /// `IndexState::current_challenge_league`)。
+    #[test]
+    fn the_ninja_pages_remember_which_game_and_which_poe1_league() {
+        let settings: AppSettings = serde_json::from_str("{}").expect("parse");
+        assert_eq!(settings.ninja_game, Game::Poe2);
+        assert_eq!(settings.poe1_league, "");
+        // `settings.league` 的意思一个字没变:它一直是 PoE2 那个联赛。
+        assert_eq!(settings.league, "Forbidden Rites");
+
+        // 存进去再读回来是同一份。写法跟着 `pnd_domain::Game` 的 serde:小写。
+        let chosen = AppSettings {
+            ninja_game: Game::Poe1,
+            poe1_league: "Allflame".to_owned(),
+            ..AppSettings::default()
+        };
+        let raw = serde_json::to_string(&chosen).expect("write");
+        assert!(raw.contains(r#""ninja_game":"poe1""#), "{raw}");
+        assert_eq!(
+            serde_json::from_str::<AppSettings>(&raw).expect("read"),
+            chosen
+        );
+
+        // 缺这个键的老文件读出来是 PoE2,而不是整份读不出来 ——
+        // 这一条才是真正要守的兼容性:盘上那份 `settings.json` 就没有它。
+        let old_file: AppSettings =
+            serde_json::from_str(r#"{"schema_version":1,"league":"Forbidden Rites"}"#)
+                .expect("老文件必须照常读得出来");
+        assert_eq!(old_file.ninja_game, Game::Poe2);
+        assert_eq!(old_file.poe1_league, "");
+        assert_eq!(old_file.league, "Forbidden Rites");
     }
 
     /// 已经在盘上的那份 schema 1 文件没有热键和 toast 这两个键。

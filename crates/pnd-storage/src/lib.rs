@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 
+use pnd_domain::Game;
+
 pub mod ninja;
 pub mod observe;
 pub mod watch;
@@ -25,6 +27,25 @@ pub fn default_watch_db_path() -> PathBuf {
 
 /// ninja 采样缓存。里面全是能重新抓回来的东西,删掉最多就是下次开程序时
 /// 重跑一轮采样,所以出问题时可以放心让用户直接删掉这个文件。
+///
+/// **签名刻意不带参数**:它问的一直是 PoE2,让老调用方一个字都不用改。
 pub fn default_ninja_db_path() -> PathBuf {
-    default_data_dir().join("ninja.sqlite")
+    default_ninja_db_path_for(Game::Poe2)
+}
+
+/// 这一代的 ninja 采样缓存放在哪。
+pub fn default_ninja_db_path_for(game: Game) -> PathBuf {
+    default_data_dir().join(ninja_db_file_name(game))
+}
+
+/// 两代各一个文件名。
+///
+/// PoE2 那个**保持原样**:本机那个库里已经躺着一整轮采样(两千个角色、
+/// 一整天的请求配额),换个名字等于让它明天从头再采一遍。
+#[must_use]
+pub fn ninja_db_file_name(game: Game) -> &'static str {
+    match game {
+        Game::Poe1 => "ninja-poe1.sqlite",
+        Game::Poe2 => "ninja.sqlite",
+    }
 }

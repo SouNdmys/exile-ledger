@@ -127,6 +127,26 @@ powershell -ExecutionPolicy Bypass -File scripts\make-shortcut.ps1
 
 ---
 
+## PoE1
+
+这个程序两代都认,只是各自能干的事不一样。
+
+**蹲价和市场观察**:把 PoE1 的 `/trade/` 网址整条粘进来就行,程序自己看得出这是
+PoE1,不用先去哪里切一下。命中之后卡片上**只有「复制私聊」** —— PoE1 没有藏身处
+传送这回事,那个按钮对它没有意义。**一键蹲价还只有 PoE2 有**(观察页上那个从词缀
+直接做成搜索的按钮):它要自己造一个搜索 id,而 PoE1 认不认那种 id 还没验过。
+
+**poe.ninja 那两页**:两页的右上角各有一个 **PoE2 / PoE1** 开关,按一下整张表就换成
+另一代的,抬头会写清现在看的是哪一代哪个联赛(比如「PoE1 · Allflame」)。刷新采的
+也是当前选中那一代。
+
+两代的采样数据**各存各的文件**(`ninja.sqlite` 和 `ninja-poe1.sqlite`),所以采 PoE1
+不会动到 PoE2 那份已经采好的。**联赛名也是分开的两个设置**:设置页上的「联赛」是
+PoE2 那个,底下多一个「PoE1 联赛」。后者**留空就是跟着当季挑战联赛走** —— 联赛名
+poe.ninja 自己会说,不用你每三个月回来改一次。
+
+---
+
 ## 东西都存在哪儿
 
 全在这一个文件夹里:`%LOCALAPPDATA%\PoeNinjaData\`
@@ -136,7 +156,8 @@ powershell -ExecutionPolicy Bypass -File scripts\make-shortcut.ps1
 | --- | --- |
 | `settings.json` | 你在设置页填的一切,**包括明文的 POESESSID** |
 | `watch.sqlite` | 搜索列表、轮询状态、提醒历史 |
-| `ninja.sqlite` | poe.ninja 的采样缓存(两张热度榜读它) |
+| `ninja.sqlite` | poe.ninja 的 **PoE2** 采样缓存(两张热度榜读它) |
+| `ninja-poe1.sqlite` | 同上,**PoE1** 那一份。没采过 PoE1 就是个空文件 |
 | `app.log` | 运行日志,程序关掉之后还查得回来 |
 | `panic.log` | 程序崩了才有。有这个文件就说明上次是崩的 |
 | `webview2\` | 登录窗那个浏览器内核自己的 cookie 和缓存。登录出问题就把它整个删掉 |
