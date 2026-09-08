@@ -17,8 +17,8 @@ pub mod settings;
 pub mod watches;
 
 use gpui::{
-    App, Context, Div, InteractiveElement as _, IntoElement, ParentElement, SharedString, Stateful,
-    Styled, Window, div, px,
+    App, Context, Div, InteractiveElement as _, IntoElement, ParentElement, Pixels, SharedString,
+    Stateful, Styled, Window, div, px,
 };
 use gpui_component::StyledExt as _;
 use gpui_component::table::{Column, TableDelegate, TableState};
@@ -162,10 +162,55 @@ impl SimpleTable {
         Self { content }
     }
 
-    /// 换语言(或者第 7b 步换成真数据)时整份换掉。
-    pub fn set_content(&mut self, content: TableContent) {
+    /// 换语言(或者数据变了)时整份换掉。返回**列头要不要重建一遍**。
+    ///
+    /// 为什么要这么个返回值:用户拖出来的列宽只活在上游表格自己那份运行时
+    /// 列组里(`col_groups`),委托手上这份是不动的。而上游一重建列头
+    /// (`TableState::refresh`)就回到委托这儿把宽度重读一遍 —— 观察页的
+    /// 数据每秒变一次,于是每秒把用户拖出来的宽度弹回默认值一次。行变了、
+    /// 列没变的那些刷新干脆不让它重建,拖出来的宽度就留住了。
+    ///
+    /// key 一样就是同一组列(换语言、换选中的那条观察都算),这时候把上一
+    /// 份宽度接过来:列头还是得重建(文字变了),但重读到的是用户的宽度。
+    #[must_use]
+    pub fn set_content(&mut self, mut content: TableContent) -> bool {
+        if same_keys(&self.content.columns, &content.columns) {
+            for (column, previous) in content.columns.iter_mut().zip(&self.content.columns) {
+                column.width = previous.width;
+            }
+        }
+        let rebuild = !same_columns(&self.content.columns, &content.columns);
         self.content = content;
+        rebuild
     }
+
+    /// 用户拖完列宽的那一下,把上游那份新宽度抄回来。
+    ///
+    /// 上游只改它自己那份运行时宽度,不回头动委托;不抄回来的话,下一次
+    /// 真的需要重建列头(换语言)时重读到的还是默认值,拖过的宽度当场作废。
+    pub fn remember_widths(&mut self, widths: &[Pixels]) {
+        for (column, width) in self.content.columns.iter_mut().zip(widths) {
+            column.width = *width;
+        }
+    }
+}
+
+/// 两组列是不是同一组列:同一批 key、同样的顺序。
+fn same_keys(left: &[Column], right: &[Column]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.key == right.key)
+}
+
+/// 两组列画出来一模一样吗。`Column` 没有 `PartialEq`,所以逐项比 ——
+/// 列头上看得见的就是 key、名字、宽度和对齐这四样。
+fn same_columns(left: &[Column], right: &[Column]) -> bool {
+    same_keys(left, right)
+        && left.iter().zip(right).all(|(left, right)| {
+            left.name == right.name && left.width == right.width && left.align == right.align
+        })
 }
 
 impl TableDelegate for SimpleTable {
@@ -438,6 +483,62 @@ mod pages_tests {
                 );
             }
         }
+    }
+
+    /// 一张小表,拿来量列宽:列由调用方给,行只是"数据变了"的占位。
+    fn widths_content(columns: Vec<Column>, rows: usize) -> TableContent {
+        TableContent {
+            columns,
+            rows: (0..rows)
+                .map(|row| vec![Cell::plain(row.to_string())])
+                .collect(),
+            empty: "nothing yet".into(),
+        }
+    }
+
+    /// 用户拖宽的那一列,不该被一次刷新弹回默认宽度。
+    ///
+    /// 上游把"现在这一列多宽"存在表格自己那边,只有重建列头
+    /// (`TableState::refresh`)时才回到委托这儿重读一遍 —— 而观察页的数据
+    /// 每秒变一次。所以委托这一侧要做两件事:**行变了列没变就说"不用重建"**,
+    /// 以及列真的变了(换语言把表头换成另一种文字)时,把上一份宽度接过来。
+    #[test]
+    fn a_resized_column_keeps_its_width_across_a_refresh() {
+        let english = || {
+            vec![
+                column("label", "Label", 180.),
+                column("league", "League", 120.),
+            ]
+        };
+        let mut table = SimpleTable::new(widths_content(english(), 0));
+
+        // 用户把第一列从 180 拖到 300。
+        table.remember_widths(&[px(300.), px(120.)]);
+
+        // 数据变了、列没变:不用重建列头,拖出来的宽度就没人动得了。
+        assert!(
+            !table.set_content(widths_content(english(), 3)),
+            "只有行变了,不该重建列头"
+        );
+        assert_eq!(table.content.columns[0].width, px(300.));
+
+        // 换语言:表头文字变了,列头得重建;但 key 没变,还是同一组列,
+        // 宽度接着用。
+        let chinese = vec![
+            column("label", "备注", 180.),
+            column("league", "联赛", 120.),
+        ];
+        assert!(
+            table.set_content(widths_content(chinese, 3)),
+            "表头文字变了,得重建列头"
+        );
+        assert_eq!(table.content.columns[0].width, px(300.));
+
+        // 换成另一组列(整张表换了):宽度回到新那组列自己的默认值,
+        // 而不是把上一张表的宽度硬套过来。
+        let other = vec![column("template", "Modifier", 90.)];
+        assert!(table.set_content(widths_content(other, 1)));
+        assert_eq!(table.content.columns[0].width, px(90.));
     }
 
     /// 上面那条只在"有行"时才检查得到东西 —— 行构造器要是哪天返回了空表,

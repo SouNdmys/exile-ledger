@@ -177,11 +177,42 @@ fn new_table(
     window: &mut Window,
     cx: &mut Context<AppShell>,
 ) -> Entity<TableState<SimpleTable>> {
-    cx.new(|cx| {
+    let state = cx.new(|cx| {
         TableState::new(SimpleTable::new(content), window, cx)
             .row_selectable(true)
             .col_selectable(false)
+    });
+    // 用户拖完一列,上游广播一次新宽度。抄回委托手上那份列 —— 上游只改
+    // 它自己那份运行时宽度,而下一次重建列头(换语言)时它是回到委托这儿
+    // 重读的:不抄,拖过的宽度那一下就作废了。
+    cx.subscribe(&state, |_: &mut AppShell, table, event: &TableEvent, cx| {
+        if let TableEvent::ColumnWidthsChanged(widths) = event {
+            let widths = widths.clone();
+            table.update(cx, |state, _| {
+                state.delegate_mut().remember_widths(&widths);
+            });
+        }
     })
+    .detach();
+    state
+}
+
+/// 把新内容装进一张表。
+///
+/// 只有列真的变了才让上游重建列头:重建会把用户拖出来的列宽重读成委托
+/// 手上那份(见 [`SimpleTable::set_content`]),而这几张表的数据每秒都在变。
+fn apply_content(
+    table: &Entity<TableState<SimpleTable>>,
+    content: pages::TableContent,
+    cx: &mut Context<AppShell>,
+) {
+    table.update(cx, |state, cx| {
+        if state.delegate_mut().set_content(content) {
+            state.refresh(cx);
+        } else {
+            cx.notify();
+        }
+    });
 }
 
 /// 换语言之后把一个下拉的选项文字重造一遍。
@@ -763,20 +794,14 @@ impl AppShell {
             self.text(),
             now_secs(),
         );
-        self.watches_table.update(cx, |state, cx| {
-            state.delegate_mut().set_content(content);
-            state.refresh(cx);
-        });
+        apply_content(&self.watches_table, content, cx);
     }
 
     /// 提醒表 = `watch.sqlite` 里最近的那 200 行。
     fn rebuild_alerts_table(&mut self, cx: &mut Context<Self>) {
         self.alerts_dirty = false;
         let content = pages::alerts::table_content_for(&self.alert_rows, self.text());
-        self.alerts_table.update(cx, |state, cx| {
-            state.delegate_mut().set_content(content);
-            state.refresh(cx);
-        });
+        apply_content(&self.alerts_table, content, cx);
     }
 
     /// 暗金表 = 选中分区的 `items` 分面 × 经济接口的参考价。
@@ -788,10 +813,7 @@ impl AppShell {
             self.uniques_show_all,
             self.text(),
         );
-        self.uniques_table.update(cx, |state, cx| {
-            state.delegate_mut().set_content(content);
-            state.refresh(cx);
-        });
+        apply_content(&self.uniques_table, content, cx);
     }
 
     /// 词缀表 = 这一轮的统计,按三个下拉筛一遍。
@@ -806,10 +828,7 @@ impl AppShell {
             self.mods_show_all,
             self.text(),
         );
-        self.mods_table.update(cx, |state, cx| {
-            state.delegate_mut().set_content(content);
-            state.refresh(cx);
-        });
+        apply_content(&self.mods_table, content, cx);
     }
 
     /// 观察表 = 设置里的观察列表 × actor 广播的运行状态。
@@ -821,10 +840,7 @@ impl AppShell {
             self.text(),
             now_secs(),
         );
-        self.observations_table.update(cx, |state, cx| {
-            state.delegate_mut().set_content(content);
-            state.refresh(cx);
-        });
+        apply_content(&self.observations_table, content, cx);
     }
 
     /// 词缀战绩表 = 选中那条观察的聚合结果,按类型和样本数筛一遍。
@@ -837,10 +853,7 @@ impl AppShell {
             self.obs_min_samples,
             self.text(),
         );
-        self.obs_mods_table.update(cx, |state, cx| {
-            state.delegate_mut().set_content(content);
-            state.refresh(cx);
-        });
+        apply_content(&self.obs_mods_table, content, cx);
     }
 
     /// 词缀页三个下拉现在选的是什么。空串 = "全部"。
