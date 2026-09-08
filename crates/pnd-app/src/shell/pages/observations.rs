@@ -35,7 +35,7 @@ use gpui_component::{Selectable as _, Sizable as _, Size, StyledExt as _};
 
 use pnd_domain::{
     GoneClass, ObservationId, Price, PriceBucket, decode_search_id, default_label_for,
-    parse_search_reference,
+    encode_search_id, parse_search_reference, with_stat_filter,
 };
 use pnd_runtime::{LiveRunState, ObservationStatus, RuntimeCommand, now_secs};
 use pnd_settings::{AppSettings, ObservationEntry};
@@ -65,6 +65,16 @@ pub const STREAM_ROWS: u32 = 20;
 /// 挂单流里一条货最多列几行词缀。石板上词缀不多,稀有装能有十几条 ——
 /// 全铺出来一屏就只剩得下两件货。
 const STREAM_MOD_LINES: usize = 4;
+
+/// 收藏过的词缀前面挂的那颗星。不走 i18n:它不是一句话,两种语言下都是
+/// 同一颗星。
+const FAVOURITE_MARK: &str = "★ ";
+
+/// 一键蹲价拼出来的备注名里,词缀最多留几个字。
+///
+/// 40:蹲价表那一列 200 像素,"观察名 · 一整句词缀"常常比它长一倍,
+/// 而截断之后剩下的那半句已经够认出是哪条词缀了。
+pub const DRAFT_TEMPLATE_CHARS: usize = 40;
 
 /// 词缀表默认要求的样本数。
 ///
@@ -430,6 +440,88 @@ fn label_for(typed: &str, search_id: &str) -> String {
 // 纯函数:词缀战绩
 // ---------------------------------------------------------------------
 
+/// 一个联赛里被收藏的那些词缀,`(mod_kind, template)` 一对。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FavouriteMods {
+    keys: Vec<(String, String)>,
+}
+
+impl FavouriteMods {
+    /// 设置里那份收藏清单,只留下这个联赛的那几条。
+    #[must_use]
+    pub fn for_league(settings: &AppSettings, league: &str) -> Self {
+        let keys = settings
+            .favourite_mods
+            .iter()
+            .filter(|entry| entry.league == league)
+            .map(|entry| (entry.mod_kind.clone(), entry.template.clone()))
+            .collect();
+        Self { keys }
+    }
+
+    #[must_use]
+    pub fn contains(&self, mod_kind: &str, template: &str) -> bool {
+        self.keys
+            .iter()
+            .any(|(kind, saved)| kind == mod_kind && saved == template)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
+/// 蹲价表单该被填成什么样。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WatchDraft {
+    pub search_id: String,
+    pub league: String,
+    pub label: String,
+    pub cap_milli: Option<i64>,
+    pub currency: String,
+}
+
+/// 词缀表上选中的那一行 → 一份蹲价草稿。
+///
+/// 搜索是**观察自己那条查询再加一格词缀筛选**,不是从零拼一条:观察那条
+/// 查询里还写着底子、物品等级、在线与否这些条件,丢掉它们就变成"全服所有
+/// 带这条词缀的东西",一天能响几百次。
+///
+/// 上限取**成交价**中位,没有才退到在售价中位:在售价是"卖不掉的人开的价",
+/// 拿它当蹲价上限等于永远在等一个没人接的价。两个都没有就留空 —— 凭空猜一个
+/// 数出来,用户按下"新增"就是照着那个数在蹲。
+#[must_use]
+pub fn watch_draft(
+    observation: &ObservationEntry,
+    query_json: &str,
+    outcome: &ModOutcome,
+    stat_id: &str,
+) -> WatchDraft {
+    WatchDraft {
+        search_id: encode_search_id(&with_stat_filter(query_json, stat_id)),
+        league: observation.league.clone(),
+        label: format!(
+            "{} · {}",
+            observation.label,
+            short_template(&outcome.template)
+        ),
+        cap_milli: outcome
+            .median_gone_price_milli
+            .or(outcome.median_active_price_milli),
+        currency: outcome.currency.clone(),
+    }
+}
+
+/// 备注名里那半句词缀。超了就截断,末尾留一个省略号说明"还有下文"。
+fn short_template(template: &str) -> String {
+    if template.chars().count() <= DRAFT_TEMPLATE_CHARS {
+        return template.to_owned();
+    }
+    let head: String = template.chars().take(DRAFT_TEMPLATE_CHARS - 1).collect();
+    format!("{head}…")
+}
+
 /// 词缀类型下拉。选项从库里已有的行长出来 —— 写死一份的话,交易站哪天多一种
 /// 词缀数组,那一档就永远筛不出来。
 pub fn kind_choices(outcomes: &[ModOutcome], text: &'static Text) -> Vec<Choice> {
@@ -465,21 +557,30 @@ fn kind_label<'a>(kind: &'a str, text: &'static Text) -> &'a str {
 /// 排序按**卖掉几件**从多到少,而不是按见过几件:这一页要回答的是"什么样的
 /// 货出得掉",一条见过 80 件、一件没卖掉的词缀不该压在榜首。见过的件数只是
 /// 打平时的次序。
+///
+/// 收藏过的那几条整体提到最前:用户亲口认下"这条值钱"的词缀,常常恰恰是
+/// 样本还薄、排在第二屏的那几条 —— 收藏了却还要每次翻下去找,等于没收藏。
+/// 提上来之后它们内部仍按同一套次序排,和下面那半张表读起来是一样的。
 #[must_use]
 pub fn mod_filtered<'a>(
     outcomes: &'a [ModOutcome],
     kind: &str,
     min_samples: u32,
+    favourites: &FavouriteMods,
+    favourites_only: bool,
 ) -> Vec<&'a ModOutcome> {
     let mut rows: Vec<&ModOutcome> = outcomes
         .iter()
         .filter(|row| kind.is_empty() || row.mod_kind == kind)
         .filter(|row| row.seen >= min_samples)
+        .filter(|row| !favourites_only || favourites.contains(&row.mod_kind, &row.template))
         .collect();
     rows.sort_by(|left, right| {
-        right
-            .sold_likely
-            .cmp(&left.sold_likely)
+        // `false < true`,所以"是收藏"要写成 `!contains`:0 排在 1 前面。
+        let pinned = |row: &ModOutcome| !favourites.contains(&row.mod_kind, &row.template);
+        pinned(left)
+            .cmp(&pinned(right))
+            .then(right.sold_likely.cmp(&left.sold_likely))
             .then(right.seen.cmp(&left.seen))
             .then(left.template.cmp(&right.template))
             .then(left.mod_kind.cmp(&right.mod_kind))
@@ -511,21 +612,34 @@ pub fn mods_table_content_for(
     outcomes: &[ModOutcome],
     kind: &str,
     min_samples: u32,
+    favourites: &FavouriteMods,
+    favourites_only: bool,
     text: &'static Text,
 ) -> TableContent {
     TableContent {
-        rows: mod_rows(&mod_filtered(outcomes, kind, min_samples), text),
+        rows: mod_rows(
+            &mod_filtered(outcomes, kind, min_samples, favourites, favourites_only),
+            favourites,
+            text,
+        ),
         ..mods_table_content(text)
     }
 }
 
 /// 一条词缀模板一行。
 #[must_use]
-pub fn mod_rows(rows: &[&ModOutcome], text: &'static Text) -> Vec<Vec<Cell>> {
+pub fn mod_rows(
+    rows: &[&ModOutcome],
+    favourites: &FavouriteMods,
+    text: &'static Text,
+) -> Vec<Vec<Cell>> {
     rows.iter()
         .map(|row| {
             vec![
-                Cell::plain(row.template.clone()),
+                Cell::plain(starred(
+                    &row.template,
+                    favourites.contains(&row.mod_kind, &row.template),
+                )),
                 Cell::muted(kind_label(&row.mod_kind, text).to_owned()),
                 Cell::data(row.seen.to_string()),
                 Cell::data(row.gone.to_string()),
@@ -734,12 +848,31 @@ pub fn gone_class_label(class: Option<GoneClass>, text: &'static Text) -> &'stat
 }
 
 /// 挂单身上那几行词缀,超了就截断。
+///
+/// 收藏过的那几条带星:聚合表是结论,这一栏是撑起结论的证据 —— 翻证据的
+/// 时候第一眼要找的就是"这件货身上有没有我认下的那条词缀"。
 #[must_use]
-pub fn listing_mod_lines(mods: &[ObservedMod]) -> Vec<String> {
+pub fn listing_mod_lines(mods: &[ObservedMod], favourites: &FavouriteMods) -> Vec<String> {
     mods.iter()
         .take(STREAM_MOD_LINES)
-        .map(|entry| entry.template.clone())
+        .map(|entry| {
+            starred(
+                &entry.template,
+                favourites.contains(&entry.mod_kind, &entry.template),
+            )
+        })
         .collect()
+}
+
+/// 收藏过的词缀在屏幕上前面挂一颗星。
+///
+/// 为什么要标:置顶之后那几行凭什么在上面,只有这颗星说得清 —— 不然看起来
+/// 像"这条卖得最好",而它其实只是被收藏了。
+fn starred(template: &str, favourite: bool) -> String {
+    if favourite {
+        return format!("{FAVOURITE_MARK}{template}");
+    }
+    template.to_owned()
 }
 
 // ---------------------------------------------------------------------
@@ -778,8 +911,80 @@ impl AppShell {
                     .flex()
                     .flex_row()
                     .gap(px(10.))
-                    .child(self.observations_aggregate_panel(cx))
+                    // 聚合表和它那排按钮竖着摞在一起:按钮作用在表里选中的
+                    // 那一行,分开摆就看不出它们是一伙的。
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .min_h(px(0.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(self.observations_aggregate_panel(cx))
+                            .child(self.observations_mod_actions(cx)),
+                    )
                     .child(self.observations_stream_panel(cx)),
+            )
+    }
+
+    /// 词缀表里选中一行之后能对它做的两件事:收藏,或者把它做成一条蹲价。
+    ///
+    /// 为什么不做成表格里的按钮:上游的表格不支持在格子里放控件(同蹲价页
+    /// 那排按钮的理由)。
+    fn observations_mod_actions(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        let text = self.text();
+        let selected = self.selected_mod(cx);
+        let favourites = self.observation_favourites();
+        let is_favourite = selected
+            .as_ref()
+            .is_some_and(|row| favourites.contains(&row.mod_kind, &row.template));
+        let label = selected.as_ref().map_or_else(
+            || text.common_select_row.to_owned(),
+            |row| row.template.clone(),
+        );
+        panel()
+            .flex_none()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .px(px(10.))
+            .py(px(6.))
+            .child(
+                div()
+                    .text_size(fs(FS_11_5))
+                    .text_color(muted())
+                    .child(text.obs_mod_actions),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(fs(FS_11_5))
+                    .text_color(c(TEXT_SECONDARY))
+                    .child(SharedString::from(label)),
+            )
+            .child(
+                Button::new("obs-favourite")
+                    .label(if is_favourite {
+                        text.obs_unfavourite
+                    } else {
+                        text.obs_favourite
+                    })
+                    .with_size(Size::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_selected_mod_favourite(cx);
+                    })),
+            )
+            .child(
+                Button::new("obs-make-watch")
+                    .label(text.obs_make_watch)
+                    .with_size(Size::Small)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.make_watch_from_selected_mod(window, cx);
+                    })),
             )
     }
 
@@ -962,12 +1167,16 @@ impl AppShell {
     fn observations_aggregate_panel(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let text = self.text();
         let min_samples = self.obs_min_samples;
+        let favourites_only = self.obs_favourites_only;
         let tab = self.obs_agg_tab;
         let selected = self.observe.selected.is_some();
         let no_data = self.observe.is_empty();
         panel()
             .flex_1()
             .min_w(px(0.))
+            // 它现在和下面那排按钮竖着摞在一起:不写这一句,flex 子项的默认
+            // 最小高度是它的内容,长表格会把按钮那一条顶出屏幕。
+            .min_h(px(0.))
             .child(
                 div()
                     .flex_none()
@@ -1013,6 +1222,20 @@ impl AppShell {
                             .text_color(muted())
                             .child(text.obs_min_samples_label),
                     )
+                    // "只看收藏"只筛得动词缀那张表(价位档没有"收藏"这回事),
+                    // 所以它和类型下拉一样跟着栏走。
+                    .children((tab == AggregateTab::Mods).then(|| {
+                        Button::new("obs-favourites-only")
+                            .ghost()
+                            .xsmall()
+                            .selected(favourites_only)
+                            .label(text.obs_favourites_only)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.obs_favourites_only = !this.obs_favourites_only;
+                                this.obs_mods_dirty = true;
+                                cx.notify();
+                            }))
+                    }))
                     .children(MIN_SAMPLE_PRESETS.into_iter().map(|preset| {
                         Button::new(("obs-min-samples", preset as usize))
                             .ghost()
@@ -1061,11 +1284,12 @@ impl AppShell {
         let text = self.text();
         let tab = self.obs_stream_tab;
         let now = now_secs();
+        let favourites = self.observation_favourites();
         let entries: Vec<gpui::Div> = self
             .observe
             .stream(tab)
             .iter()
-            .map(|entry| stream_row(entry, tab, text, now))
+            .map(|entry| stream_row(entry, tab, &favourites, text, now))
             .collect();
         let empty = entries.is_empty();
         let first_look = self.observe.summary.gone_before_first_look;
@@ -1362,6 +1586,147 @@ impl AppShell {
         cx.notify();
     }
 
+    /// 现在这张词缀表该按哪个联赛的收藏来标星。
+    ///
+    /// 跟着**选中那条观察**的联赛,不是设置页那个当前联赛:翻看上赛季的
+    /// 观察时,该亮的是上赛季认下的那几条。
+    pub(crate) fn observation_favourites(&self) -> FavouriteMods {
+        FavouriteMods::for_league(&self.settings, &self.observation_league())
+    }
+
+    /// 选中那条观察是哪个联赛的。一条都没选中(还没加过观察)时退回设置页
+    /// 那个当前联赛 —— 收藏总得记在某个联赛名下。
+    fn observation_league(&self) -> String {
+        self.observe
+            .selected
+            .as_ref()
+            .and_then(|id| self.settings.observation(id))
+            .map_or_else(
+                || self.settings.league.clone(),
+                |entry| entry.league.clone(),
+            )
+    }
+
+    /// 词缀表里选中的那一行。
+    ///
+    /// 表上画的是筛过、排过的那一份,所以这里要用同一套参数再算一遍 ——
+    /// 拿行号去 `self.observe.mods`(库里那份原始顺序)里取,选中的和
+    /// 按钮作用的就是两条不同的词缀。
+    fn selected_mod(&self, cx: &mut Context<Self>) -> Option<ModOutcome> {
+        let row = self.obs_mods_table.read(cx).selected_row()?;
+        let kind = crate::shell::selected_value(&self.obs_kind_select, cx);
+        let favourites = self.observation_favourites();
+        mod_filtered(
+            &self.observe.mods,
+            &kind,
+            self.obs_min_samples,
+            &favourites,
+            self.obs_favourites_only,
+        )
+        .get(row)
+        .map(|row| (*row).clone())
+    }
+
+    /// 收藏 / 取消收藏选中那条词缀。
+    fn toggle_selected_mod_favourite(&mut self, cx: &mut Context<Self>) {
+        let Some(row) = self.selected_mod(cx) else {
+            self.select_an_observation_first(cx);
+            return;
+        };
+        let league = self.observation_league();
+        let now_favourite = self
+            .settings
+            .toggle_favourite(&league, &row.mod_kind, &row.template);
+        self.push_log(format!(
+            "modifier {} favourite: {} ({league})",
+            if now_favourite {
+                "added to"
+            } else {
+                "removed from"
+            },
+            row.template
+        ));
+        self.save_and_apply();
+        // 置顶顺序和星号都变了,挂单流那一栏也跟着重画。
+        self.obs_mods_dirty = true;
+        // 刚收藏的那一行会跳到表头去,而"选中的是第几行"是个行号 ——
+        // 不让它跟着走的话,下一下按钮作用的就是另一条词缀了。
+        self.reselect_mod_row(&row, cx);
+        cx.notify();
+    }
+
+    /// 重排之后,把选中标记挪回原来那条词缀身上。
+    fn reselect_mod_row(&mut self, row: &ModOutcome, cx: &mut Context<Self>) {
+        let kind = crate::shell::selected_value(&self.obs_kind_select, cx);
+        let favourites = self.observation_favourites();
+        let moved_to = mod_filtered(
+            &self.observe.mods,
+            &kind,
+            self.obs_min_samples,
+            &favourites,
+            self.obs_favourites_only,
+        )
+        .iter()
+        .position(|candidate| {
+            candidate.mod_kind == row.mod_kind && candidate.template == row.template
+        });
+        // 找不着了("只看收藏"开着,而这一下正是取消收藏):选中标记留在原处,
+        // 反正那一行已经不在表上了。
+        let Some(index) = moved_to else {
+            return;
+        };
+        self.obs_mods_table.clone().update(cx, |state, cx| {
+            state.set_selected_row(index, cx);
+        });
+    }
+
+    /// 一键蹲价:把选中那条词缀做成一份蹲价草稿,翻到蹲价页填进表单。
+    ///
+    /// **只填,不加**:按下"新增"的永远是用户自己 —— 一条自动加进去的搜索
+    /// 会立刻开始花限速预算,而它是不是用户要的还没人确认过。
+    fn make_watch_from_selected_mod(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.text();
+        let (Some(row), Some(obs_id)) = (self.selected_mod(cx), self.observe.selected.clone())
+        else {
+            self.select_an_observation_first(cx);
+            return;
+        };
+        let Some(entry) = self.settings.observation(&obs_id).cloned() else {
+            return;
+        };
+        // 词缀筛选认的是 stat id,而库里只有模板 —— id 得回物品原文里翻。
+        let stat_id = self.alerts_store.as_ref().and_then(|store| {
+            store
+                .stat_id_for_template(&obs_id, &row.mod_kind, &row.template)
+                .unwrap_or_default()
+        });
+        let Some(stat_id) = stat_id else {
+            self.set_notice(text.obs_no_stat_id.to_owned());
+            cx.notify();
+            return;
+        };
+        // 查询原文优先用库里存的那份(actor 每轮都写);它还没写过(刚加的
+        // 观察)就当场从搜索 id 解一份出来 —— 两条路解出来的是同一段。
+        let query_json = self
+            .alerts_store
+            .as_ref()
+            .and_then(|store| store.observation_state(&obs_id).ok().flatten())
+            .and_then(|run| run.query_json)
+            .or_else(|| decode_search_id(&entry.search_id).ok());
+        let Some(query_json) = query_json else {
+            self.set_notice(text.obs_invalid_search.to_owned());
+            cx.notify();
+            return;
+        };
+
+        let draft = watch_draft(&entry, &query_json, &row, &stat_id);
+        self.push_log(format!("watch draft from modifier: {}", draft.label));
+        self.prefill_add_form(draft, window, cx);
+        self.show_page(crate::shell::Page::Watches);
+        self.set_notice(text.watches_prefilled.to_owned());
+        cx.notify();
+    }
+
     fn select_an_observation_first(&mut self, cx: &mut Context<Self>) {
         let text = self.text();
         self.set_notice(text.common_select_row.to_owned());
@@ -1446,8 +1811,14 @@ impl AppShell {
 }
 
 /// 挂单流里的一条。
-fn stream_row(entry: &StreamEntry, tab: StreamTab, text: &'static Text, now: i64) -> gpui::Div {
-    let lines = listing_mod_lines(&entry.mods);
+fn stream_row(
+    entry: &StreamEntry,
+    tab: StreamTab,
+    favourites: &FavouriteMods,
+    text: &'static Text,
+    now: i64,
+) -> gpui::Div {
+    let lines = listing_mod_lines(&entry.mods, favourites);
     div()
         .flex()
         .flex_col()
@@ -1502,6 +1873,22 @@ mod observations_page_tests {
 
     const HOUR: i64 = 3_600;
     const NOW: i64 = 1_000_000;
+
+    /// 网页上真抄下来的那条查询(Choir of the Storm),一键蹲价拿它当底子。
+    const FIXTURE_QUERY: &str = r#"{"status":{"option":"online"},"name":"Choir of the Storm","stats":[{"type":"and","filters":[]}]}"#;
+
+    /// 一份收藏清单,联赛统一是观察那一条的("Forbidden Rites")。
+    fn favourites(pairs: &[(&str, &str)]) -> FavouriteMods {
+        let mut settings = AppSettings::default();
+        for (kind, template) in pairs {
+            settings.toggle_favourite("Forbidden Rites", kind, template);
+        }
+        FavouriteMods::for_league(&settings, "Forbidden Rites")
+    }
+
+    fn templates(rows: &[&ModOutcome]) -> Vec<String> {
+        rows.iter().map(|row| row.template.clone()).collect()
+    }
 
     fn settings() -> AppSettings {
         AppSettings {
@@ -1814,7 +2201,7 @@ mod observations_page_tests {
             outcome("+# to maximum Life", "explicit", 30, 22, 20),
             outcome("+#% to Fire Resistance", "explicit", 40, 10, 9),
         ];
-        let rows = mod_filtered(&outcomes, "", 1);
+        let rows = mod_filtered(&outcomes, "", 1, &FavouriteMods::default(), false);
         assert_eq!(rows[0].template, "+# to maximum Life");
         assert_eq!(rows[1].template, "+#% to Fire Resistance");
         assert_eq!(rows[2].template, "#% increased Rarity");
@@ -1824,7 +2211,12 @@ mod observations_page_tests {
     #[test]
     fn a_modifier_row_carries_the_counts_the_rate_and_both_medians() {
         let outcomes = vec![outcome("+# to maximum Life", "explicit", 30, 22, 20)];
-        let rows = mod_rows(&mod_filtered(&outcomes, "", 1), &i18n::ENGLISH);
+        let favourites = FavouriteMods::default();
+        let rows = mod_rows(
+            &mod_filtered(&outcomes, "", 1, &favourites, false),
+            &favourites,
+            &i18n::ENGLISH,
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0].text(), "+# to maximum Life");
         assert_eq!(rows[0][1].text(), "Explicit");
@@ -1847,7 +2239,7 @@ mod observations_page_tests {
         thin.median_gone_price_milli = None;
         thin.median_active_price_milli = None;
         thin.median_hours_alive = None;
-        let rows = mod_rows(&[&thin], &i18n::ENGLISH);
+        let rows = mod_rows(&[&thin], &FavouriteMods::default(), &i18n::ENGLISH);
         assert_eq!(rows[0][4].text(), "0");
         assert_eq!(rows[0][5].text(), "0.0%");
         assert_eq!(rows[0][6].text(), "—");
@@ -1862,13 +2254,202 @@ mod observations_page_tests {
             outcome("+# to maximum Life", "explicit", 30, 22, 20),
             outcome("+# to Spirit", "implicit", 2, 2, 2),
         ];
-        assert_eq!(mod_filtered(&outcomes, "", 1).len(), 2);
-        assert_eq!(mod_filtered(&outcomes, "", DEFAULT_MIN_SAMPLES).len(), 1);
-        assert_eq!(mod_filtered(&outcomes, "", 10).len(), 1);
-        assert!(mod_filtered(&outcomes, "", 99).is_empty());
+        let none = FavouriteMods::default();
+        assert_eq!(mod_filtered(&outcomes, "", 1, &none, false).len(), 2);
+        assert_eq!(
+            mod_filtered(&outcomes, "", DEFAULT_MIN_SAMPLES, &none, false).len(),
+            1
+        );
+        assert_eq!(mod_filtered(&outcomes, "", 10, &none, false).len(), 1);
+        assert!(mod_filtered(&outcomes, "", 99, &none, false).is_empty());
         // 类型筛选和样本数是"和"的关系。
-        assert_eq!(mod_filtered(&outcomes, "implicit", 1).len(), 1);
-        assert!(mod_filtered(&outcomes, "implicit", 3).is_empty());
+        assert_eq!(
+            mod_filtered(&outcomes, "implicit", 1, &none, false).len(),
+            1
+        );
+        assert!(mod_filtered(&outcomes, "implicit", 3, &none, false).is_empty());
+    }
+
+    /// 收藏过的词缀置顶,而且带一颗星。
+    ///
+    /// 置顶的理由:这张表默认按"卖掉几件"排,而用户亲口认下"这条值钱"的
+    /// 那几条,常常恰恰是样本还薄、排在第二屏的 —— 收藏了却还要每次翻下去找,
+    /// 等于没收藏。星是给"它在上面是因为被收藏了,不是因为它卖得最好"这件事
+    /// 一个交代。
+    #[test]
+    fn favourite_modifiers_are_pinned_to_the_top_and_wear_a_star() {
+        let outcomes = vec![
+            outcome("+# to maximum Life", "explicit", 30, 22, 20),
+            outcome("+#% to Fire Resistance", "explicit", 40, 10, 9),
+            outcome("#% increased Rarity", "explicit", 80, 4, 1),
+        ];
+        let none = FavouriteMods::default();
+        let pinned = favourites(&[("explicit", "#% increased Rarity")]);
+
+        // 没有收藏时就是原来的顺序:卖掉最多的在前。
+        assert_eq!(
+            templates(&mod_filtered(&outcomes, "", 1, &none, false)),
+            vec![
+                "+# to maximum Life",
+                "+#% to Fire Resistance",
+                "#% increased Rarity"
+            ]
+        );
+        // 收藏那条跳到最前,剩下的相对次序一个不动。
+        assert_eq!(
+            templates(&mod_filtered(&outcomes, "", 1, &pinned, false)),
+            vec![
+                "#% increased Rarity",
+                "+# to maximum Life",
+                "+#% to Fire Resistance"
+            ]
+        );
+
+        let rows = mod_rows(
+            &mod_filtered(&outcomes, "", 1, &pinned, false),
+            &pinned,
+            &i18n::ENGLISH,
+        );
+        assert_eq!(rows[0][0].text(), "★ #% increased Rarity");
+        assert_eq!(rows[1][0].text(), "+# to maximum Life", "没收藏的不带星");
+    }
+
+    /// 收藏是按联赛记的:上赛季认下的那条,在这个赛季的观察上不该置顶。
+    #[test]
+    fn a_favourite_from_another_league_does_not_count() {
+        let outcomes = vec![
+            outcome("+# to maximum Life", "explicit", 30, 22, 20),
+            outcome("#% increased Rarity", "explicit", 80, 4, 1),
+        ];
+        let mut settings = AppSettings::default();
+        settings.toggle_favourite("Standard", "explicit", "#% increased Rarity");
+        let here = FavouriteMods::for_league(&settings, "Forbidden Rites");
+        assert!(here.is_empty());
+        assert_eq!(
+            templates(&mod_filtered(&outcomes, "", 1, &here, false)),
+            vec!["+# to maximum Life", "#% increased Rarity"]
+        );
+        // 类型也是键的一部分。
+        let other_kind = favourites(&[("implicit", "#% increased Rarity")]);
+        assert!(!other_kind.contains("explicit", "#% increased Rarity"));
+    }
+
+    /// "只看收藏"打开之后,没收藏的一行都不留 —— 这一档是"我认下的这几条
+    /// 今天卖得怎么样",别的词缀在这个问题里只是噪音。
+    #[test]
+    fn the_favourites_only_toggle_hides_everything_else() {
+        let outcomes = vec![
+            outcome("+# to maximum Life", "explicit", 30, 22, 20),
+            outcome("#% increased Rarity", "explicit", 80, 4, 1),
+        ];
+        let picked = favourites(&[("explicit", "#% increased Rarity")]);
+        assert_eq!(
+            templates(&mod_filtered(&outcomes, "", 1, &picked, true)),
+            vec!["#% increased Rarity"]
+        );
+        // 和样本门槛、类型筛选是"和"的关系。
+        assert!(mod_filtered(&outcomes, "", 99, &picked, true).is_empty());
+        assert!(mod_filtered(&outcomes, "implicit", 1, &picked, true).is_empty());
+        // 一条都没收藏时开着它就是一张空表(而不是悄悄退回全部)。
+        assert!(mod_filtered(&outcomes, "", 1, &FavouriteMods::default(), true).is_empty());
+    }
+
+    /// 挂单流里的词缀也要带星:聚合表是结论,这一栏是证据 —— 一件货身上
+    /// 有没有我认下的那条词缀,是翻证据时第一眼要看的东西。
+    #[test]
+    fn a_favourite_modifier_is_starred_in_the_listing_stream() {
+        let entry = entry("one", Some(GoneClass::SoldLikely));
+        let picked = favourites(&[("explicit", "+# to maximum Life")]);
+        assert_eq!(
+            listing_mod_lines(&entry.mods, &picked),
+            vec![
+                "★ +# to maximum Life".to_string(),
+                "#% increased Quantity of Waystones found".to_string(),
+            ]
+        );
+        assert_eq!(
+            listing_mod_lines(&entry.mods, &FavouriteMods::default())[0],
+            "+# to maximum Life"
+        );
+    }
+
+    /// 一键蹲价:选中的词缀 + 这条观察自己的查询 = 一条能直接粘回交易站的搜索。
+    ///
+    /// 上限取**成交价**中位,不取在售价:在售价是"卖不掉的人开的价",拿它当
+    /// 蹲价上限等于永远在等一个没人接的价。
+    #[test]
+    fn a_watch_draft_carries_the_filtered_search_the_label_and_the_sold_median() {
+        let settings = settings();
+        let observation = &settings.observations[0];
+        let mut row = outcome("+#% to Lightning Resistance", "explicit", 30, 22, 20);
+        row.median_gone_price_milli = Some(12_500);
+        row.median_active_price_milli = Some(20_000);
+
+        let draft = watch_draft(observation, FIXTURE_QUERY, &row, "explicit.stat_1671376347");
+        assert_eq!(draft.league, "Forbidden Rites");
+        assert_eq!(
+            draft.label,
+            "Precursor Tablets · +#% to Lightning Resistance"
+        );
+        assert_eq!(draft.cap_milli, Some(12_500));
+        assert_eq!(draft.currency, "exalted");
+
+        // 搜索 id 解开之后,是原来的查询加上那一格词缀筛选。
+        let query: serde_json::Value =
+            serde_json::from_str(&decode_search_id(&draft.search_id).expect("decode")).unwrap();
+        assert_eq!(query["name"], "Choir of the Storm");
+        assert_eq!(
+            query["stats"][0]["filters"],
+            serde_json::json!([{ "id": "explicit.stat_1671376347" }])
+        );
+    }
+
+    /// 一条都还没卖掉的词缀没有成交价中位,退到在售价中位;两个都没有就
+    /// 把上限那一格留空 —— 猜一个数出来,用户按下新增就是照着它蹲。
+    #[test]
+    fn a_watch_draft_falls_back_to_the_asking_median_then_to_nothing() {
+        let settings = settings();
+        let observation = &settings.observations[0];
+        let mut unsold = outcome("+# to maximum Life", "explicit", 30, 0, 0);
+        unsold.median_gone_price_milli = None;
+        assert_eq!(
+            watch_draft(observation, FIXTURE_QUERY, &unsold, "explicit.a").cap_milli,
+            Some(20_000)
+        );
+
+        let mut priceless = unsold.clone();
+        priceless.median_active_price_milli = None;
+        priceless.currency = String::new();
+        let draft = watch_draft(observation, FIXTURE_QUERY, &priceless, "explicit.a");
+        assert_eq!(draft.cap_milli, None);
+        assert!(draft.currency.is_empty());
+    }
+
+    /// 长词缀要截断:备注名那一列只有 200 像素,而"观察名 · 一整句词缀"
+    /// 常常比它长一倍。
+    #[test]
+    fn a_watch_draft_label_keeps_the_template_short() {
+        let settings = settings();
+        let long = outcome(
+            "#% increased Quantity of Items found in this Area and #% increased Rarity",
+            "explicit",
+            30,
+            22,
+            20,
+        );
+        let draft = watch_draft(
+            &settings.observations[0],
+            FIXTURE_QUERY,
+            &long,
+            "explicit.a",
+        );
+        let tail = draft
+            .label
+            .strip_prefix("Precursor Tablets · ")
+            .expect("the observation name leads");
+        assert_eq!(tail.chars().count(), DRAFT_TEMPLATE_CHARS);
+        assert!(tail.ends_with('…'), "{tail}");
+        assert!(long.template.starts_with(tail.trim_end_matches('…')));
     }
 
     /// 类型下拉从库里长出来,而且交易站那七种都得有中文写法 ——
@@ -2059,10 +2640,10 @@ mod observations_page_tests {
                 value2: None,
             })
             .collect();
-        let lines = listing_mod_lines(&many.mods);
+        let lines = listing_mod_lines(&many.mods, &FavouriteMods::default());
         assert_eq!(lines.len(), STREAM_MOD_LINES);
         assert_eq!(lines[0], "modifier 0");
-        assert!(listing_mod_lines(&[]).is_empty());
+        assert!(listing_mod_lines(&[], &FavouriteMods::default()).is_empty());
     }
 
     /// 四档判定在两种语言下都得有话说,而且互不重复 —— 分不清"卖掉了"和

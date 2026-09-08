@@ -400,7 +400,14 @@ mod pages_tests {
             median_active_price_milli: Some(20_000),
             median_hours_alive: Some(3.5),
         }];
-        observations::mods_table_content_for(&outcomes, "", 1, text)
+        observations::mods_table_content_for(
+            &outcomes,
+            "",
+            1,
+            &observations::FavouriteMods::default(),
+            false,
+            text,
+        )
     }
 
     /// 一档价位战绩,拿来量观察页那张价位表。

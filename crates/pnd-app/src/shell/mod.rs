@@ -116,6 +116,15 @@ impl Choice {
         }
     }
 
+    /// 存储值。
+    ///
+    /// 和 `SelectItem::value` 拿到的是同一个东西,但那是个 trait 方法 ——
+    /// 把那个 trait 引进页面文件里,`String` 上的 `matches` 会跟着被它的
+    /// 同名方法接管(上游给 `String` 也实现了 `SelectItem`)。
+    pub fn stored_value(&self) -> &str {
+        &self.value
+    }
+
     /// 选项的显示文字和存储值一样(联赛名、职业名这种专有名词)。
     pub fn plain(value: impl Into<SharedString>) -> Self {
         let value = value.into();
@@ -317,6 +326,8 @@ pub struct AppShell {
     pub(crate) obs_error: String,
     /// 词缀战绩表现在要求至少见过几件。
     pub(crate) obs_min_samples: u32,
+    /// 词缀战绩表只留收藏过的那几行。
+    pub(crate) obs_favourites_only: bool,
     /// 左下那块聚合表现在看的是哪一栏(词缀战绩 / 价位战绩)。
     pub(crate) obs_agg_tab: pages::observations::AggregateTab,
     /// 挂单流现在看的是哪一栏。
@@ -626,6 +637,7 @@ impl AppShell {
             watch_error: String::new(),
             obs_error: String::new(),
             obs_min_samples: pages::observations::DEFAULT_MIN_SAMPLES,
+            obs_favourites_only: false,
             obs_agg_tab: pages::observations::AggregateTab::default(),
             obs_stream_tab: pages::observations::StreamTab::default(),
             obs_remove_armed: false,
@@ -865,6 +877,8 @@ impl AppShell {
             &self.observe.mods,
             &kind,
             self.obs_min_samples,
+            &self.observation_favourites(),
+            self.obs_favourites_only,
             self.text(),
         );
         apply_content(&self.obs_mods_table, content, cx);

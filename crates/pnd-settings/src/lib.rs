@@ -166,6 +166,23 @@ impl ObservationEntry {
     }
 }
 
+/// 一条被收藏的词缀:市场观察那张战绩表上,用户看完数字之后亲口认下
+/// "这条值钱"的那些。
+///
+/// 联赛是键的一部分,不是顺手存的:上个赛季"+# 生命"值不值得盯,和这个
+/// 赛季没有关系 —— 物价、BD、能刷到什么货每赛季都重来一遍。
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct FavouriteMod {
+    pub league: String,
+    /// `explicit` / `implicit` / `enchant` / … 和库里 `observed_mods.mod_kind` 同一套写法。
+    pub mod_kind: String,
+    /// 词缀模板(`+# to maximum Life`),同 `observed_mods.template`。
+    pub template: String,
+    /// RFC3339;空串合法(手写的设置文件可以不填)。
+    pub added_at: String,
+}
+
 /// 轮询和限速预算的旋钮。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default)]
@@ -295,6 +312,8 @@ pub struct AppSettings {
     /// 市场观察的列表。schema 版本还是 1:`#[serde(default)]` 让老文件缺这个
     /// 键时读出一个空列表,而不是整份设置读不出来。
     pub observations: Vec<ObservationEntry>,
+    /// 被认定为"值钱"的词缀。同上,schema 版本还是 1。
+    pub favourite_mods: Vec<FavouriteMod>,
     pub watcher: WatcherTuning,
     pub alert: AlertTuning,
     pub ninja: NinjaTuning,
@@ -310,6 +329,7 @@ impl Default for AppSettings {
             poesessid: String::new(),
             watches: Vec::new(),
             observations: Vec::new(),
+            favourite_mods: Vec::new(),
             watcher: WatcherTuning::default(),
             alert: AlertTuning::default(),
             ninja: NinjaTuning::default(),
@@ -347,6 +367,36 @@ impl AppSettings {
 
     pub fn watch(&self, id: &WatchId) -> Option<&WatchEntry> {
         self.watches.iter().find(|entry| &entry.id == id)
+    }
+
+    /// 这条词缀被收藏过没有。
+    pub fn is_favourite(&self, league: &str, mod_kind: &str, template: &str) -> bool {
+        self.favourite_index(league, mod_kind, template).is_some()
+    }
+
+    /// 收藏 / 取消收藏,返回"按完这一下,它现在是收藏的吗"。
+    ///
+    /// 一个方法管两个方向:界面上那颗按钮本来就只有一个,而"现在是不是收藏"
+    /// 只有设置这一份说了算 —— 分成 add/remove 两个方法的话,界面得先自己
+    /// 查一次再决定调哪个,那一步查错了就会出现"取消收藏之后还是星标"。
+    pub fn toggle_favourite(&mut self, league: &str, mod_kind: &str, template: &str) -> bool {
+        if let Some(index) = self.favourite_index(league, mod_kind, template) {
+            self.favourite_mods.remove(index);
+            return false;
+        }
+        self.favourite_mods.push(FavouriteMod {
+            league: league.to_string(),
+            mod_kind: mod_kind.to_string(),
+            template: template.to_string(),
+            added_at: chrono::Utc::now().to_rfc3339(),
+        });
+        true
+    }
+
+    fn favourite_index(&self, league: &str, mod_kind: &str, template: &str) -> Option<usize> {
+        self.favourite_mods.iter().position(|entry| {
+            entry.league == league && entry.mod_kind == mod_kind && entry.template == template
+        })
     }
 
     pub fn observation(&self, id: &ObservationId) -> Option<&ObservationEntry> {
@@ -853,6 +903,58 @@ mod settings_tests {
         assert_eq!(settings.observations[1].discover_interval_secs, 3_600);
         assert_eq!(settings.observations[1].recheck_interval_secs, 172_800);
         assert_eq!(settings.observations[1].sample_every, 4);
+    }
+
+    /// 收藏一条词缀:同一个联赛里再问就是"收藏过了",第二次按同一下就取消。
+    ///
+    /// 联赛是键的一部分:上个赛季"+# 生命"值不值得盯,和这个赛季没有关系。
+    #[test]
+    fn a_favourite_modifier_toggles_on_and_off_within_its_league() {
+        let mut settings = AppSettings::default();
+        assert!(!settings.is_favourite("Forbidden Rites", "explicit", "+# to maximum Life"));
+
+        assert!(settings.toggle_favourite("Forbidden Rites", "explicit", "+# to maximum Life"));
+        assert!(settings.is_favourite("Forbidden Rites", "explicit", "+# to maximum Life"));
+        assert_eq!(settings.favourite_mods.len(), 1);
+        assert!(
+            !settings.favourite_mods[0].added_at.is_empty(),
+            "收藏的时刻要记下来,不然排序只能靠运气"
+        );
+
+        // 别的联赛、别的类型、别的模板都不算同一条。
+        assert!(!settings.is_favourite("Standard", "explicit", "+# to maximum Life"));
+        assert!(!settings.is_favourite("Forbidden Rites", "implicit", "+# to maximum Life"));
+        assert!(!settings.is_favourite("Forbidden Rites", "explicit", "+# to Spirit"));
+
+        // 再按一下就是取消,而且不留空壳。
+        assert!(!settings.toggle_favourite("Forbidden Rites", "explicit", "+# to maximum Life"));
+        assert!(!settings.is_favourite("Forbidden Rites", "explicit", "+# to maximum Life"));
+        assert!(settings.favourite_mods.is_empty());
+    }
+
+    /// 老的 `settings.json` 里没有这个键,读出来该是一份空收藏,而不是
+    /// 整份设置读不出来 —— schema 版本还是 1。
+    #[test]
+    fn a_settings_file_without_favourites_still_loads() {
+        let store = temp_store("favourites-missing");
+        write_file(
+            &store,
+            r#"{"schema_version":1,"league":"Forbidden Rites","watches":[]}"#,
+        );
+        let loaded = store.load();
+        assert_eq!(loaded.status, LoadStatus::Loaded);
+        assert!(loaded.settings.favourite_mods.is_empty());
+
+        // 存回去再读一遍,收藏要原样留着。
+        let mut settings = loaded.settings;
+        settings.toggle_favourite("Forbidden Rites", "explicit", "#% increased Rarity");
+        store.save(&settings).expect("save");
+        assert_eq!(settings.favourite_mods.len(), 1);
+        assert_eq!(
+            store.load().settings.favourite_mods,
+            settings.favourite_mods
+        );
+        assert_eq!(store.load().settings.schema_version, CURRENT_SCHEMA_VERSION);
     }
 
     /// 货币走普通字符串、金额走千分整数 —— 手工看设置文件时要能读懂。

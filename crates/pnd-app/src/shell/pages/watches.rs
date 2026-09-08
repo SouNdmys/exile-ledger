@@ -27,6 +27,7 @@ use pnd_trade::{FETCH_POLICY, SEARCH_POLICY};
 use super::{Cell, TableContent, Tone, column, number_column};
 use crate::i18n::{self, Text};
 use crate::shell::link::{countdown_text, local_clock, local_hm};
+use crate::shell::pages;
 use crate::shell::{
     AppShell, Choice, ChoiceSelect, choice_select, field_label, field_row, hint, page_heading,
     panel, picker, table,
@@ -809,6 +810,46 @@ impl AppShell {
     /// 备注名那一格。留空的处理在 [`label_for`] 里。
     fn form_label(&self, search_id: &str, cx: &Context<Self>) -> String {
         label_for(&text_of(&self.watches_form.label, cx), search_id)
+    }
+
+    /// 市场观察那边递过来一份草稿 → 填进新增表单。
+    ///
+    /// 填完**什么都没发生**:表单退回"新增"模式,按不按那颗"新增"是用户
+    /// 自己的事。一条自动加进去的搜索会立刻开始花限速预算,而它是不是用户
+    /// 要的那条,只有他看一眼才知道。
+    pub(crate) fn prefill_add_form(
+        &mut self,
+        draft: pages::observations::WatchDraft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for (input, value) in [
+            (&self.watches_form.search, draft.search_id),
+            (&self.watches_form.label, draft.label),
+            (&self.watches_form.league, draft.league),
+            // 中位价算不出来时留空:凭空填一个数,用户按下新增就是照着它蹲。
+            (
+                &self.watches_form.cap,
+                draft.cap_milli.map(milli_text).unwrap_or_default(),
+            ),
+        ] {
+            input.update(cx, |state, cx| {
+                state.set_value(value, window, cx);
+            });
+        }
+        // 下拉里没有的货币(交易站上还有几十种)就别去动它:选不中会把
+        // 用户上一次挑的那个也一起清掉。
+        if currency_choices()
+            .iter()
+            .any(|choice| choice.stored_value() == draft.currency)
+        {
+            let currency = SharedString::from(draft.currency);
+            self.watches_form.currency.update(cx, |state, cx| {
+                state.set_selected_value(&currency, window, cx);
+            });
+        }
+        self.watches_form.editing = None;
+        self.watch_error.clear();
     }
 
     /// 表格里选中了一行 → 把那条搜索装进表单。
