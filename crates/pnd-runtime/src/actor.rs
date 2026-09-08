@@ -30,7 +30,8 @@ use pnd_storage::{
 use pnd_trade::live::{LiveConfig, MAX_LIVE_CONNECTIONS_PER_ACCOUNT};
 use pnd_trade::{
     BucketUsage, Budget, FETCH_LONG_WINDOW_REQUESTS, FETCH_LONG_WINDOW_SECS, MAX_FETCH_IDS,
-    SEARCH_LONG_WINDOW_REQUESTS, SEARCH_LONG_WINDOW_SECS, TradeClient, ggg_error, jwt_expiry,
+    SEARCH_LONG_WINDOW_REQUESTS, SEARCH_LONG_WINDOW_SECS, TradeClient, fetch_url, ggg_error,
+    jwt_expiry,
 };
 use thiserror::Error;
 
@@ -1920,6 +1921,15 @@ impl RuntimeActor {
         if let Some(runtime) = self.observations.get_mut(obs_id) {
             runtime.discover_pending = ids.chunks(batch).count();
         }
+        // 和回查那一行对着看:两边发的是同一种请求,形状也该看得见 ——
+        // "为什么这一路好好的、那一路一直砸"只有摆在一起才回答得了。
+        self.emit(RuntimeEvent::Log(format!(
+            "observation {}: fetching {} new listing(s) in {} batch(es), fetch url {} chars",
+            self.observation_label(obs_id),
+            ids.len(),
+            ids.chunks(batch).count(),
+            fetch_url(&ids[..ids.len().min(batch)], search_id).len()
+        )));
         for chunk in ids.chunks(batch) {
             self.gateway.submit(GatewayRequest {
                 // 按 id 对号的那一种:普通 fetch 的回信早把 `null` 那几格丢掉了,
@@ -2029,11 +2039,17 @@ impl RuntimeActor {
                 sweep_id,
                 chunk.iter().flat_map(|(_, asked)| asked.clone()).collect(),
             );
+            let ids: Vec<String> = chunk.iter().map(|(id, _)| id.clone()).collect();
+            // 回查这一批长什么样,是排查"为什么它总是砸而 discover 不砸"的
+            // 第一手材料 —— 光看 `last_error` 分不清是请求本身有问题
+            // (太长、id 太多)还是连接出的事。
+            self.emit(RuntimeEvent::Log(format!(
+                "observation recheck batch #{sweep_id}: {} listing(s), fetch url {} chars",
+                ids.len(),
+                fetch_url(&ids, &search_id).len()
+            )));
             self.gateway.submit(GatewayRequest {
-                kind: RequestKind::FetchByIds {
-                    ids: chunk.iter().map(|(id, _)| id.clone()).collect(),
-                    search_id,
-                },
+                kind: RequestKind::FetchByIds { ids, search_id },
                 priority: Priority::Background,
                 reply: self.replies.clone(),
                 tag: RequestTag::sweep(sweep_id, OBSERVE_RECHECK_LABEL),
@@ -2097,6 +2113,13 @@ impl RuntimeActor {
         let Some(asked) = self.sweeps.remove(&sweep_id) else {
             return;
         };
+        // 这一句必须进日志,不能只躺在 `last_error` 里:观察页上那一格是
+        // 一行字,滚过去就没了,而"回查一直在砸"这件事只有攒成一串
+        // 才看得出来。主人的六小时里 gone 一直是 0,日志里却一个字都没有。
+        self.emit(RuntimeEvent::Log(format!(
+            "observation recheck batch #{sweep_id} failed for {} listing(s): {error}",
+            asked.len()
+        )));
         for obs_id in asked
             .iter()
             .map(|due| due.obs_id.clone())
@@ -2203,11 +2226,23 @@ impl RuntimeActor {
     /// (它本来就是十分钟一次的慢节奏,而 429 / Cloudflare 那两种真该停手的
     /// 情况,网关在自己那一层已经拦住了)。
     fn on_discover_failed(&mut self, obs_id: &ObservationId, error: &GatewayError) {
+        let label = self.observation_label(obs_id);
         if let Some(runtime) = self.observations.get_mut(obs_id) {
             runtime.discover_in_flight = false;
             runtime.status.last_error = Some(error.to_string());
         }
+        self.emit(RuntimeEvent::Log(format!(
+            "observation {label}: the discover search failed: {error}"
+        )));
         self.emit_observation_status(obs_id);
+    }
+
+    /// 日志里认得出来的那个名字。观察被删掉了就退回它的 id ——
+    /// 一条日志不该因为找不到名字就消失。
+    fn observation_label(&self, obs_id: &ObservationId) -> String {
+        self.observations
+            .get(obs_id)
+            .map_or_else(|| obs_id.to_string(), |runtime| runtime.entry.label.clone())
     }
 
     fn on_observe_reply(&mut self, obs_id: &ObservationId, label: &str, kind: ReplyKind, now: i64) {
@@ -2230,9 +2265,13 @@ impl RuntimeActor {
                 }
             }
             ReplyKind::FetchByIds(Err(error)) => {
+                let label = self.observation_label(obs_id);
                 if let Some(runtime) = self.observations.get_mut(obs_id) {
                     runtime.status.last_error = Some(error.to_string());
                 }
+                self.emit(RuntimeEvent::Log(format!(
+                    "observation {label}: a first-look fetch failed: {error}"
+                )));
                 if from_live {
                     self.emit_observation_status(obs_id);
                 } else {
@@ -3068,6 +3107,12 @@ mod actor_tests {
         whisper_html: bool,
         /// 设了就让 whisper 连发都发不出去(断网、TLS 挂了)。
         whisper_error: Option<String>,
+        /// 设了就让每次 fetch 都连不上 —— 主人 2026-09-08 早上看到的
+        /// `io: unexpected end of file` 就是这一类:请求死在 TLS 握手上,
+        /// 一个 HTTP 字节都没发出去。
+        fetch_error: Option<String>,
+        /// 同上,只不过砸的是 search。
+        search_error: Option<String>,
         /// fetch 回来的挂单带不带 hideout_token(真实世界里取决于带没带 cookie)。
         hideout_token: Option<String>,
         /// fetch 回来的卖家在不在线。跟 hideout_token 没关系:即刻购买的货
@@ -3184,12 +3229,19 @@ mod actor_tests {
             body_json: &str,
             _session: Option<&str>,
         ) -> Result<TradeResponse, pnd_trade::TransportError> {
-            let (rules, ids) = {
+            let (rules, ids, error) = {
                 let mut log = self.log.lock().unwrap();
                 log.searches += 1;
                 log.search_bodies.push(body_json.to_string());
-                (log.rate_rules.clone(), log.search_ids.clone())
+                (
+                    log.rate_rules.clone(),
+                    log.search_ids.clone(),
+                    log.search_error.clone(),
+                )
             };
+            if let Some(error) = error {
+                return Err(pnd_trade::TransportError::Unreachable(error));
+            }
             let ids = ids.unwrap_or_else(|| vec!["one".to_string(), "two".to_string()]);
             let quoted: Vec<String> = ids.iter().map(|id| format!("\"{id}\"")).collect();
             let body = format!(
@@ -3222,7 +3274,7 @@ mod actor_tests {
             _search_id: &str,
             _session: Option<&str>,
         ) -> Result<TradeResponse, pnd_trade::TransportError> {
-            let (token, offline, nothing, price, gone, mods) = {
+            let (token, offline, nothing, price, gone, mods, error) = {
                 let mut log = self.log.lock().unwrap();
                 log.fetches.push(ids.to_vec());
                 (
@@ -3232,8 +3284,12 @@ mod actor_tests {
                     log.price_divine,
                     log.gone_ids.clone(),
                     log.item_mods.clone(),
+                    log.fetch_error.clone(),
                 )
             };
+            if let Some(error) = error {
+                return Err(pnd_trade::TransportError::Unreachable(error));
+            }
             if nothing {
                 return ok(r#"{"result":[]}"#);
             }
@@ -5520,5 +5576,130 @@ mod actor_tests {
         assert_eq!(store.observation_summary(&one).unwrap().gone, 0);
         assert_eq!(store.observation_summary(&two).unwrap().gone, 1);
         remove_db(&db);
+    }
+
+    /// 观察这条路上砸了的请求必须**进日志**,不能只写在状态格里。
+    ///
+    /// 2026-09-08 早上主人的程序跑了六个小时,gone 一直是 0,状态格里
+    /// 挂着一句 `io: unexpected end of file` —— 而 `app.log` 里一个字都没有。
+    /// 状态格是一行会被下一轮盖掉的字,日志才是能翻回去看的东西。
+    #[test]
+    fn a_failed_observation_fetch_says_so_in_the_log() {
+        let (transport, log) = FakeTrade::new();
+        log.lock().unwrap().fetch_error = Some("io: unexpected end of file".to_string());
+        let (settings, _obs_id) = observe_settings("Choir of the Storm");
+        let db = temp_db("failure-log");
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::new(db.clone()), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        wait_for(
+            &handle,
+            &mut seen,
+            |event| {
+                matches!(event, RuntimeEvent::Log(message)
+                    if message.contains("Choir of the Storm")
+                        && message.contains("unexpected end of file"))
+            },
+            "a log line naming the observation and the transport error",
+        );
+        drop(handle);
+        remove_db(&db);
+    }
+
+    /// 兜底轮询的那一次 search 砸了也一样:状态格之外还要有一行日志。
+    #[test]
+    fn a_failed_discover_search_says_so_in_the_log() {
+        let (transport, log) = FakeTrade::new();
+        log.lock().unwrap().search_error = Some("io: unexpected end of file".to_string());
+        let (settings, _obs_id) = observe_settings("Choir of the Storm");
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::in_memory(), transport).unwrap();
+
+        let mut seen = Vec::new();
+        wait_for(
+            &handle,
+            &mut seen,
+            |event| {
+                matches!(event, RuntimeEvent::Log(message)
+                    if message.contains("Choir of the Storm")
+                        && message.contains("discover search failed")
+                        && message.contains("unexpected end of file"))
+            },
+            "a log line for the failed discover search",
+        );
+        drop(handle);
+    }
+
+    /// 回查那一批砸了也一样要进日志,而且要说清是几条挂单没查成。
+    #[test]
+    fn a_failed_recheck_batch_says_so_in_the_log() {
+        let (transport, log) = FakeTrade::new();
+        let (settings, obs_id) = observe_settings("Choir of the Storm");
+        let db = temp_db("recheck-failure-log");
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::new(db.clone()), transport)
+                .unwrap();
+
+        // 先让第一轮 discover 把两条挂单记进库(这一轮的 fetch 要成功)。
+        let mut seen = Vec::new();
+        wait_for(
+            &handle,
+            &mut seen,
+            |event| matches!(event, RuntimeEvent::ObservationChanged { .. }),
+            "the first discover to land",
+        );
+        // 然后把网掐了,再点"立刻回查"。
+        log.lock().unwrap().fetch_error = Some("io: unexpected end of file".to_string());
+        handle
+            .try_send(RuntimeCommand::RecheckNow {
+                obs_id: obs_id.clone(),
+            })
+            .unwrap();
+
+        wait_for(
+            &handle,
+            &mut seen,
+            |event| {
+                matches!(event, RuntimeEvent::Log(message)
+                    if message.contains("recheck batch")
+                        && message.contains("failed for 2 listing(s)")
+                        && message.contains("unexpected end of file"))
+            },
+            "a log line for the failed recheck batch",
+        );
+        drop(handle);
+        remove_db(&db);
+    }
+
+    /// 回查这一轮能问几条挂单,永远至少凑得满一批。
+    ///
+    /// 主人那台机器上正是最挤的那种配置:两条观察分同一份抓取额度,
+    /// 一分钟扫一次 —— `499 / 2 / 2 = 124`,再除 360 轮就除没了。除没了
+    /// 不能变成"这一轮一条也不问",不然在册的挂单永远等不到人回头看它。
+    #[test]
+    fn the_recheck_cap_is_never_smaller_than_one_batch() {
+        // 主人那份配置,原样代进去。
+        assert_eq!(
+            fetch_listing_cap(2, SWEEP_INTERVAL_SECS, 499, FETCH_LONG_WINDOW_SECS, 10),
+            10,
+            "两条观察 + 一分钟一扫,一轮该问满十条"
+        );
+        // 同一份额度分给兜底轮询(10 分钟一轮)就是 30 —— 主人日志里那句
+        // "can only afford 30" 说的就是它,顺手把两条算式钉在一起。
+        assert_eq!(
+            fetch_listing_cap(2, 600, 499, FETCH_LONG_WINDOW_SECS, 10),
+            30
+        );
+        // 额度被别的请求吃光了也一样:一轮至少一批,不然这条观察就死了。
+        assert_eq!(
+            fetch_listing_cap(2, SWEEP_INTERVAL_SECS, 0, FETCH_LONG_WINDOW_SECS, 10),
+            10
+        );
+        assert_eq!(
+            fetch_listing_cap(50, SWEEP_INTERVAL_SECS, 1, FETCH_LONG_WINDOW_SECS, 1),
+            1
+        );
     }
 }

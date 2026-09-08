@@ -42,6 +42,13 @@ const IDLE_WAIT: Duration = Duration::from_secs(1);
 /// 就会变成一条 100% 占 CPU 的空转线程。
 const MIN_WAIT: Duration = Duration::from_millis(50);
 
+/// "压根没连上"之后隔多久再试一次。
+///
+/// 一秒只为一件事:别在网络正抽风的那一瞬间连着捅两下。真正解决问题的是
+/// **换一条连接** —— 握手砸了的那条连接不会进 ureq 的连接池,所以下一次
+/// 一定是新开的。
+const TRANSPORT_RETRY_DELAY_SECS: i64 = 1;
+
 // ---------------------------------------------------------------------
 // 传输层抽象
 // ---------------------------------------------------------------------
@@ -419,6 +426,9 @@ struct Pending {
     not_before: i64,
     /// 已经因为 429 重试过几次,退避的指数就是它。
     attempts: u32,
+    /// 已经因为"连都没连上"重发过一次。和 `attempts` 分开记:429 是服务端
+    /// 说"你太快了",连不上是这封请求压根没上过网,两件事的次数不该混着算。
+    retried_transport: bool,
 }
 
 /// 队列里挑一封现在就能发的:先看能不能发(时间到了、限速放行了),
@@ -469,6 +479,16 @@ fn next_allowed_in(limiter: &mut RateLimiter, policy: &str, now: i64) -> Option<
 
 /// 超过一天的等待一律当"不知道"。真实的限速窗口最长 6 小时。
 const MAX_REPORTED_WAIT_SECS: i64 = 86_400;
+
+/// 这封请求重发一次是不是安全的。
+///
+/// search / fetch / 会话检查都只是"问一句",问两遍和问一遍的后果一模一样,
+/// 所以连不上的时候可以再试。**whisper 不行**:它是全程序唯一一个会在游戏里
+/// 留下痕迹的请求(给别人发传送邀请),而"连不上"并不能证明服务端没收到。
+/// 宁可少发一次让用户自己再点一下,也不能替他发两次。
+fn is_read_only(kind: &RequestKind) -> bool {
+    !matches!(kind, RequestKind::Whisper { .. })
+}
 
 /// 这个响应是不是 Cloudflare 的拦截页;是的话整条队列停到什么时候。
 ///
@@ -590,6 +610,7 @@ impl TradeGateway {
                     sequence,
                     not_before: 0,
                     attempts: 0,
+                    retried_transport: false,
                 });
             }
             GatewayMessage::SetSession(session) => self.session = session,
@@ -684,6 +705,18 @@ impl TradeGateway {
             Err(error) => {
                 // 连头都没拿到,只销掉在途计数,已知的限速信息原样留着。
                 self.limiter.finish_request(ticket, None, done_at);
+                if is_read_only(&pending.request.kind) && !pending.retried_transport {
+                    pending.retried_transport = true;
+                    pending.not_before = done_at + TRANSPORT_RETRY_DELAY_SECS;
+                    self.emit(GatewayEvent::Log(format!(
+                        "{policy}: the request never reached the trade site ({error}) — \
+                         trying once more on a new connection"
+                    )));
+                    // 保留原来的 sequence,和 429 重排队一样:它仍然排在
+                    // 同优先级的最前面,不会被后来的请求插队。
+                    self.queue.push(pending);
+                    return;
+                }
                 self.reply(pending, GatewayError::Transport(error.to_string()));
                 return;
             }
@@ -853,7 +886,196 @@ fn error_reply(kind: &RequestKind, error: GatewayError) -> ReplyKind {
 
 #[cfg(test)]
 mod gateway_tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    /// 一个"头几封请求连不上、之后正常"的假交易站。
+    ///
+    /// 复现的是 2026-09-08 早上那条错误:`io: unexpected end of file` ——
+    /// rustls 在**握手途中**读到 EOF(ureq 是连上就立刻握手的),也就是说
+    /// 那封请求一个 HTTP 字节都没发出去。
+    struct FlakyTrade {
+        fails_left: Mutex<usize>,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl FlakyTrade {
+        fn new(fails: usize) -> (Box<FlakyTrade>, Arc<Mutex<usize>>) {
+            let calls = Arc::new(Mutex::new(0));
+            (
+                Box::new(FlakyTrade {
+                    fails_left: Mutex::new(fails),
+                    calls: Arc::clone(&calls),
+                }),
+                calls,
+            )
+        }
+
+        fn answer(&self) -> Result<TradeResponse, TransportError> {
+            *self.calls.lock().unwrap() += 1;
+            let mut left = self.fails_left.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                return Err(TransportError::Unreachable(
+                    "io: unexpected end of file".to_string(),
+                ));
+            }
+            Ok(TradeResponse {
+                status: 200,
+                body: br#"{"result":[]}"#.to_vec(),
+                rate: None,
+                looks_like_html: false,
+            })
+        }
+    }
+
+    impl TradeTransport for FlakyTrade {
+        fn search(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<TradeResponse, TransportError> {
+            self.answer()
+        }
+        fn fetch(
+            &self,
+            _: &[String],
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<TradeResponse, TransportError> {
+            self.answer()
+        }
+        fn whisper(&self, _: &str, _: &str, _: &str) -> Result<TradeResponse, TransportError> {
+            self.answer()
+        }
+    }
+
+    /// 一个不起线程的网关:测试直接调 `execute`,一封一封地看它怎么处置。
+    fn offline_gateway(
+        transport: Box<dyn TradeTransport>,
+    ) -> (TradeGateway, Receiver<GatewayEvent>) {
+        let (events, rx) = channel();
+        (
+            TradeGateway {
+                transport,
+                limiter: RateLimiter::default(),
+                session: Some("cookie".to_string()),
+                events,
+                whisper_policy: WHISPER_POLICY_PLACEHOLDER.to_string(),
+                hold_until: None,
+                queue: Vec::new(),
+                next_sequence: 0,
+            },
+            rx,
+        )
+    }
+
+    fn queued(kind: RequestKind) -> (Pending, Receiver<GatewayReply>) {
+        let (tx, rx) = channel();
+        (
+            Pending {
+                request: GatewayRequest {
+                    kind,
+                    priority: Priority::Background,
+                    reply: tx,
+                    tag: RequestTag::sweep(7, "observe-recheck"),
+                },
+                sequence: 0,
+                not_before: 0,
+                attempts: 0,
+                retried_transport: false,
+            },
+            rx,
+        )
+    }
+
+    /// 一封读请求死在连接上(还没拿到任何响应字节),要再试一次。
+    ///
+    /// 为什么这条最要紧:回查是一分钟一次的独立时间线,ureq 的连接池
+    /// 只留 15 秒,所以**每一封回查都是一次全新的 TLS 握手** —— 握手一失手,
+    /// 整批挂单这一分钟就白等了,而且没有任何东西会把它补回来。
+    /// 兜底轮询那一轮是 1 次 search + 3 次 fetch 挤在一秒里,复用同一条连接,
+    /// 所以同样的网络抖动几乎砸不到它 —— 主人那六个小时里 discover 一直好好的,
+    /// 回查一条都没成,差别就在这儿。
+    #[test]
+    fn a_read_request_that_dies_on_the_connection_gets_one_more_try() {
+        let (transport, calls) = FlakyTrade::new(1);
+        let (mut gateway, _events) = offline_gateway(transport);
+        let (pending, replies) = queued(RequestKind::FetchByIds {
+            ids: vec!["a".to_string()],
+            search_id: "q".to_string(),
+        });
+
+        gateway.execute(pending, 1_000);
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert!(
+            replies.try_recv().is_err(),
+            "第一次连不上还不算结论,不该现在就回信说失败"
+        );
+        assert_eq!(gateway.queue.len(), 1, "这一批该回到队列里再试一次");
+        assert!(gateway.queue[0].retried_transport, "重试只给一次,得记下来");
+
+        let retry = gateway.queue.remove(0);
+        gateway.execute(retry, 1_001);
+        assert_eq!(*calls.lock().unwrap(), 2);
+        let reply = replies.try_recv().expect("重试之后该有回信了");
+        assert!(
+            matches!(reply.kind, ReplyKind::FetchByIds(Ok(_))),
+            "{:?}",
+            reply.kind
+        );
+        assert!(gateway.queue.is_empty());
+    }
+
+    /// 再试一次还是连不上就认了:上层收到失败,下一轮扫描会重新问这批挂单。
+    #[test]
+    fn a_second_connection_failure_is_reported_instead_of_retried_forever() {
+        let (transport, calls) = FlakyTrade::new(9);
+        let (mut gateway, _events) = offline_gateway(transport);
+        let (pending, replies) = queued(RequestKind::FetchByIds {
+            ids: vec!["a".to_string()],
+            search_id: "q".to_string(),
+        });
+
+        gateway.execute(pending, 1_000);
+        let retry = gateway.queue.remove(0);
+        gateway.execute(retry, 1_001);
+
+        assert_eq!(*calls.lock().unwrap(), 2, "最多两次,不能没完没了");
+        assert!(gateway.queue.is_empty());
+        let reply = replies.try_recv().expect("该回一封失败的信");
+        match reply.kind {
+            ReplyKind::FetchByIds(Err(error)) => {
+                assert!(
+                    error.to_string().contains("unexpected end of file"),
+                    "{error}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// whisper 不重试。它是唯一一个会在**游戏里**留下痕迹的请求(传送邀请),
+    /// 而"连不上"并不能证明服务端没收到 —— 宁可少发一次,也不能发两次。
+    #[test]
+    fn a_whisper_is_never_retried_behind_the_users_back() {
+        let (transport, calls) = FlakyTrade::new(1);
+        let (mut gateway, _events) = offline_gateway(transport);
+        let (pending, replies) = queued(RequestKind::Whisper {
+            token: "t".to_string(),
+            referer: "r".to_string(),
+        });
+
+        gateway.execute(pending, 1_000);
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert!(gateway.queue.is_empty(), "whisper 不回队列");
+        assert!(matches!(
+            replies.try_recv().expect("回信").kind,
+            ReplyKind::Whisper(Err(GatewayError::Transport(_)))
+        ));
+    }
 
     fn pending(priority: Priority, sequence: u64, not_before: i64, kind: RequestKind) -> Pending {
         // 这几个测试只排队、不执行,所以没人会往这个回信地址发东西,
@@ -869,6 +1091,7 @@ mod gateway_tests {
             sequence,
             not_before,
             attempts: 0,
+            retried_transport: false,
         }
     }
 

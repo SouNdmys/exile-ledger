@@ -28,7 +28,8 @@
 //! cargo run -p pnd-runtime --bin trade_probe -- \
 //!     --observe-run --search <搜索URL或id> --minutes 1 \
 //!     [--live --session <POESESSID>] [--sample-every 1] \
-//!     [--discover-seconds 300] [--recheck-seconds 3600]
+//!     [--discover-seconds 300] [--recheck-seconds 3600] \
+//!     [--recheck-after-secs 0]
 //! ```
 //!
 //! `--observe-run` 和 `--watch` 一样,一行判定逻辑都没有:它造一份带一条
@@ -40,6 +41,11 @@
 //! 一分钟的窗口里等不到阶梯上最快的那一档(10 分钟),所以第一轮 discover
 //! 一跑完,探针就发一条 `RecheckNow`:这样一趟就能看到"新挂单入库 → 回查 →
 //! 判定"整条链路。花掉的请求是 1 次 search + 新面孔那几批 fetch + 回查那几批。
+//!
+//! `--recheck-after-secs N` 在这两步之间**故意空转 N 秒**。真程序里回查是
+//! 一分钟一次的独立时间线,所以那一批 fetch 几乎总是"安静了一分钟之后的
+//! 第一封请求";而探针默认是 discover 刚落地就接着发,连接还热着。要复现
+//! "程序里回查一直失败、探针里一次就成"这类差别,就得把这段安静补上。
 //!
 //! 加上 `--live`(要 `--session`)就再开一条 WebSocket:挂单一上架就被推过来,
 //! 当场去抓详情 —— 抓回来是 null 的那些就是"我们还没看它第一眼就被买走了",
@@ -108,7 +114,7 @@ trade_probe --watch --minutes 3 [--poll-seconds 60] --search <url|id> [--search 
 trade_probe --observe --search <url|id> [--league \"Forbidden Rites\"]\n       \
 trade_probe --observe-run --search <url|id> [--minutes 1] \
 [--live --session <POESESSID>] [--sample-every 1] \
-[--discover-seconds 300] [--recheck-seconds 3600]";
+[--discover-seconds 300] [--recheck-seconds 3600] [--recheck-after-secs 0]";
 
 /// 蹲价模式里多久抽一次事件。事件通道是无界的,抽得慢只是屏幕上晚一点看到,
 /// 不会丢。
@@ -629,6 +635,10 @@ fn run_observe_run(args: &Args) -> Result<(), String> {
         settings.observations[0].sample_every
     );
     println!("database      {}", db_path.display());
+    println!(
+        "recheck after {} s of deliberate quiet once the first discover lands",
+        args.recheck_after_secs
+    );
     println!("running for   {} minutes\n", args.minutes);
 
     let handle = RuntimeHandle::start(settings, RuntimePaths::new(db_path.clone()))
@@ -641,29 +651,58 @@ fn run_observe_run(args: &Args) -> Result<(), String> {
     // 等不到。第一轮 discover 一落地就手动排一次 —— 这条命令正是界面上那个
     // "立刻回查"按钮发的东西(把在册的挂单全部推到此刻到期)。
     let mut recheck_asked = false;
+    let mut recheck_at: Option<Instant> = None;
+    // 最后一条状态行留着:`last_error` 是界面上那一格显示的东西,跑完要原样摆出来。
+    let mut last_status: Option<ObservationStatus> = None;
     while Instant::now() < deadline {
         match handle.try_next_event() {
             Some(event) => {
-                if !recheck_asked && matches!(event, RuntimeEvent::ObservationChanged { .. }) {
-                    recheck_asked = true;
+                if recheck_at.is_none()
+                    && !recheck_asked
+                    && matches!(event, RuntimeEvent::ObservationChanged { .. })
+                {
+                    recheck_at =
+                        Some(Instant::now() + Duration::from_secs(args.recheck_after_secs));
                     println!(
-                        "{} observe   the first discover landed — asking for a recheck now",
-                        stamp()
+                        "{} observe   the first discover landed — going quiet for {} s, \
+                         then asking for a recheck",
+                        stamp(),
+                        args.recheck_after_secs
                     );
-                    handle
-                        .try_send(RuntimeCommand::RecheckNow {
-                            obs_id: obs_id.clone(),
-                        })
-                        .map_err(|error| error.to_string())?;
+                }
+                if let RuntimeEvent::ObservationStatus { status, .. } = &event {
+                    last_status = Some(status.clone());
                 }
                 print_event(&event, &labels);
             }
             None => sleep(DRAIN_INTERVAL),
         }
+        if !recheck_asked && recheck_at.is_some_and(|at| Instant::now() >= at) {
+            recheck_asked = true;
+            println!("{} observe   asking for a recheck now", stamp());
+            handle
+                .try_send(RuntimeCommand::RecheckNow {
+                    obs_id: obs_id.clone(),
+                })
+                .map_err(|error| error.to_string())?;
+        }
     }
     // actor 先走干净,再去读它写的那个库。
     drop(handle);
     println!("\n{} observe window finished.", stamp());
+    println!(
+        "last status   {}",
+        last_status
+            .as_ref()
+            .map_or_else(|| "(none arrived)".to_string(), describe_observation)
+    );
+    println!(
+        "last error    {}",
+        last_status
+            .as_ref()
+            .and_then(|status| status.last_error.clone())
+            .unwrap_or_else(|| "(none — nothing failed)".to_string())
+    );
 
     let report = observation_report(&db_path, &obs_id);
     // 库故意留在原地:聚合表要是空的,里面存着的物品原文就是唯一的线索。
@@ -1435,6 +1474,9 @@ struct Args {
     /// 跑的是"最勤能多勤",而 `normalize` 会兜住不让它更勤。
     discover_seconds: u64,
     recheck_seconds: u64,
+    /// 第一轮 discover 落地之后,先安静多少秒再发 `RecheckNow`。
+    /// 真程序里的回查是"安静一分钟之后的第一封请求",默认的 0 秒不是。
+    recheck_after_secs: u64,
     minutes: u64,
     poll_seconds: u64,
     /// `--hideout <alert_id>`:蹲价模式下发一条 `TravelToHideout` 命令。
@@ -1464,6 +1506,7 @@ impl Args {
         let mut sample_every: u32 = 1;
         let mut discover_seconds = pnd_settings::MIN_DISCOVER_INTERVAL_SECS;
         let mut recheck_seconds = pnd_settings::MIN_RECHECK_INTERVAL_SECS;
+        let mut recheck_after_secs: u64 = 0;
         let mut minutes: u64 = 3;
         let mut poll_seconds: u64 = 300;
         let mut hideout: Option<i64> = None;
@@ -1494,6 +1537,12 @@ impl Args {
                     let raw = value()?;
                     recheck_seconds = raw.parse::<u64>().map_err(|_| {
                         format!("--recheck-seconds wants a whole number, got {raw:?}")
+                    })?;
+                }
+                "--recheck-after-secs" => {
+                    let raw = value()?;
+                    recheck_after_secs = raw.parse::<u64>().map_err(|_| {
+                        format!("--recheck-after-secs wants a whole number, got {raw:?}")
                     })?;
                 }
                 "--minutes" => {
@@ -1565,6 +1614,7 @@ impl Args {
             sample_every,
             discover_seconds,
             recheck_seconds,
+            recheck_after_secs,
             minutes,
             // 低于 60 秒对交易站不礼貌;`AppSettings::normalize` 也会兜这一下,
             // 这里先兜是为了打印出来的数就是真正会用的数。
