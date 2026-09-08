@@ -15,6 +15,6 @@ pub use observe::{
 pub use price::{Currency, CurrencyRates, Price, PriceCap, Verdict, judge, to_divine_milli};
 pub use search_ref::{
     SearchIdError, SearchRef, decode_search_id, default_label_for, encode_league_path,
-    live_page_url, parse_search_reference, search_page_url, search_request_body,
-    with_seller_filter, with_sort,
+    encode_search_id, live_page_url, parse_search_reference, search_page_url, search_request_body,
+    with_seller_filter, with_sort, with_stat_filter,
 };

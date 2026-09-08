@@ -866,6 +866,37 @@ impl WatchStore {
         Ok(out)
     }
 
+    /// 这条词缀模板在交易站上的筛选 id(`explicit.stat_1671376347`)。
+    ///
+    /// 为什么要回原文里翻:`observed_mods` 存的是模板,那是给人看的;而
+    /// "一键蹲价"要拼的是一格词缀筛选,交易站认的是 id。id 只出现在每条挂单
+    /// 的物品原文里(每条词缀对象上的 `hash`),库里没有第二处存着它。
+    ///
+    /// 只翻最近 [`STAT_ID_SCAN_LIMIT`] 条:一条跑了几天的观察攒着上千条原文,
+    /// 而同一条词缀在每件货身上是同一个 id —— 翻到就够了,不必扫全表。
+    pub fn stat_id_for_template(
+        &self,
+        obs_id: &ObservationId,
+        mod_kind: &str,
+        template: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT item_json FROM observed_listings
+             WHERE obs_id = ?1 AND item_json <> ''
+             ORDER BY first_seen_at DESC, listing_id ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![obs_id.as_str(), i64::from(STAT_ID_SCAN_LIMIT)],
+            |row| row.get::<_, String>(0),
+        )?;
+        for row in rows {
+            if let Some(id) = stat_id_in_item_json(&row?, mod_kind, template) {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
     /// 按词缀模板聚合:这条观察攒下来的全部答案就在这张表里。
     ///
     /// `min_samples` 是"至少见过几条带这条词缀的货才值得摆出来" —— 三条货
@@ -1215,6 +1246,33 @@ pub fn observed_mods_from_item_json(item_json: &str) -> Vec<ObservedMod> {
     out
 }
 
+/// 找 stat id 时最多翻几条物品原文。
+///
+/// 50 是"够用又不至于扫全表":同一条词缀在每件货身上都是同一个 id,而
+/// 最近这几十条货本来就是聚合表上那些行的主要来源。
+pub const STAT_ID_SCAN_LIMIT: u32 = 50;
+
+/// 一件货的原文里,某条词缀模板对应的筛选 id。
+///
+/// 交易站给的 `hash` 长这样:`stat.explicit.stat_1671376347`,而搜索请求里的
+/// 词缀筛选写的是 `explicit.stat_1671376347` —— 差的就是开头那个 `stat.`。
+/// `|` 后面那一段(附魔的取值档,`…|21380`)是 id 的一部分,原样留着。
+#[must_use]
+pub fn stat_id_in_item_json(item_json: &str, mod_kind: &str, template: &str) -> Option<String> {
+    let item: serde_json::Value = serde_json::from_str(item_json).ok()?;
+    let key = MOD_ARRAYS
+        .iter()
+        .find(|(_, kind)| *kind == mod_kind)
+        .map(|(key, _)| *key)?;
+    item.get(key)?
+        .as_array()?
+        .iter()
+        .find(|entry| mod_display_line(entry).is_some_and(|line| mod_template(line) == template))
+        .and_then(|entry| entry.get("hash"))
+        .and_then(serde_json::Value::as_str)
+        .map(|hash| hash.strip_prefix("stat.").unwrap_or(hash).to_string())
+}
+
 /// 词缀数组里的一格 → 那行显示文本。
 ///
 /// **poe2 的交易站给的是对象**,显示文本在 `description` 里,旁边还跟着
@@ -1312,6 +1370,29 @@ mod observe_tests {
 
     fn divine(amount_milli: i64) -> Option<Price> {
         Some(Price::new(amount_milli, Currency::Divine))
+    }
+
+    /// 交易站真给的那种物品原文:词缀是对象,显示文本在 `description`,
+    /// stat id 在 `hash`。
+    const CHOIR_ITEM_JSON: &str = r#"{"name":"Choir of the Storm","typeLine":"Lapis Amulet",
+         "rarity":"Unique","ilvl":81,
+         "implicitMods":[{"description":"+15 to [Dexterity|Dexterity]",
+            "domain":"implicit","hash":"stat.implicit.stat_3261801346",
+            "mods":[{"level":10,"magnitudes":[{"max":"15","min":"10"}]}]}],
+         "explicitMods":[
+           {"description":"+64% to [Resistances|Lightning Resistance]",
+            "domain":"explicit","hash":"stat.explicit.stat_1671376347",
+            "mods":[{"level":69,"magnitudes":[{"max":"100","min":"50"}]}]}],
+         "enchantMods":[{"description":"Allocates [criticals39|Preemptive Strike]",
+            "domain":"enchant","hash":"stat.enchant.stat_2954116742|21380",
+            "mods":[{"magnitudes":[{"max":1,"min":1}]}]}]}"#;
+
+    /// 一条挂单摘要,物品原文由调用方给 —— stat id 只存在于原文里。
+    fn listing_with_item_json(id: &str, item_json: &str) -> ListingSummary {
+        ListingSummary {
+            item_json: item_json.to_string(),
+            ..listing(id, divine(1_000), &[])
+        }
     }
 
     /// 建表语句必须能在同一个库上跑第二遍:每次开库都会执行它。
@@ -2249,6 +2330,106 @@ mod observe_tests {
         assert!(
             observed_mods_from_item_json(r#"{"explicitMods":[{"hash":"stat.explicit.x"}]}"#)
                 .is_empty()
+        );
+    }
+
+    /// 一键蹲价要的那个 stat id:从存下来的物品原文里,把这条词缀模板对应的
+    /// `hash` 捞出来。
+    ///
+    /// 库里 `observed_mods` 只存了模板(`+#% to Lightning Resistance`),而交易站
+    /// 的词缀筛选认的是 id(`explicit.stat_1671376347`)—— 那个 id 就跟在物品原文
+    /// 里每条词缀的 `hash` 上,所以只能回原文里找。
+    #[test]
+    fn a_stat_id_comes_out_of_the_stored_item_json() {
+        let store = store();
+        let id = obs("o-1");
+        store
+            .record_seen(
+                &id,
+                &listing_with_item_json("amulet", CHOIR_ITEM_JSON),
+                1_000,
+            )
+            .expect("record");
+
+        assert_eq!(
+            store
+                .stat_id_for_template(&id, "explicit", "+#% to Lightning Resistance")
+                .expect("read"),
+            Some("explicit.stat_1671376347".to_string()),
+            "`stat.` 那一截要去掉:交易站的筛选 id 不带它"
+        );
+        // `|` 后面那一段(附魔的取值档)原样留着。
+        assert_eq!(
+            store
+                .stat_id_for_template(&id, "enchant", "Allocates Preemptive Strike")
+                .expect("read"),
+            Some("enchant.stat_2954116742|21380".to_string())
+        );
+        assert_eq!(
+            store
+                .stat_id_for_template(&id, "implicit", "+# to Dexterity")
+                .expect("read"),
+            Some("implicit.stat_3261801346".to_string())
+        );
+
+        // 类型对不上、模板对不上、观察对不上,都不该硬凑一个出来。
+        assert_eq!(
+            store
+                .stat_id_for_template(&id, "implicit", "+#% to Lightning Resistance")
+                .expect("read"),
+            None
+        );
+        assert_eq!(
+            store
+                .stat_id_for_template(&id, "explicit", "+# to maximum Life")
+                .expect("read"),
+            None
+        );
+        assert_eq!(
+            store
+                .stat_id_for_template(&obs("o-2"), "explicit", "+#% to Lightning Resistance")
+                .expect("read"),
+            None
+        );
+    }
+
+    /// 只翻最近的几十条:一条跑了几天的观察攒着上千条原文,而这个问题
+    /// ("这条词缀的 id 是什么")最近那几条就答得上。
+    #[test]
+    fn the_stat_id_lookup_reads_the_newest_listings_first() {
+        let store = store();
+        let id = obs("o-1");
+        // 老的那条身上没有这条词缀,新的那条有。翻不到 50 条之外去,
+        // 所以只有"新的在前"才找得着。
+        for index in 0..60 {
+            store
+                .record_seen(
+                    &id,
+                    &listing_with_item_json(
+                        &format!("old-{index:02}"),
+                        r#"{"explicitMods":[{"description":"+80 to maximum Life",
+                             "hash":"stat.explicit.stat_3299347043"}]}"#,
+                    ),
+                    1_000 + i64::from(index),
+                )
+                .expect("record");
+        }
+        store
+            .record_seen(&id, &listing_with_item_json("new", CHOIR_ITEM_JSON), 9_000)
+            .expect("record");
+
+        assert_eq!(
+            store
+                .stat_id_for_template(&id, "explicit", "+#% to Lightning Resistance")
+                .expect("read"),
+            Some("explicit.stat_1671376347".to_string())
+        );
+        // 老货身上那条照样找得到(它就在最近 50 条里)。
+        assert_eq!(
+            store
+                .stat_id_for_template(&id, "explicit", "+# to maximum Life")
+                .expect("read"),
+            Some("explicit.stat_3299347043".to_string())
         );
     }
 

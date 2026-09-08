@@ -6,9 +6,11 @@
 //! 再 POST 回去。用户在网页上筛好条件,粘一次地址栏就够了。
 
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Write as _};
 
+use flate2::Compression;
 use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -136,6 +138,77 @@ pub fn decode_search_id(id: &str) -> Result<String, SearchIdError> {
         return Err(SearchIdError::NotJson);
     }
     Ok(json)
+}
+
+/// 查询 JSON → 搜索 id,[`decode_search_id`] 的逆:先 gzip,再 base64url(不填 `=`)。
+///
+/// 为什么要在本地造 id:交易站没有"帮我存一条查询"的接口(见本文件开头),
+/// 而"一键蹲价"要做的正是**在观察自己的查询上多加一格词缀筛选,再变成一条
+/// 新搜索**。压出来的字节和网页压的不一定一模一样(压缩级别是我们自己的),
+/// 但解开之后是同一段 JSON —— 交易站认的就是这个。
+///
+/// 不填 `=`:id 要粘进地址栏,而填充号在 URL 里会被转义或截断。
+pub fn encode_search_id(query_json: &str) -> String {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(query_json.as_bytes())
+        .expect("writing into a Vec never fails");
+    let raw = encoder.finish().expect("finishing a Vec never fails");
+    encode_base64_url(&raw)
+}
+
+/// 在查询上多加一格"必须带这条词缀",其余条件原样保留。
+///
+/// 交易站的词缀条件放在 `stats`:一个数组,每一项是一组(`{"type":"and",
+/// "filters":[…]}`)。网页上没加过任何词缀条件的查询里可能整段都没有,
+/// 所以缺了就自己建一组。
+///
+/// 同一个 id 不重复加:交易站会把两格一样的筛选当成"这条词缀要有两次",
+/// 于是搜出来一件都没有。
+///
+/// id 的写法是 **`explicit.stat_1671376347`**(库里存的 `hash` 去掉开头那个
+/// `stat.`)。2026-09-09 匿名跑过一趟核实:把这一格加在"Choir of the Storm"
+/// 上再压成搜索 id,服务端答 200、`total 25`,回的每一件都带着那条词缀。
+///
+/// 和 [`with_sort`] / [`with_seller_filter`] 不一样,这里返回的是**查询本身**
+/// 而不是请求体 —— 它下一步要交给 [`encode_search_id`] 压成一条搜索 id,
+/// 而搜索 id 里装的就是查询本身,外面没有 `query` 那一层。
+pub fn with_stat_filter(query_json: &str, stat_id: &str) -> String {
+    let mut query = query_part(query_json);
+    if !query.is_object() {
+        query = json!({});
+    }
+    let stats = query
+        .as_object_mut()
+        .expect("just made it an object")
+        .entry("stats".to_string())
+        .or_insert_with(|| json!([]));
+    if !stats.is_array() {
+        *stats = json!([]);
+    }
+    let groups = stats.as_array_mut().expect("just made it an array");
+    if groups.is_empty() {
+        groups.push(json!({ "type": "and", "filters": [] }));
+    }
+    if !groups[0].is_object() {
+        groups[0] = json!({ "type": "and", "filters": [] });
+    }
+    let filters = groups[0]
+        .as_object_mut()
+        .expect("just made it an object")
+        .entry("filters".to_string())
+        .or_insert_with(|| json!([]));
+    if !filters.is_array() {
+        *filters = json!([]);
+    }
+    let list = filters.as_array_mut().expect("just made it an array");
+    let already_there = list
+        .iter()
+        .any(|entry| entry.get("id").and_then(Value::as_str) == Some(stat_id));
+    if !already_there {
+        list.push(json!({ "id": stat_id }));
+    }
+    query.to_string()
 }
 
 /// 搜索自己带的名字,拿来当备注名的默认值。
@@ -286,6 +359,28 @@ fn hex_value(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// base64url 的字母表(最后两位是 `-_`,不是 `+/`)。编码只用这一套:
+/// 出去的 id 要能直接粘进地址栏。
+const BASE64_URL_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// 手写的 base64url 编码,不填 `=`。理由同解码那一份:domain 层不为几十行
+/// 引一个 crate,而这里的输出只有一个去处(交易站的搜索 id)。
+fn encode_base64_url(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let block = (u32::from(chunk[0]) << 16)
+            | (u32::from(chunk.get(1).copied().unwrap_or(0)) << 8)
+            | u32::from(chunk.get(2).copied().unwrap_or(0));
+        // 3 字节写 4 个字符,2 字节写 3 个,1 字节写 2 个 —— 剩下的位是补的 0,
+        // 不该写出来(写出来就得靠 `=` 说明"那几位不算数")。
+        for shift in [18, 12, 6, 0].into_iter().take(chunk.len() + 1) {
+            out.push(BASE64_URL_ALPHABET[((block >> shift) & 63) as usize] as char);
+        }
+    }
+    out
 }
 
 /// 手写的 base64 解码:同时吃 url-safe(`-_`)和标准(`+/`)字母表,`=` 填充可有可无。
@@ -533,6 +628,86 @@ mod search_ref_tests {
         );
         assert_eq!(default_label_for(r#"{"query":{"name":"   "}}"#), None);
         assert_eq!(default_label_for("not json at all"), None);
+    }
+
+    /// 编码是解码的逆:出去的 id 得能被自己(以及交易站)读回同一段查询。
+    ///
+    /// 不比对 id 字符串本身 —— 同一段 JSON 用不同的压缩级别会压出不同的字节,
+    /// 而交易站要的只是"解开之后是这段查询"。
+    #[test]
+    fn an_encoded_query_decodes_back_to_itself() {
+        let id = encode_search_id(FIXTURE_QUERY);
+        assert_eq!(decode_search_id(&id).unwrap(), FIXTURE_QUERY);
+        // 交易站的 id 里没有填充号,粘进地址栏才不会被截断。
+        assert!(!id.contains('='), "{id}");
+        assert!(!id.contains('+') && !id.contains('/'), "{id}");
+        // 网页上真抄下来的那个 id 解开再压回去,还是同一段查询。
+        let decoded = decode_search_id(FIXTURE_ID).unwrap();
+        assert_eq!(
+            decode_search_id(&encode_search_id(&decoded)).unwrap(),
+            decoded
+        );
+    }
+
+    /// 一键蹲价:在观察自己的查询上多加一格词缀筛选,别的条件一个不动。
+    #[test]
+    fn a_stat_filter_is_appended_to_the_first_stat_group() {
+        let query: Value =
+            serde_json::from_str(&with_stat_filter(FIXTURE_QUERY, "explicit.stat_1671376347"))
+                .unwrap();
+        assert_eq!(query["name"], "Choir of the Storm", "原来的条件一个不能掉");
+        assert_eq!(query["status"]["option"], "online");
+        assert_eq!(
+            query["stats"][0]["filters"],
+            json!([{ "id": "explicit.stat_1671376347" }])
+        );
+        assert_eq!(query["stats"][0]["type"], "and");
+        // 出来的是查询本身(不是请求体),因为它下一步要被压成搜索 id。
+        assert!(query.get("query").is_none(), "{query}");
+        assert_eq!(
+            decode_search_id(&encode_search_id(&query.to_string())).unwrap(),
+            query.to_string()
+        );
+    }
+
+    /// 查询里根本没有 `stats` 那一段(网页上没加过词缀条件)时自己建一组,
+    /// 而同一个 id 加两遍只留一格 —— 交易站会把重复的筛选当成"两条都要有"。
+    #[test]
+    fn a_missing_stat_group_is_created_and_an_id_is_never_added_twice() {
+        let fresh: Value = serde_json::from_str(&with_stat_filter(
+            r#"{"type":"Sapphire Ring"}"#,
+            "explicit.a",
+        ))
+        .unwrap();
+        assert_eq!(fresh["type"], "Sapphire Ring");
+        assert_eq!(
+            fresh["stats"],
+            json!([{ "type": "and", "filters": [{ "id": "explicit.a" }] }])
+        );
+
+        let twice = with_stat_filter(&with_stat_filter(FIXTURE_QUERY, "explicit.a"), "explicit.a");
+        let twice: Value = serde_json::from_str(&twice).unwrap();
+        assert_eq!(
+            twice["stats"][0]["filters"],
+            json!([{ "id": "explicit.a" }])
+        );
+
+        // 已经有一格别的筛选时是追加,不是替换。
+        let both = with_stat_filter(&with_stat_filter(FIXTURE_QUERY, "explicit.a"), "explicit.b");
+        let both: Value = serde_json::from_str(&both).unwrap();
+        assert_eq!(
+            both["stats"][0]["filters"],
+            json!([{ "id": "explicit.a" }, { "id": "explicit.b" }])
+        );
+
+        // 请求体形状的输入也认:只取 `query` 那一半,和 `with_sort` 一个规矩。
+        let unwrapped: Value = serde_json::from_str(&with_stat_filter(
+            r#"{"query":{"name":"Mageblood"},"sort":{"price":"asc"}}"#,
+            "explicit.a",
+        ))
+        .unwrap();
+        assert_eq!(unwrapped["name"], "Mageblood");
+        assert!(unwrapped.get("sort").is_none(), "{unwrapped}");
     }
 
     #[test]
