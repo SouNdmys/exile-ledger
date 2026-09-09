@@ -144,6 +144,12 @@ pub fn run() {
                     let view = cx.new(|cx| AppShell::new(window, cx));
                     let focus = view.read(cx).focus_handle.clone();
                     window.focus(&focus);
+                    // 点右上角那个叉:默认只是把窗口缩进通知区,后台照跑。
+                    // 回调返回 false = "别关",gpui 就把这条 WM_CLOSE 吃掉。
+                    let shell = view.clone();
+                    window.on_window_should_close(cx, move |_, cx| {
+                        shell.update(cx, |shell, _| shell.on_close_requested())
+                    });
                     cx.new(|cx| Root::new(view, window, cx))
                 },
             )

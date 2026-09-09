@@ -30,6 +30,10 @@ pnd-platform-win = { path = "../pnd-platform-win" }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
+# 只为一件事:从 gpui 的 `Window` 里把 Win32 的 HWND 掏出来(托盘要知道
+# 藏的是哪一个窗口)。版本必须和 gpui 用的那条一致,否则 `HasWindowHandle`
+# 会变成两个互不认识的同名 trait。
+raw-window-handle = "0.6"
 
 # build.rs 把 assets/icon.ico 编进 exe 的资源段。故意不放在
 # target.'cfg(windows)' 下面:build-dependencies 的 target cfg 是按目标平台判定

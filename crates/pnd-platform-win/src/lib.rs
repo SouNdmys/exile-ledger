@@ -12,6 +12,7 @@
 //! - [`AlertCardService`] —— 屏幕角落那张不抢焦点的提醒卡片,连同那条只用来
 //!   收起它自己的全局热键([`parse_hotkey`]);
 //! - [`LoginService`] —— 装着 Edge 内核(WebView2)的登录窗,用来取 `POESESSID`;
+//! - [`TrayService`] —— 通知区("托盘")图标,让主窗口能藏起来而不是退出;
 //! - [`open_url`] —— 用默认浏览器打开官方交易页。
 
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -23,6 +24,7 @@ mod hotkey;
 mod login;
 #[cfg(not(windows))]
 mod non_windows;
+mod tray;
 mod wave;
 #[cfg(windows)]
 mod win32;
@@ -40,6 +42,10 @@ pub use login::{
     LOGIN_URL, LoginConfig, LoginEvent, LoginFailure, LoginService, MAX_AUTO_NAVIGATIONS,
     SESSION_COOKIE, SITE_PREFIX, after_navigation, is_account_url, login_geometry,
     pick_session_cookie,
+};
+pub use tray::{
+    MENU_OPEN_ID, MENU_QUIT_ID, TRAY_ICON_ID, TrayClick, TrayConfig, TrayError, TrayEvent,
+    TrayHandle, TrayService, decode_tray_callback, menu_command,
 };
 pub use wave::{
     LoopingWavePlayer, PcmWaveFormat, ValidatedWave, WaveValidationError, WaveValidationErrorKind,

@@ -608,6 +608,15 @@ catalogue! {
     /// 篮子里一条带 id 的都没有 —— 这么做出来的蹲价和原来那条搜索一模一样,
     /// 所以宁可什么都不做,把话说清楚。
     obs_basket_no_stat_ids,
+    // -- 通知区("托盘")图标 --
+    // 窗口藏起来之后,托盘图标是唯一能把它拿回来的地方,所以那两条菜单
+    // 必须说人话 —— 尤其是"退出程序":那是关掉这个程序的唯一一条路。
+    tray_menu_open,
+    tray_menu_quit,
+    /// 设置页上那个开关:点叉是缩到托盘还是真的退出。
+    settings_close_to_tray,
+    /// 开关旁边那句话。关掉窗口之后怎么退出,必须写在开关旁边。
+    settings_close_to_tray_hint,
 }
 
 /// 支持的语言码。设置里存的就是这两个字符串。
@@ -1056,6 +1065,10 @@ pub static ENGLISH: Text = Text {
     obs_basket_added: "Added to the basket: {}",
     obs_basket_favourites_added: "Added {} favourites to the basket.",
     obs_basket_no_stat_ids: "None of the modifiers in the basket has a filter id, so the watch would be the same search as the observation.",
+    tray_menu_open: "Open the main window",
+    tray_menu_quit: "Quit",
+    settings_close_to_tray: "Close button hides to the tray",
+    settings_close_to_tray_hint: "right-click the tray icon to quit",
 };
 
 pub static SIMPLIFIED_CHINESE: Text = Text {
@@ -1459,6 +1472,10 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     obs_basket_added: "已加入筛选篮:{}",
     obs_basket_favourites_added: "已把 {} 条收藏加入筛选篮。",
     obs_basket_no_stat_ids: "篮子里一条带筛选 id 的词缀都没有,这么做出来的蹲价和原来那条搜索一模一样。",
+    tray_menu_open: "打开主窗口",
+    tray_menu_quit: "退出程序",
+    settings_close_to_tray: "点关闭时缩到右下角托盘",
+    settings_close_to_tray_hint: "托盘图标右键可退出",
 };
 
 #[cfg(test)]
