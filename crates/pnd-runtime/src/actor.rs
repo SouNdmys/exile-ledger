@@ -5951,6 +5951,46 @@ mod actor_tests {
         );
     }
 
+    /// 等到一份满足条件的 `ObservationStatus`(或者超时)。
+    ///
+    /// 为什么光 `wait_for_fetches` 不够:它在假交易站**记下**那一次 fetch 的
+    /// 那一刻就返回,而 actor 是回信到手之后才写库、才发状态事件。这两件事
+    /// 之间在快机器上挤成一瞬,慢机器上却隔得开 —— 那 200 毫秒的抽干就等不
+    /// 到后一半,测试读到的是回查**之前**的那份状态,`drop(handle)` 再把剩下
+    /// 的事件连同答案一起扔掉。CI 的 windows-latest 真的这么砸过一次。
+    ///
+    /// 所以要等的不是"请求发出去了",而是"结果已经落到状态里了"。
+    fn wait_for_status(
+        handle: &RuntimeHandle,
+        seen: &mut Vec<RuntimeEvent>,
+        wanted: impl Fn(&ObservationStatus) -> bool,
+        what: &str,
+    ) -> ObservationStatus {
+        // 先翻已经收在手上的:`wait_for_fetches` 那一轮抽干可能已经把它捞走了,
+        // 只盯着通道等新的会等到超时。
+        let matching = |seen: &[RuntimeEvent]| {
+            seen.iter().rev().find_map(|event| match event {
+                RuntimeEvent::ObservationStatus { status, .. } if wanted(status) => {
+                    Some(status.clone())
+                }
+                _ => None,
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = matching(seen) {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for {what}; saw {seen:#?}");
+            }
+            match handle.try_next_event() {
+                Some(event) => seen.push(event),
+                None => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
     /// 第一轮 discover:排序换成上架时间倒序,新面孔连同物品原文和词缀一起入库。
     #[test]
     fn an_observation_stores_new_listings_with_their_item_json_and_mods() {
@@ -6083,6 +6123,13 @@ mod actor_tests {
             })
             .unwrap();
         wait_for_fetches(&handle, &mut seen, &log, 2);
+        // 回查的结果落到状态里才算这一轮跑完 —— fetch 记下来的那一刻还没写库。
+        let last = wait_for_status(
+            &handle,
+            &mut seen,
+            |status| status.last_recheck_at.is_some(),
+            "an ObservationStatus from after the recheck",
+        );
         drop(handle);
 
         assert_eq!(
@@ -6103,14 +6150,6 @@ mod actor_tests {
         let summary = store.observation_summary(&obs_id).unwrap();
         assert_eq!((summary.active, summary.gone, summary.unknown), (1, 1, 1));
         // 状态事件里也要看得见这一笔。
-        let last = seen
-            .iter()
-            .rev()
-            .find_map(|event| match event {
-                RuntimeEvent::ObservationStatus { status, .. } => Some(status.clone()),
-                _ => None,
-            })
-            .expect("an ObservationStatus");
         assert_eq!((last.active, last.gone), (1, 1));
         assert!(last.last_recheck_at.is_some());
         remove_db(&db);
@@ -6254,6 +6293,15 @@ mod actor_tests {
 
         let mut seen = Vec::new();
         wait_for_fetches(&handle, &mut seen, &log, 1);
+        // actor 还活着,库要现在就读 —— 那得等它真的把这一条写进去,
+        // 而不是等假交易站记下那次 fetch。
+        wait_for_status(
+            &handle,
+            &mut seen,
+            // 假交易站默认报回 "one" 和 "two",两条都入库了这一轮才算跑完。
+            |status| status.active == 2,
+            "an ObservationStatus after the first look was stored",
+        );
 
         {
             let store = WatchStore::open(&db).expect("open");
