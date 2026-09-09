@@ -426,6 +426,17 @@ pub struct AppShell {
 
 impl AppShell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // 开窗之前的这几行先攒着:`push_log` 要脱敏、要落盘,而那两件事都得
+        // 等外壳自己造出来(日志文件的位置存在它身上)。造完立刻补记。
+        let mut boot_log: Vec<String> = Vec::new();
+
+        // 数据目录搬家(PoeNinjaData → ExileLedger)排在最前面,比读设置还早:
+        // 只要有谁先开了新目录里的文件,新目录就存在了,搬家条件再也不成立,
+        // 老数据就静默留在原地 —— 用户看到的是"我的搜索列表全没了"。
+        if let Some(line) = crate::migrate_data_dir() {
+            boot_log.push(line);
+        }
+
         let settings_store = crate::settings_store();
         let loaded = settings_store.load();
         let mut settings = loaded.settings;
@@ -435,9 +446,6 @@ impl AppShell {
         let language = settings.ui_language.clone();
         let text = i18n::text(&language);
 
-        // 开窗之前的这几行先攒着:`push_log` 要脱敏、要落盘,而那两件事都得
-        // 等外壳自己造出来(日志文件的位置存在它身上)。造完立刻补记。
-        let mut boot_log: Vec<String> = Vec::new();
         let mut notice = String::new();
         let read_only = match &loaded.status {
             pnd_settings::LoadStatus::FutureSchemaReadOnly { detected } => {

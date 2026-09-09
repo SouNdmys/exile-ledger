@@ -25,7 +25,8 @@ try {
         throw "编译失败(退出码 $LASTEXITCODE)。"
     }
 
-    $exe = Join-Path $repo 'target\release\pnd-app.exe'
+    # crate 叫 pnd-app,exe 叫 exile-ledger.exe(见 pnd-app/Cargo.toml 的 [[bin]])。
+    $exe = Join-Path $repo 'target\release\exile-ledger.exe'
     $size = [Math]::Round((Get-Item -LiteralPath $exe).Length / 1MB, 1)
     Write-Host "编好了:$exe($size MB)"
 

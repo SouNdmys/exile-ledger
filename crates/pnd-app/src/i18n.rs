@@ -679,7 +679,7 @@ pub fn fill(template: &str, values: &[&str]) -> String {
 }
 
 pub static ENGLISH: Text = Text {
-    app_title: "POE Ninja Data",
+    app_title: "Exile Ledger",
 
     nav_watches: "Watches",
     nav_alerts: "Alerts",
@@ -976,7 +976,7 @@ pub static ENGLISH: Text = Text {
     settings_login_hint: "Opens the official login page in a window of its own. Your password goes to the site, never through this program; only the POESESSID cookie is read back when the login succeeds.",
     settings_login_check_now: "I'm logged in — check now",
     settings_login_get_webview2: "Get WebView2",
-    settings_login_window_title: "POE Ninja Data — pathofexile.com login",
+    settings_login_window_title: "Exile Ledger — pathofexile.com login",
     settings_login_window_hint: "Log in as usual. This window closes by itself once the session is read.",
     settings_login_opening: "opening the login window…",
     settings_login_rechecking: "checking whether you are logged in…",
@@ -1094,7 +1094,7 @@ pub static ENGLISH: Text = Text {
 };
 
 pub static SIMPLIFIED_CHINESE: Text = Text {
-    app_title: "POE Ninja Data",
+    app_title: "Exile Ledger",
 
     nav_watches: "蹲价",
     nav_alerts: "提醒记录",
@@ -1391,7 +1391,7 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     settings_login_hint: "开一个单独的窗口让你登官网。密码只进官网自己的页面,不经过本程序;登录成功后程序只读走 POESESSID 这一个 cookie。",
     settings_login_check_now: "我已登录,现在核对",
     settings_login_get_webview2: "去装 WebView2",
-    settings_login_window_title: "POE Ninja Data —— 官网登录",
+    settings_login_window_title: "Exile Ledger —— 官网登录",
     settings_login_window_hint: "照平常那样登录。读到会话之后这个窗口会自己关掉。",
     settings_login_opening: "正在打开登录窗…",
     settings_login_rechecking: "正在核对有没有登录…",

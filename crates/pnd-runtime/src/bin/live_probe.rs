@@ -574,7 +574,7 @@ fn resolve_session(args: &Args) -> (String, String) {
 /// 和 trade_probe 一样的 UA。以后会从设置里来,探针写死是为了少一个变量。
 fn user_agent() -> String {
     format!(
-        "PoeNinjaData/{} (contact: soundmys1994@gmail.com)",
+        "ExileLedger/{} (contact: https://github.com/SouNdmys/exile-ledger)",
         env!("CARGO_PKG_VERSION")
     )
 }

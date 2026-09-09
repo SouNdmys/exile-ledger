@@ -1,4 +1,6 @@
-# POE Ninja Data
+# Exile Ledger
+
+这个项目以前叫 POE Ninja Data,改名之后 crate 名字仍然保留 `pnd-` 前缀。
 
 单人自用的暗金蹲价 + poe.ninja 热门装备/词缀监控工具(Rust + GPUI 桌面应用,
 Windows 专用):盯交易网站上某件暗金的价格,出现好价就弹卡片提醒;同时看

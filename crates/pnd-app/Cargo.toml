@@ -6,15 +6,19 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "POE Ninja Data GPUI desktop front end"
-default-run = "pnd-app"
+# 这一条会变成 exe 属性里的 FileDescription,任务管理器拿它当程序名显示 ——
+# 所以用工作区那句人话,不是"某某 crate 的前端"。
+description.workspace = true
+default-run = "exile-ledger"
 
 [lib]
 name = "pnd_app"
 path = "src/lib.rs"
 
+# crate 还叫 pnd-app(仓内的名字),但编出来的 exe 叫 exile-ledger.exe:
+# 双击它的人看到的是产品名,而不是一个内部代号。
 [[bin]]
-name = "pnd-app"
+name = "exile-ledger"
 path = "src/main.rs"
 
 [dependencies]

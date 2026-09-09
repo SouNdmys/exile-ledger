@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
-const APP_DIR_NAME: &str = "PoeNinjaData";
+const APP_DIR_NAME: &str = "ExileLedger";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 
 /// 切成浏览器 UA 时用的那一串。写死一个具体版本而不是拼当前时间:
@@ -453,11 +453,13 @@ impl AppSettings {
         self.observations.iter().find(|entry| &entry.id == id)
     }
 
-    /// 所有出站请求的 User-Agent。ninja 的文档要求能识别到人 + 联系方式。
+    /// 所有出站请求的 User-Agent。ninja 的文档要求能识别到人 + 联系方式;
+    /// 联系方式给仓库地址而不是邮箱 —— 一样找得到人,又不用把私人邮箱
+    /// 发给每一个上游服务器。
     pub fn user_agent(&self) -> String {
         match self.user_agent_mode {
             UserAgentMode::Identified => format!(
-                "PoeNinjaData/{} (contact: soundmys1994@gmail.com)",
+                "ExileLedger/{} (contact: https://github.com/SouNdmys/exile-ledger)",
                 env!("CARGO_PKG_VERSION")
             ),
             UserAgentMode::Browser => BROWSER_USER_AGENT.to_string(),
@@ -501,7 +503,7 @@ pub struct SettingsStore {
 }
 
 impl SettingsStore {
-    /// 正式位置:`%LOCALAPPDATA%\PoeNinjaData\settings.json`。
+    /// 正式位置:`%LOCALAPPDATA%\ExileLedger\settings.json`。
     pub fn release_default() -> Self {
         let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
         Self::release_default_from(Path::new(&local))
@@ -871,11 +873,26 @@ mod settings_tests {
     fn user_agent_follows_the_mode() {
         let mut settings = AppSettings::default();
         let identified = settings.user_agent();
-        assert!(identified.starts_with("PoeNinjaData/"));
-        assert!(identified.contains("soundmys1994@gmail.com"));
+        assert!(identified.starts_with("ExileLedger/"));
+        assert!(identified.contains("github.com/SouNdmys/exile-ledger"));
+        assert!(
+            !identified.contains('@'),
+            "联系方式只留仓库地址,邮箱不许再回到 UA 里"
+        );
 
         settings.user_agent_mode = UserAgentMode::Browser;
         assert!(settings.user_agent().starts_with("Mozilla/5.0"));
+    }
+
+    /// `pnd-storage` 的 `the_two_folders_are_siblings` 盯着同一个名字:两个 crate
+    /// 各存各的常量,一旦对不上,搬完文件夹之后设置就会在老地方扑空。
+    #[test]
+    fn settings_live_in_the_exile_ledger_folder() {
+        let store = SettingsStore::release_default_from(Path::new("C:\\fake\\Local"));
+        assert_eq!(
+            store.path().parent().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("ExileLedger"))
+        );
     }
 
     /// 新建的记录要有 uuid、有时间戳,三个开关都默认开着。

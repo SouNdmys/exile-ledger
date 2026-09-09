@@ -42,7 +42,7 @@ use crate::tray::{
 };
 
 const TRAY_CLASS: PCWSTR = w!("PndTrayIcon");
-const TRAY_TITLE: PCWSTR = w!("POE Ninja Data tray");
+const TRAY_TITLE: PCWSTR = w!("Exile Ledger tray");
 /// 托盘图标的回调消息号。挑在 `WM_APP` 之上,和卡片那条错开。
 const WM_TRAY_CALLBACK: u32 = WM_APP + 0x2A2;
 /// 请托盘线程收摊的线程消息。

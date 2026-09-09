@@ -35,16 +35,16 @@ fn main() {
     let description = std::env::var("CARGO_PKG_DESCRIPTION").unwrap_or_default();
 
     // Cargo 里没有"品牌名"这一栏,只有这一条是字面量。
-    res.set("ProductName", "POE Ninja Data");
+    res.set("ProductName", "Exile Ledger");
     // 任务管理器把 FileDescription 当程序名显示,所以这里要放人话而不是包名。
     res.set("FileDescription", &description);
     res.set("CompanyName", &authors);
     // 不盖年份:build.rs 拿不到一个不会过期的年份,写死了迟早变成陈年谎话。
     res.set("LegalCopyright", &format!("Copyright (C) {authors}"));
-    // 这个包只有 pnd-app 一个 bin,所以文件名写死是真话(兄弟项目有两个 bin,
-    // 那边就只能空着)。任务管理器和"属性"面板会拿它来认这个 exe。
-    res.set("InternalName", "pnd-app.exe");
-    res.set("OriginalFilename", "pnd-app.exe");
+    // 这个包只有一个 bin(`exile-ledger`),所以文件名写死是真话(兄弟项目有
+    // 两个 bin,那边就只能空着)。任务管理器和"属性"面板会拿它来认这个 exe。
+    res.set("InternalName", "exile-ledger.exe");
+    res.set("OriginalFilename", "exile-ledger.exe");
 
     // 缺 rc.exe(没装 Windows SDK)不该把别人的构建拦死在这儿:图标是锦上添花,
     // 没有它 exe 照样能跑,只是退回系统默认图标。所以只警告,不 panic。
