@@ -15,3 +15,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+
+# 会话 cookie 用 DPAPI 加密之后才落盘(见 `src/secret.rs`)。用 windows-sys 而
+# 不是完整的 `windows`:这里只要 crypt32 的两个函数、一个结构体和 LocalFree,
+# 不需要 COM 那一整套。0.61.2 是这棵树上本来就有的那一份,版本对上了整棵树里
+# 就只有一个 windows-sys 0.61。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }

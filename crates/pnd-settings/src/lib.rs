@@ -6,12 +6,15 @@
 //! `sync_all` 落盘,再改名顶上去;发现盘上是更新的 schema 就拒绝写,不覆盖。
 //! (posture 照搬 POE-Trade-Tracker 的 `ptt-settings`,schema 从 v1 重新起。)
 
+pub mod secret;
+
+use std::fmt;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use pnd_domain::{Currency, Game, ObservationId, Price, RateOverride, SearchRef, WatchId};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -310,7 +313,9 @@ impl Default for NinjaTuning {
 ///
 /// 每个结构都挂 `#[serde(default)]`:老文件缺哪个键就用默认值补,
 /// 而不是整份读不出来退回全盘默认 —— 那等于用户的搜索列表和会话一起没了。
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+///
+/// `Debug` 是手写的:这份东西会走进日志和 panic 信息,而它带着会话 cookie。
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct AppSettings {
     pub schema_version: u32,
@@ -330,7 +335,15 @@ pub struct AppSettings {
     /// 自己就说得出当季那个叫什么(`IndexState::current_challenge_league`)。
     /// 填了就以填的为准 —— 想看 Standard 或者硬核的人得有话语权。
     pub poe1_league: String,
-    /// 明文存本机。程序不登录、不存密码、不把它写进日志。
+    /// 交易站的会话 cookie。
+    ///
+    /// **内存里是明文,盘上是 `dpapi:<base64>`** —— 那对 serde 钩子就是全部的
+    /// 差别,读它的代码一行都不用改。为什么要加密、老文件怎么办,见
+    /// [`secret`] 的模块注释。程序不登录、不存密码、不把它写进日志。
+    #[serde(
+        serialize_with = "serialize_session",
+        deserialize_with = "deserialize_session"
+    )]
     pub poesessid: String,
     pub watches: Vec<WatchEntry>,
     /// 市场观察的列表。schema 版本还是 1:`#[serde(default)]` 让老文件缺这个
@@ -375,6 +388,53 @@ impl Default for AppSettings {
             rate_override: RateOverride::default(),
             close_to_tray: true,
         }
+    }
+}
+
+/// 落盘前把会话 cookie 加密。
+fn serialize_session<S: Serializer>(value: &str, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&secret::protect(value))
+}
+
+/// 读盘时解密。**解不开不算读失败**:那份文件多半是从别的机器拷来的,别的键
+/// (搜索列表、联赛、所有旋钮)都还好好的,不该为了一个会话把整份设置退回默认。
+/// 于是这里读出空串 = 没有会话,而 [`SettingsStore::load`] 会另外给出一句
+/// [`LoadedSettings::session_warning`] 让界面说一声。
+fn deserialize_session<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let stored = String::deserialize(deserializer)?;
+    Ok(secret::unprotect(&stored).unwrap_or_default())
+}
+
+impl fmt::Debug for AppSettings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AppSettings")
+            .field("schema_version", &self.schema_version)
+            .field("ui_language", &self.ui_language)
+            .field("league", &self.league)
+            .field("ninja_game", &self.ninja_game)
+            .field("poe1_league", &self.poe1_league)
+            // 只说有多长,绝不说是什么 —— 长度足够回答"到底填没填"。
+            .field("poesessid", &Redacted(self.poesessid.chars().count()))
+            .field("watches", &self.watches)
+            .field("observations", &self.observations)
+            .field("favourite_mods", &self.favourite_mods)
+            .field("watcher", &self.watcher)
+            .field("alert", &self.alert)
+            .field("ninja", &self.ninja)
+            .field("user_agent_mode", &self.user_agent_mode)
+            .field("rate_override", &self.rate_override)
+            .field("close_to_tray", &self.close_to_tray)
+            .finish()
+    }
+}
+
+/// `<redacted 32 chars>`。
+struct Redacted(usize);
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "<redacted {} chars>", self.0)
     }
 }
 
@@ -485,6 +545,12 @@ pub enum LoadStatus {
 pub struct LoadedSettings {
     pub settings: AppSettings,
     pub status: LoadStatus,
+    /// 盘上有会话,但解不开 —— 这里就是那句能说给用户听的话,`None` = 一切正常。
+    ///
+    /// 它和 [`LoadStatus`] 分开是因为这不是"文件读不出来":搜索列表、联赛、
+    /// 所有旋钮都读出来了,只有会话没了。而不说一声的话,用户只会看到 live
+    /// 不工作,不知道该去重新登录一次。
+    pub session_warning: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -527,10 +593,12 @@ impl SettingsStore {
             return LoadedSettings {
                 settings: AppSettings::default(),
                 status: LoadStatus::Defaults,
+                session_warning: None,
             };
         };
         match serde_json::from_str::<AppSettings>(&raw) {
             Ok(settings) if settings.schema_version <= CURRENT_SCHEMA_VERSION => LoadedSettings {
+                session_warning: unreadable_session_warning(&raw, &settings),
                 settings,
                 status: LoadStatus::Loaded,
             },
@@ -539,6 +607,7 @@ impl SettingsStore {
                     detected: settings.schema_version,
                 },
                 settings: AppSettings::default(),
+                session_warning: None,
             },
             Err(error) => {
                 // 文件可能只是新版本加了我们读不懂的东西:先单独把版本号捞出来看一眼,
@@ -549,6 +618,7 @@ impl SettingsStore {
                     return LoadedSettings {
                         settings: AppSettings::default(),
                         status: LoadStatus::FutureSchemaReadOnly { detected },
+                        session_warning: None,
                     };
                 }
                 // 存在但读不出来,不等于"没有文件":抢在任何人保存之前把它挪开,
@@ -560,6 +630,7 @@ impl SettingsStore {
                         backup_path,
                         reason: error.to_string(),
                     },
+                    session_warning: None,
                 }
             }
         }
@@ -632,6 +703,31 @@ impl SettingsStore {
         }
         Ok(())
     }
+}
+
+/// 盘上那段会话是不是解不开了。整份文件读得出来之后才问这一句。
+///
+/// 判据是"盘上非空、读出来是空":除了解不开,没有第二种写法能让这两件事同时
+/// 成立 —— [`secret::unprotect`] 对不带 `dpapi:` 前缀的明文永远原样返回。
+/// 这么问是为了不把一个失败信号硬塞进 serde:反序列化只管翻译,谁去告诉用户
+/// 是上层的事。
+fn unreadable_session_warning(raw: &str, loaded: &AppSettings) -> Option<String> {
+    #[derive(Deserialize)]
+    struct SessionOnly {
+        #[serde(default)]
+        poesessid: String,
+    }
+    let stored = serde_json::from_str::<SessionOnly>(raw).ok()?.poesessid;
+    if stored.is_empty() || !loaded.poesessid.is_empty() {
+        return None;
+    }
+    // 密文本身一个字符都不进这句话:它会被原样打进日志。
+    Some(
+        "the stored session cookie could not be decrypted on this machine — \
+         settings.json was probably copied from another PC or another Windows user; \
+         log in again on the Settings page"
+            .to_string(),
+    )
 }
 
 /// 只把版本号捞出来 —— 整份读不懂的时候还能问一句"这是谁写的"。
@@ -1164,6 +1260,117 @@ mod settings_tests {
         store.save(&settings).expect("save");
         assert!(!store.load().settings.close_to_tray);
         assert_eq!(store.load().settings.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    /// 盘上那份老文件里 POESESSID 是明文。它必须照常读出来(一个字不变),
+    /// 而**下一次保存**就该把它换成密文 —— 升级一次程序,cookie 自己就搬了家,
+    /// 不用用户重新登录一次。
+    #[cfg(windows)]
+    #[test]
+    fn a_plain_text_session_is_protected_on_the_next_save() {
+        let store = temp_store("session-migration");
+        write_file(
+            &store,
+            r#"{"schema_version":1,"league":"Forbidden Rites","poesessid":"test-session-0000"}"#,
+        );
+
+        let loaded = store.load();
+        assert_eq!(loaded.status, LoadStatus::Loaded);
+        assert_eq!(
+            loaded.settings.poesessid, "test-session-0000",
+            "老文件里的明文会话要原样读出来"
+        );
+
+        store.save(&loaded.settings).expect("save");
+        let raw = fs::read_to_string(store.path()).expect("read");
+        assert!(
+            raw.contains(r#""poesessid": "dpapi:"#),
+            "存回去的该是 DPAPI 密文:{raw}"
+        );
+        assert!(
+            !raw.contains("test-session-0000"),
+            "盘上不该还留着明文:{raw}"
+        );
+
+        // 再读一遍,还是同一串。
+        let back = store.load();
+        assert_eq!(back.status, LoadStatus::Loaded);
+        assert_eq!(back.settings.poesessid, "test-session-0000");
+        assert_eq!(back.settings.league, "Forbidden Rites");
+    }
+
+    /// 从别的机器(或者别的 Windows 用户)拷过来的 `settings.json`,里面那段
+    /// 密文在这台机器上解不开。那就当没有会话:轮询照常匿名跑,而不是把一串
+    /// base64 当 cookie 发出去,更不是整份设置读不出来。
+    #[cfg(windows)]
+    #[test]
+    fn a_session_that_cannot_be_decrypted_is_treated_as_absent() {
+        let store = temp_store("session-foreign");
+        write_file(
+            &store,
+            r#"{"schema_version":1,"league":"Forbidden Rites","poesessid":"dpapi:AAAA"}"#,
+        );
+        let loaded = store.load();
+        assert_eq!(loaded.status, LoadStatus::Loaded, "别的键都还好好的");
+        assert_eq!(loaded.settings.league, "Forbidden Rites");
+        assert_eq!(loaded.settings.poesessid, "", "解不开就当没填");
+    }
+
+    /// 解不开的时候得留下一句能说给用户听的话。
+    ///
+    /// 不然那个会话就是"悄悄没了":用户只会看到 live 不工作、"去藏身处"是灰的,
+    /// 却不知道该回设置页重新登录一次。这句话里当然不能带上那段密文本身。
+    #[cfg(windows)]
+    #[test]
+    fn an_unreadable_session_leaves_a_warning_for_the_app_to_show() {
+        let store = temp_store("session-warning");
+        write_file(
+            &store,
+            r#"{"schema_version":1,"league":"Forbidden Rites","poesessid":"dpapi:AAAA"}"#,
+        );
+        let loaded = store.load();
+        assert_eq!(loaded.status, LoadStatus::Loaded);
+        let warning = loaded.session_warning.expect("解不开就该留一句话");
+        assert!(warning.contains("session"), "{warning}");
+        assert!(
+            !warning.contains("dpapi:AAAA"),
+            "话里不该带上那段密文:{warning}"
+        );
+
+        // 一切正常的时候没有这句话。
+        let ok = temp_store("session-warning-none");
+        ok.save(&AppSettings {
+            poesessid: "test-session-0000".to_string(),
+            ..AppSettings::default()
+        })
+        .expect("save");
+        assert_eq!(ok.load().session_warning, None);
+
+        // 根本没填会话的时候也没有。
+        let empty = temp_store("session-warning-empty");
+        empty.save(&AppSettings::default()).expect("save");
+        assert_eq!(empty.load().session_warning, None);
+    }
+
+    /// 打印一份设置的时候,POESESSID 一个字符都不该出现。
+    ///
+    /// `Debug` 会走进日志、panic 信息和错误上下文,那些地方都不是放 cookie
+    /// 的地方;长度留着,因为它能回答"到底填没填"。
+    #[test]
+    fn debug_never_prints_the_session() {
+        let settings = AppSettings {
+            poesessid: "test-session-0000".to_string(),
+            ..AppSettings::default()
+        };
+        let text = format!("{settings:?}");
+        assert!(!text.contains("test-session-0000"), "{text}");
+        assert!(text.contains("<redacted 17 chars>"), "{text}");
+        // 别的字段照常看得见。
+        assert!(text.contains("Forbidden Rites"), "{text}");
+
+        // 空会话也得说得出来是空的。
+        let empty = format!("{:?}", AppSettings::default());
+        assert!(empty.contains("<redacted 0 chars>"), "{empty}");
     }
 
     /// 货币走普通字符串、金额走千分整数 —— 手工看设置文件时要能读懂。

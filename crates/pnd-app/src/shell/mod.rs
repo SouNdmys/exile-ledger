@@ -457,6 +457,11 @@ impl AppShell {
             }
             pnd_settings::LoadStatus::Loaded | pnd_settings::LoadStatus::Defaults => false,
         };
+        // 会话解不开也得说一声(整份设置是好的,只有那段密文这台机器打不开)。
+        // 不说的话,live 和"去藏身处"就是莫名其妙地不工作。
+        if let Some(warning) = &loaded.session_warning {
+            boot_log.push(format!("settings: {warning}"));
+        }
         boot_log.push(format!("settings: {}", settings_store.path().display()));
 
         // 后台三件套。每一件失败都只是少一半功能,不该拦着窗口开出来:
