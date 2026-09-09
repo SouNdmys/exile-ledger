@@ -27,7 +27,7 @@ use gpui_component::select::{SearchableVec, SelectEvent, SelectItem, SelectState
 use gpui_component::table::{TableEvent, TableState};
 use gpui_component::{IndexPath, Selectable as _, Sizable as _, Size, StyledExt as _};
 
-use pnd_domain::{CurrencyRates, Game, ObservationId, WatchId};
+use pnd_domain::{CurrencyRates, Game, ObservationId, RateSources, WatchId};
 use pnd_platform_win::{AlertCardService, LoginService};
 use pnd_runtime::{
     MatchedListing, ObservationStatus, RuntimeHandle, SamplerHandle, WatchStatus, now_secs,
@@ -314,7 +314,10 @@ pub struct AppShell {
     pub(crate) session_check_busy: bool,
     /// 上一次测试会话的结论,画在设置页那个按钮旁边。
     pub(crate) session_check_line: String,
+    /// 现在真正在用的换算表(手填的已经盖在 poe.ninja 那份上)。
     pub(crate) rates: CurrencyRates,
+    /// 上面那张表每一档是从哪儿来的。观察页那句汇率靠它说出"(手动)"。
+    pub(crate) rate_sources: RateSources,
     /// 弹过的卡片:卡片按钮事件只带一个 alert_id,靠它找回是哪一批命中。
     pub(crate) shown_cards: BTreeMap<i64, MatchedListing>,
     /// 提醒记录页当前显示的那些行。
@@ -333,6 +336,11 @@ pub struct AppShell {
     pub(crate) obs_favourites_only: bool,
     /// 左下那块聚合表现在看的是哪一栏(词缀战绩 / 价位战绩)。
     pub(crate) obs_agg_tab: pages::observations::AggregateTab,
+    /// 价位战绩按哪种口径分档:按币种,还是全部折成 divine。
+    ///
+    /// 默认折算 —— 按币种那一栏答不出"值 2 divine 的货卖不卖得掉":
+    /// 标 chaos 的那批和标 divine 的那批在两套档位里各算各的。
+    pub(crate) obs_price_mode: pnd_storage::PriceMode,
     /// 挂单流现在看的是哪一栏。
     pub(crate) obs_stream_tab: pages::observations::StreamTab,
     /// 删除观察的按钮已经按过第一下了。删掉的东西找不回来,所以要按两下。
@@ -640,6 +648,7 @@ impl AppShell {
             session_check_busy: false,
             session_check_line: String::new(),
             rates: CurrencyRates::none(),
+            rate_sources: RateSources::default(),
             shown_cards: BTreeMap::new(),
             alert_rows: Vec::new(),
             ninja,
@@ -649,6 +658,7 @@ impl AppShell {
             obs_min_samples: pages::observations::DEFAULT_MIN_SAMPLES,
             obs_favourites_only: false,
             obs_agg_tab: pages::observations::AggregateTab::default(),
+            obs_price_mode: pnd_storage::PriceMode::default(),
             obs_stream_tab: pages::observations::StreamTab::default(),
             obs_remove_armed: false,
             obs_stream_scroll: ScrollHandle::new(),
@@ -901,8 +911,9 @@ impl AppShell {
     fn rebuild_obs_price_table(&mut self, cx: &mut Context<Self>) {
         self.obs_price_dirty = false;
         let content = pages::observations::price_table_content_for(
-            &self.observe.prices,
+            self.observe.prices(self.obs_price_mode),
             self.obs_min_samples,
+            self.obs_price_mode,
             self.text(),
         );
         apply_content(&self.obs_price_table, content, cx);

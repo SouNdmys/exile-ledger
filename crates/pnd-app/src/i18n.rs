@@ -285,9 +285,26 @@ catalogue! {
     obs_col_median_life,
     obs_mods_empty,
     obs_col_price_bucket,
-    /// 最低那一档的写法:"不到 1 {}"。写成"0 divine"会读成"白送"。
-    obs_price_under_one,
+    /// 最低那一档的写法:"不到 {} {}"(下界 + 货币)。写成"0 divine"会读成
+    /// "白送",而两条阶梯的最低档不一样宽(按币种是 1,折成 divine 是 0.1)。
+    obs_price_under,
     obs_price_empty,
+    /// 价位表那个两档开关:按币种分,还是全部折成 divine。
+    obs_price_by_currency,
+    obs_price_in_divine,
+    /// 价位表上头那句话:"汇率:1 divine = {} chaos · {} exalted({})",
+    /// 最后一个 `{}` 是这份汇率从哪儿来的。
+    obs_rates_line,
+    /// 一档汇率都没有时的那一句。
+    obs_rates_unknown,
+    /// 汇率的三种来路,填进上面那句话的最后一格。
+    obs_rate_source_ninja,
+    obs_rate_source_manual,
+    obs_rate_source_mixed,
+    obs_rate_source_unknown,
+    /// "{} 条未折算" —— 有价、但记下它那一刻换不出 divine 的挂单。
+    /// 它们在表上一行都看不见,不说一声会以为总共就这么几件货。
+    obs_unconverted,
     obs_stream_gone_tab,
     obs_stream_active_tab,
     obs_stream_empty,
@@ -481,6 +498,13 @@ catalogue! {
     /// builds 接口一个 IP 一小时的请求配额。今天节流的主控就是它。
     settings_ninja_hourly_budget,
     settings_ninja_request_gap,
+    /// 手填的汇率两格。货币写在框右边的单位位置(`common_currency_*`),
+    /// 所以标签只到等号为止 —— 整句塞进标签会超出那一栏的 150 像素。
+    settings_manual_rate_chaos,
+    settings_manual_rate_exalted,
+    /// 为什么这两格在这儿:交易站自己那个"折合等值"的筛选按一个和市面差得
+    /// 很远的汇率换算,而且按一种货币筛会把别的货币标价的挂单整批筛掉。
+    settings_manual_rate_hint,
     settings_user_agent_mode,
     settings_user_agent_identified,
     settings_user_agent_browser,
@@ -788,7 +812,16 @@ pub static ENGLISH: Text = Text {
     obs_col_median_life: "Median life",
     obs_mods_empty: "No modifier has enough samples yet. Lower the minimum, or give it a few more hours.",
     obs_col_price_bucket: "Price",
-    obs_price_under_one: "under 1 {}",
+    obs_price_under: "under {} {}",
+    obs_price_by_currency: "By currency",
+    obs_price_in_divine: "In divine",
+    obs_rates_line: "Rates: 1 divine = {} chaos · {} exalted ({})",
+    obs_rates_unknown: "Rates: not loaded yet — nothing can be converted",
+    obs_rate_source_ninja: "poe.ninja",
+    obs_rate_source_manual: "manual",
+    obs_rate_source_mixed: "poe.ninja + manual",
+    obs_rate_source_unknown: "unknown",
+    obs_unconverted: "{} not converted",
     obs_price_empty: "No priced samples yet. Lower the minimum, or give it a few more hours.",
     obs_stream_gone_tab: "Recently gone",
     obs_stream_active_tab: "Longest listed",
@@ -930,6 +963,9 @@ pub static ENGLISH: Text = Text {
     settings_ninja_refresh_hours: "Refresh every",
     settings_ninja_hourly_budget: "Requests per hour",
     settings_ninja_request_gap: "Minimum gap",
+    settings_manual_rate_chaos: "Manual rate: 1 divine =",
+    settings_manual_rate_exalted: "… 1 divine =",
+    settings_manual_rate_hint: "Leave blank to use the poe.ninja rate. Fill it in when that rate lags: the trade site's own \"exalted equivalent\" filter converts at a rate far off the market, and filtering by one currency hides every listing priced in another — so price ranges belong here, not there.",
     settings_user_agent_mode: "User agent",
     settings_user_agent_identified: "Identified",
     settings_user_agent_browser: "Browser",
@@ -1167,7 +1203,16 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     obs_col_median_life: "中位存活",
     obs_mods_empty: "还没有哪条词缀攒够样本。把最少样本调低,或者再等几个小时。",
     obs_col_price_bucket: "价位",
-    obs_price_under_one: "不到 1 {}",
+    obs_price_under: "不到 {} {}",
+    obs_price_by_currency: "按币种",
+    obs_price_in_divine: "折成 divine",
+    obs_rates_line: "汇率:1 divine = {} chaos · {} exalted({})",
+    obs_rates_unknown: "汇率:还没读到 —— 一条都折算不了",
+    obs_rate_source_ninja: "poe.ninja",
+    obs_rate_source_manual: "手动",
+    obs_rate_source_mixed: "poe.ninja + 手动",
+    obs_rate_source_unknown: "未知",
+    obs_unconverted: "{} 条未折算",
     obs_price_empty: "还没有带价格的样本。把最少样本调低,或者再等几个小时。",
     obs_stream_gone_tab: "最近消失",
     obs_stream_active_tab: "在售最久",
@@ -1309,6 +1354,9 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     settings_ninja_refresh_hours: "多久重采一次",
     settings_ninja_hourly_budget: "每小时请求数",
     settings_ninja_request_gap: "最小间隔",
+    settings_manual_rate_chaos: "手动汇率:1 divine =",
+    settings_manual_rate_exalted: "… 1 divine =",
+    settings_manual_rate_hint: "留空就用 poe.ninja 的汇率。它跟不上的时候再填:交易站自己那个「折合 exalted」的价格筛选按一个和市面差得很远的汇率换算,而且按一种货币筛会把别的货币标价的挂单整批藏掉 —— 所以价格区间放在这里判,不放在网页上。",
     settings_user_agent_mode: "User-Agent",
     settings_user_agent_identified: "自报家门",
     settings_user_agent_browser: "浏览器",

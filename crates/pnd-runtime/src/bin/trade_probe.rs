@@ -964,7 +964,12 @@ fn print_event(event: &RuntimeEvent, labels: &BTreeMap<String, String>) {
     let at = stamp();
     match event {
         RuntimeEvent::Ready => println!("{at} ready"),
-        RuntimeEvent::RatesUpdated(rates) => println!("{at} rates     {}", describe_rates(rates)),
+        RuntimeEvent::RatesUpdated { rates, sources } => println!(
+            "{at} rates     {} (chaos from {:?}, exalted from {:?})",
+            describe_rates(rates),
+            sources.chaos,
+            sources.exalted
+        ),
         RuntimeEvent::WatchStatus { watch_id, status } => {
             println!(
                 "{at} watch     {} {}",

@@ -44,7 +44,34 @@ pub struct SettingsForm {
     pub ninja_refresh_hours: Entity<InputState>,
     pub ninja_hourly_budget: Entity<InputState>,
     pub ninja_request_gap: Entity<InputState>,
+    /// 手填的两格汇率。留空 = 听 poe.ninja 的。
+    pub rate_chaos: Entity<InputState>,
+    pub rate_exalted: Entity<InputState>,
     pub user_agent_mode: ChoiceSelect,
+}
+
+/// 手填汇率那两格:框里的字 → 千分整数。
+///
+/// 空白是一档**有意义**的选择("这一档听 poe.ninja 的"),所以它返回
+/// `None` 而不是保留原值 —— 否则填过一次之后就再也清不掉了。读不出来的
+/// (打了字母、负数)一律当没填:一个假汇率比没有汇率坏得多。
+fn rate_milli_of(input: &Entity<InputState>, cx: &App) -> Option<i64> {
+    let raw = text_of(input, cx);
+    if raw.is_empty() {
+        return None;
+    }
+    let amount = raw.parse::<f64>().ok()?;
+    if !amount.is_finite() || amount <= 0.0 {
+        return None;
+    }
+    Some((amount * 1000.0).round() as i64)
+}
+
+/// 千分整数 → 框里那行字。没填就是空框。
+fn rate_text(milli: Option<i64>) -> String {
+    milli
+        .map(crate::shell::pages::watches::milli_text)
+        .unwrap_or_default()
 }
 
 /// 语言选项。名字永远写它自己那门语言 —— 读不懂当前这门的人也能找到自己的。
@@ -158,6 +185,17 @@ impl SettingsForm {
             false,
         );
         let ninja_request_gap = input(settings.ninja.min_request_gap_ms.to_string(), "2000", false);
+        // 占位符写的是今天市面上的数,不是"必须填这个" —— 留空才是默认档。
+        let rate_chaos = input(
+            rate_text(settings.rate_override.chaos_per_divine_milli),
+            "13",
+            false,
+        );
+        let rate_exalted = input(
+            rate_text(settings.rate_override.exalted_per_divine_milli),
+            "186",
+            false,
+        );
 
         let language = choice_select(language_choices(), &settings.ui_language, window, cx);
         let corner = choice_select(corner_choices(text), &settings.alert.corner, window, cx);
@@ -213,6 +251,8 @@ impl SettingsForm {
             ninja_refresh_hours,
             ninja_hourly_budget,
             ninja_request_gap,
+            rate_chaos,
+            rate_exalted,
             user_agent_mode: user_agent_select,
         }
     }
@@ -323,6 +363,14 @@ impl SettingsForm {
             (
                 &self.ninja_request_gap,
                 settings.ninja.min_request_gap_ms.to_string(),
+            ),
+            (
+                &self.rate_chaos,
+                rate_text(settings.rate_override.chaos_per_divine_milli),
+            ),
+            (
+                &self.rate_exalted,
+                rate_text(settings.rate_override.exalted_per_divine_milli),
             ),
         ] {
             input.update(cx, |state, cx| {
@@ -479,6 +527,23 @@ impl AppShell {
                     text.common_percent,
                     read_only,
                 ),
+                // 汇率放在蹲价这一段:价格上限的判定就靠它,而**判定搬到这儿来
+                // 本身**就是因为交易站上那个筛选不能用(见下面那句话)。
+                unit_row(
+                    text.settings_manual_rate_chaos,
+                    &form.rate_chaos,
+                    text.common_currency_chaos,
+                    read_only,
+                ),
+                unit_row(
+                    text.settings_manual_rate_exalted,
+                    &form.rate_exalted,
+                    text.common_currency_exalted,
+                    read_only,
+                ),
+                field_row()
+                    .child(field_label(""))
+                    .child(hint(text.settings_manual_rate_hint)),
             ],
         );
 
@@ -729,6 +794,8 @@ impl AppShell {
             self.settings.ninja.min_request_gap_ms,
             cx,
         );
+        let rate_chaos = rate_milli_of(&form.rate_chaos, cx);
+        let rate_exalted = rate_milli_of(&form.rate_exalted, cx);
 
         // 联赛留空就保持原样:一个空联赛名会让每一个接口都 404。
         if !league.is_empty() {
@@ -751,6 +818,10 @@ impl AppShell {
         self.settings.ninja.refresh_hours = refresh_hours;
         self.settings.ninja.max_requests_per_hour = hourly_budget;
         self.settings.ninja.min_request_gap_ms = request_gap;
+        // 这两格和 PoE1 联赛那格一样:**清空是一档有意义的选择**
+        // ("这一档退回听 poe.ninja 的"),所以空框就真的清掉它。
+        self.settings.rate_override.chaos_per_divine_milli = rate_chaos;
+        self.settings.rate_override.exalted_per_divine_milli = rate_exalted;
     }
 }
 

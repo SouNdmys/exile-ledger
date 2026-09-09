@@ -18,7 +18,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use pnd_domain::{
-    CurrencyRates, Game, ListingSummary, ObservationId, PriceCap, SearchRef, WatchId,
+    CurrencyRates, Game, ListingSummary, ObservationId, PriceCap, RateSources, SearchRef, WatchId,
     classify_gone, decode_search_id, judge, next_check_after, search_page_url, search_request_body,
     with_sort,
 };
@@ -320,7 +320,16 @@ pub enum RuntimeEvent {
     CloudflareBlocked {
         until: i64,
     },
-    RatesUpdated(CurrencyRates),
+    /// 换算表变了 —— 要么 poe.ninja 那条线送来了新的一份,要么用户改了设置
+    /// 页里那两格手填汇率。发的是**合并之后**的那一份(手填的盖在 ninja 上),
+    /// 判定和界面看到的于是永远是同一张表。
+    ///
+    /// `sources` 说每一档是从哪儿来的:界面上那句「(poe.ninja)」/「(手动)」
+    /// 靠它,而汇率不对时"去设置页改"和"等 ninja 恢复"是两条不同的路。
+    RatesUpdated {
+        rates: CurrencyRates,
+        sources: RateSources,
+    },
     Log(String),
     /// 运行时线程非正常结束。界面收到这个就该停止显示"运行中"。
     Fault(String),
@@ -671,6 +680,10 @@ struct RuntimeActor {
     no_session_reported: bool,
     /// 每个还没走完的"去藏身处"。
     hideout: BTreeMap<i64, HideoutFlow>,
+    /// poe.ninja 那条线送来的原表。**手填的汇率不写进它** —— 清空设置页里
+    /// 那两格要能退回接口给的数,而那只有在两份分开存着的时候才办得到。
+    ninja_rates: CurrencyRates,
+    /// 判定和记账真正用的那一份:`ninja_rates` 盖上手填的那几档。
     rates: CurrencyRates,
     rebuild: Option<TransportFactory>,
     /// 汇率线程的取消开关。换联赛时立一次、重起一条。
@@ -734,6 +747,7 @@ impl RuntimeActor {
             session_invalid_reported: false,
             no_session_reported: false,
             hideout: BTreeMap::new(),
+            ninja_rates: CurrencyRates::none(),
             rates: CurrencyRates::none(),
             rebuild,
             rates_cancel: None,
@@ -768,8 +782,8 @@ impl RuntimeActor {
                 Ok(Inbox::Gateway(event)) => self.handle_gateway_event(event),
                 Ok(Inbox::Live(event)) => self.handle_live_event(event),
                 Ok(Inbox::Rates(rates)) => {
-                    self.rates = rates.clone();
-                    self.emit(RuntimeEvent::RatesUpdated(rates));
+                    self.ninja_rates = rates;
+                    self.refresh_rates();
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -1023,7 +1037,32 @@ impl RuntimeActor {
             self.restart_rates_thread();
         }
         self.settings = settings;
+        // 手填的汇率就在这份设置里,所以每次 `ApplySettings` 都要重算一遍
+        // 合并表 —— 判定(蹲价)和记账(观察折算价)下一秒就要用它。
+        self.refresh_rates();
         self.sync_live_workers(now);
+    }
+
+    /// 把手填的那几档盖到 poe.ninja 那份上,算出真正在用的换算表。
+    ///
+    /// 每次都广播一遍(哪怕一个数都没变):这条事件很稀(15 分钟一次汇率、
+    /// 保存设置时一次),而"少发一条"换来的是界面上那句汇率和实际用的对不上。
+    fn refresh_rates(&mut self) {
+        let manual = &self.settings.rate_override;
+        self.rates = self.ninja_rates.with_override(manual);
+        let sources = self.ninja_rates.rate_sources(manual);
+        self.emit(RuntimeEvent::RatesUpdated {
+            rates: self.rates.clone(),
+            sources,
+        });
+    }
+
+    /// 这条挂单此刻折成 divine 值多少(千分整数)。
+    ///
+    /// 记进库里的就是它,而且**只在看见它的那一刻算一次**:汇率天天变,
+    /// 三天后再折一遍得到的是三天后的答案,那回答不了"它当时值多少"。
+    fn divine_milli(&self, listing: &ListingSummary) -> Option<i64> {
+        self.rates.to_divine_milli(listing.price.as_ref()?)
     }
 
     // ---- live --------------------------------------------------------
@@ -2361,7 +2400,11 @@ impl RuntimeActor {
     /// 10 分钟,所以它多半会是 `Unknown`,而那是诚实的:我们确实不知道它挂了
     /// 多久。
     fn record_first_look(&mut self, obs_id: &ObservationId, listing: &ListingSummary, now: i64) {
-        self.note(self.store.record_seen(obs_id, listing, now), "record_seen");
+        let div_milli = self.divine_milli(listing);
+        self.note(
+            self.store.record_seen(obs_id, listing, div_milli, now),
+            "record_seen",
+        );
         if listing.verified {
             return;
         }
@@ -2602,8 +2645,9 @@ impl RuntimeActor {
                         self.mark_verified_gone(&due.obs_id, listing, due.first_seen_at, now);
                     }
                     Some(listing) => {
+                        let div_milli = self.divine_milli(listing);
                         self.note(
-                            self.store.record_seen(&due.obs_id, listing, now),
+                            self.store.record_seen(&due.obs_id, listing, div_milli, now),
                             "record_seen",
                         );
                         self.advance_check(due);
@@ -3697,9 +3741,14 @@ mod actor_tests {
         seller_offline: bool,
         /// fetch 回一个空 `result`(那件货在这几秒里被买走了)。
         fetch_returns_nothing: bool,
-        /// 让 fetch 回来的每件货都标这个价(divine)。不设就用下面那套
-        /// 18、17、16… 的递减价。
+        /// 让 fetch 回来的每件货都标这个价。不设就用下面那套 18、17、16…
+        /// 的递减价。单位是 `price_currency` 那种货币。
         price_divine: Option<i64>,
+        /// 挂单标价用哪种货币。`None` = divine(交易站上大宗货的常态)。
+        ///
+        /// 有它才测得了跨货币那条路:主人真正在盯的碑牌大多标 chaos,而
+        /// 一条 divine 的上限接不接得住它,全看手上那份汇率。
+        price_currency: Option<String>,
         /// search 响应的 `X-Rate-Limit-Rules` 写什么。`None` = 不给限速头。
         /// 会话检查看的就是这一行。
         rate_rules: Option<String>,
@@ -3781,11 +3830,13 @@ mod actor_tests {
         token: Option<&str>,
         online: bool,
         price_divine: Option<i64>,
+        price_currency: Option<&str>,
         gone: &BTreeSet<String>,
         unverified: &BTreeSet<String>,
         indexed: &str,
         mods: &[String],
     ) -> String {
+        let currency = price_currency.unwrap_or("divine");
         let mod_lines: Vec<String> = mods
             .iter()
             .map(|line| {
@@ -3819,7 +3870,7 @@ mod actor_tests {
                 format!(
                     r#"{{"id":"{id}","listing":{{"indexed":"{indexed}",
                         "whisper":"@{id} hi",{hideout}
-                        "price":{{"type":"~price","amount":{},"currency":"divine"}},
+                        "price":{{"type":"~price","amount":{},"currency":"{currency}"}},
                         "account":{{"name":"Seller{id}","lastCharacterName":"Char{id}"{presence}}}}},
                      "item":{{"name":"Choir of the Storm","typeLine":"Lapis Amulet"{verified},
                        "explicitMods":[{}]}}}}"#,
@@ -3909,6 +3960,7 @@ mod actor_tests {
                 offline,
                 nothing,
                 price,
+                currency,
                 gone,
                 unverified,
                 answer_ids,
@@ -3923,6 +3975,7 @@ mod actor_tests {
                     log.seller_offline,
                     log.fetch_returns_nothing,
                     log.price_divine,
+                    log.price_currency.clone(),
                     log.gone_ids.clone(),
                     log.unverified_ids.clone(),
                     log.answer_ids.clone(),
@@ -3942,6 +3995,7 @@ mod actor_tests {
                 token.as_deref(),
                 !offline,
                 price,
+                currency.as_deref(),
                 &gone,
                 &unverified,
                 indexed.as_deref().unwrap_or("2026-09-06T10:00:00Z"),
@@ -6104,6 +6158,139 @@ mod actor_tests {
         remove_db(&db);
     }
 
+    // ---- 手填的汇率 ----------------------------------------------------
+
+    /// 手填一个汇率,divine 的上限就能接住 chaos 标价的挂单。
+    ///
+    /// 为什么这条路要有:交易站自己那个"折合等值"的价格筛选按一个和市面差
+    /// 得很远的内部汇率换算,而且按某种货币筛之后,别的货币标价的挂单会整批
+    /// 消失。所以价格区间搬进这个程序里判 —— 而 poe.ninja 的汇率也有跟不上
+    /// 的那一天,人得能自己顶一个数上去。
+    #[test]
+    fn a_manual_rate_lets_a_divine_cap_match_a_chaos_listing() {
+        let (transport, log) = FakeTrade::new();
+        {
+            let mut log = log.lock().unwrap();
+            log.price_currency = Some("chaos".to_string());
+            log.price_divine = Some(60);
+        }
+        let mut settings = settings();
+        // 1 divine = 13 chaos。离线跑,ninja 那条线根本没起来 —— 手填的
+        // 这个数是这张表上唯一的汇率。
+        settings.rate_override.chaos_per_divine_milli = Some(13_000);
+        let handle =
+            RuntimeHandle::start_offline(settings.clone(), RuntimePaths::in_memory(), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        let event = wait_for(
+            &handle,
+            &mut seen,
+            |event| matches!(event, RuntimeEvent::RatesUpdated { .. }),
+            "the merged rates",
+        );
+        let RuntimeEvent::RatesUpdated { rates, sources } = event else {
+            unreachable!()
+        };
+        assert_eq!(rates.chaos_per_divine_milli, Some(13_000));
+        assert_eq!(sources.chaos, pnd_domain::RateSource::Manual);
+        assert_eq!(
+            sources.exalted,
+            pnd_domain::RateSource::Unknown,
+            "没手填、也没抓到"
+        );
+
+        // 60 chaos ≈ 4.6 divine,远低于 20 divine 的上限 —— 没有那个汇率
+        // 的话这条挂单只会被判成"异币种,换不出来"。
+        let matched = wait_for(
+            &handle,
+            &mut seen,
+            |event| matches!(event, RuntimeEvent::ListingMatched(_)),
+            "ListingMatched",
+        );
+        let RuntimeEvent::ListingMatched(matched) = matched else {
+            unreachable!()
+        };
+        assert_eq!(
+            matched.headline.price,
+            Some(Price::new(60_000, Currency::Chaos))
+        );
+
+        // 清空之后退回"不知道":手填过一次不该从此和 poe.ninja 断了。
+        settings.rate_override = pnd_domain::RateOverride::default();
+        handle
+            .try_send(RuntimeCommand::ApplySettings(Box::new(settings)))
+            .unwrap();
+        let event = wait_for(
+            &handle,
+            &mut seen,
+            |event| {
+                matches!(event, RuntimeEvent::RatesUpdated { rates, .. }
+                    if rates.chaos_per_divine_milli.is_none())
+            },
+            "the rates without the override",
+        );
+        let RuntimeEvent::RatesUpdated { sources, .. } = event else {
+            unreachable!()
+        };
+        assert_eq!(sources.chaos, pnd_domain::RateSource::Unknown);
+    }
+
+    /// 观察记下一条挂单时,顺手存下它**那一刻**折成 divine 值多少。
+    #[test]
+    fn an_observed_listing_stores_what_it_was_worth_in_divine_at_the_time() {
+        let (transport, log) = FakeTrade::new();
+        {
+            let mut log = log.lock().unwrap();
+            log.price_currency = Some("chaos".to_string());
+            log.price_divine = Some(60);
+        }
+        let (mut settings, obs_id) = observe_settings("Precursor Tablets");
+        settings.rate_override.chaos_per_divine_milli = Some(13_000);
+        let db = temp_db("divine-equivalent");
+        let handle =
+            RuntimeHandle::start_offline(settings, RuntimePaths::new(db.clone()), transport)
+                .unwrap();
+
+        let mut seen = Vec::new();
+        wait_for_fetches(&handle, &mut seen, &log, 1);
+
+        {
+            let store = WatchStore::open(&db).expect("open");
+            let row = store
+                .observed_listing(&obs_id, "one")
+                .unwrap()
+                .expect("row");
+            assert_eq!(row.last_price, Some(Price::new(60_000, Currency::Chaos)));
+            // 60 chaos ÷ 13 = 4.615 divine。
+            assert_eq!(row.first_price_div_milli, Some(4_615));
+            assert_eq!(row.last_price_div_milli, Some(4_615));
+        }
+
+        // 卖家改标一种我们没有汇率的货币:换不出来就存空,不猜一个数。
+        log.lock().unwrap().price_currency = Some("regal".to_string());
+        handle
+            .try_send(RuntimeCommand::RecheckNow {
+                obs_id: obs_id.clone(),
+            })
+            .unwrap();
+        wait_for_fetches(&handle, &mut seen, &log, 2);
+        drop(handle);
+
+        let store = WatchStore::open(&db).expect("open");
+        let row = store
+            .observed_listing(&obs_id, "one")
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.last_price_div_milli, None, "换不出来就是空,不是 0");
+        assert_eq!(
+            row.first_price_div_milli,
+            Some(4_615),
+            "第一次见到它时折出来的那个数一个字都不该动"
+        );
+        remove_db(&db);
+    }
+
     /// 观察也花搜索额度,所以预算地板必须把观察条数一起数进去。
     ///
     /// 一条搜索 + 两条观察 = 三个花搜索额度的东西,地板是 217 秒。要是只数
@@ -6179,7 +6366,7 @@ mod actor_tests {
                 .to_string(),
         };
         store
-            .record_seen(obs_id, &listing, first_seen)
+            .record_seen(obs_id, &listing, None, first_seen)
             .expect("seed a listing");
     }
 

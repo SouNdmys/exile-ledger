@@ -452,7 +452,7 @@ mod pages_tests {
             median_lifetime_secs: Some(12_600),
             active: 2,
         }];
-        observations::price_table_content_for(&outcomes, 1, text)
+        observations::price_table_content_for(&outcomes, 1, pnd_storage::PriceMode::Converted, text)
     }
 
     /// 一条提醒历史,拿来量提醒表。

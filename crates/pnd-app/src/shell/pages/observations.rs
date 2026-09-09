@@ -34,13 +34,15 @@ use gpui_component::switch::Switch;
 use gpui_component::{Selectable as _, Sizable as _, Size, StyledExt as _};
 
 use pnd_domain::{
-    Game, GoneClass, ObservationId, Price, PriceBucket, decode_search_id, default_label_for,
-    encode_search_id, parse_search_reference, with_stat_filter,
+    CurrencyRates, Game, GoneClass, ObservationId, Price, PriceBucket, RateSource, RateSources,
+    SUB_DIVINE_BUCKET_MILLI, decode_search_id, default_label_for, encode_search_id,
+    parse_search_reference, with_stat_filter,
 };
 use pnd_runtime::{LiveRunState, ObservationStatus, RuntimeCommand, now_secs};
 use pnd_settings::{AppSettings, ObservationEntry};
 use pnd_storage::{
-    ModOutcome, ObservationSummary, ObservedListingRow, ObservedMod, PriceOutcome, StorageError,
+    ModOutcome, ObservationSummary, ObservedListingRow, ObservedMod, PriceMode, PriceOutcome,
+    StorageError,
 };
 
 use super::{Cell, TableContent, Tone, column, league_cell_text, number_column};
@@ -130,13 +132,27 @@ pub struct ObservationData {
     pub summary: ObservationSummary,
     /// 全部词缀模板(样本数没过滤,过滤在 [`mod_filtered`] 里做)。
     pub mods: Vec<ModOutcome>,
-    /// 全部价位档,同样没过滤([`price_filtered`] 里做)。
-    pub prices: Vec<PriceOutcome>,
+    /// 按币种分的价位档,同样没过滤([`price_filtered`] 里做)。
+    pub prices_by_currency: Vec<PriceOutcome>,
+    /// 全部折成 divine 的那一份。两份一起读进来,是因为那个两档开关按一下
+    /// 就该换表 —— 为了换一栏再打一次库不值当,而这两份一起变、一起过时。
+    pub prices_converted: Vec<PriceOutcome>,
+    /// 折算那一份里有价、却换不出 divine 的挂单条数。
+    pub unconverted: u32,
     pub gone: Vec<StreamEntry>,
     pub active: Vec<StreamEntry>,
 }
 
 impl ObservationData {
+    /// 这一栏要画的那些价位档。
+    #[must_use]
+    pub fn prices(&self, mode: PriceMode) -> &[PriceOutcome] {
+        match mode {
+            PriceMode::ByCurrency => &self.prices_by_currency,
+            PriceMode::Converted => &self.prices_converted,
+        }
+    }
+
     /// 当前这一栏要画的那些条目。
     #[must_use]
     pub fn stream(&self, tab: StreamTab) -> &[StreamEntry] {
@@ -709,19 +725,92 @@ pub fn price_filtered(outcomes: &[PriceOutcome], min_samples: u32) -> Vec<&Price
         .collect()
 }
 
-/// 一档价位的写法:`2 divine`。
+/// 这一栏的阶梯上最低的那根**正**横档(千分整数)。
 ///
-/// 最低那一档单独一句「不到 1 divine」:它的下界是 0,而写成「0 divine」
-/// 会读成"白送"。
+/// 两条阶梯不一样低:按币种那条从 1 起步,折成 divine 那条从 0.1 起步
+/// (原先标几十 chaos 的货折过来全在 1 以下,不分开就挤成一格)。最低那一档
+/// 的写法要照着它写,不然会写出一句"不到 1 divine"而 0.5 divine 明明另有一档。
 #[must_use]
-pub fn price_bucket_label(bucket_milli: i64, currency: &str, text: &'static Text) -> String {
+pub fn bucket_floor_milli(mode: PriceMode) -> i64 {
+    match mode {
+        PriceMode::ByCurrency => 1_000,
+        PriceMode::Converted => SUB_DIVINE_BUCKET_MILLI[0],
+    }
+}
+
+/// 一档价位的写法:`2 divine`、`0.5 divine`。
+///
+/// 最低那一档单独一句「不到 0.1 divine」:它的下界是 0,而写成「0 divine」
+/// 会读成"白送"。`floor_milli` 是这条阶梯上最低的那根正横档,见
+/// [`bucket_floor_milli`]。
+#[must_use]
+pub fn price_bucket_label(
+    bucket_milli: i64,
+    floor_milli: i64,
+    currency: &str,
+    text: &'static Text,
+) -> String {
     let bucket = PriceBucket {
         lower_bound_milli: bucket_milli,
     };
     if bucket.is_under_one() {
-        return i18n::fill(text.obs_price_under_one, &[currency]);
+        return i18n::fill(text.obs_price_under, &[&milli_text(floor_milli), currency]);
     }
     format!("{} {currency}", milli_text(bucket_milli))
+}
+
+/// 价位表上头那句汇率。
+///
+/// 必须常驻:折算那一栏的每一个数都建在这份汇率上,而汇率是会过时的
+/// (poe.ninja 那条线断了、手填的忘了改)。不写出来的话,一张按错汇率
+/// 折出来的表和一张对的长得一模一样。
+///
+/// `unconverted` 是有价、但记下它那一刻换不出 divine 的挂单条数。它们在表上
+/// 一行都看不见 —— 不说一声会让人以为总共就这么几件货。
+#[must_use]
+pub fn rates_status_line(
+    rates: &CurrencyRates,
+    sources: &RateSources,
+    unconverted: u32,
+    text: &'static Text,
+) -> String {
+    let mut line = match (rates.chaos_per_divine_milli, rates.exalted_per_divine_milli) {
+        (None, None) => text.obs_rates_unknown.to_owned(),
+        (chaos, exalted) => i18n::fill(
+            text.obs_rates_line,
+            &[
+                &rate_number(chaos, text),
+                &rate_number(exalted, text),
+                rate_source_word(sources, text),
+            ],
+        ),
+    };
+    if unconverted > 0 {
+        line.push_str(" · ");
+        line.push_str(&i18n::fill(
+            text.obs_unconverted,
+            &[&unconverted.to_string()],
+        ));
+    }
+    line
+}
+
+/// 汇率里的一个数。缺的那一档写破折号,不写 0 —— 0 会被读成"一个都不值"。
+fn rate_number(milli: Option<i64>, text: &'static Text) -> String {
+    milli.map_or_else(|| text.common_none.to_owned(), milli_text)
+}
+
+/// 这份汇率是从哪儿来的。两档来路不同就都说 —— "一半是我自己填的"
+/// 恰恰是最该看见的那种情况。
+fn rate_source_word(sources: &RateSources, text: &'static Text) -> &'static str {
+    let manual = [sources.chaos, sources.exalted].contains(&RateSource::Manual);
+    let ninja = [sources.chaos, sources.exalted].contains(&RateSource::Ninja);
+    match (manual, ninja) {
+        (true, true) => text.obs_rate_source_mixed,
+        (true, false) => text.obs_rate_source_manual,
+        (false, true) => text.obs_rate_source_ninja,
+        (false, false) => text.obs_rate_source_unknown,
+    }
 }
 
 /// 价位表的列。
@@ -747,21 +836,28 @@ pub fn price_table_content(text: &'static Text) -> TableContent {
 pub fn price_table_content_for(
     outcomes: &[PriceOutcome],
     min_samples: u32,
+    mode: PriceMode,
     text: &'static Text,
 ) -> TableContent {
     TableContent {
-        rows: price_rows(&price_filtered(outcomes, min_samples), text),
+        rows: price_rows(&price_filtered(outcomes, min_samples), mode, text),
         ..price_table_content(text)
     }
 }
 
 /// 一档价位一行。语气跟词缀表走,两张表并排看时才不像两个程序画的。
 #[must_use]
-pub fn price_rows(rows: &[&PriceOutcome], text: &'static Text) -> Vec<Vec<Cell>> {
+pub fn price_rows(rows: &[&PriceOutcome], mode: PriceMode, text: &'static Text) -> Vec<Vec<Cell>> {
+    let floor_milli = bucket_floor_milli(mode);
     rows.iter()
         .map(|row| {
             vec![
-                Cell::plain(price_bucket_label(row.bucket_milli, &row.currency, text)),
+                Cell::plain(price_bucket_label(
+                    row.bucket_milli,
+                    floor_milli,
+                    &row.currency,
+                    text,
+                )),
                 Cell::data(row.seen.to_string()),
                 Cell::data(row.gone.to_string()),
                 // 卖掉几件是这张表的主角,给它金色(同词缀表)。
@@ -1187,8 +1283,18 @@ impl AppShell {
         let min_samples = self.obs_min_samples;
         let favourites_only = self.obs_favourites_only;
         let tab = self.obs_agg_tab;
+        let price_mode = self.obs_price_mode;
         let selected = self.observe.selected.is_some();
         let no_data = self.observe.is_empty();
+        // 折算那一栏的每个数都建在这份汇率上,所以它必须写在表的正上方:
+        // 按错汇率折出来的表和对的长得一模一样。
+        // "未折算"那一段只在折算那一栏说:按币种分的时候一条都没被漏下,
+        // 说它反而像是这张表也藏了东西。
+        let unconverted = match price_mode {
+            PriceMode::Converted => self.observe.unconverted,
+            PriceMode::ByCurrency => 0,
+        };
+        let rates_line = rates_status_line(&self.rates, &self.rate_sources, unconverted, text);
         panel()
             .flex_1()
             .min_w(px(0.))
@@ -1233,6 +1339,32 @@ impl AppShell {
                         (tab == AggregateTab::Mods)
                             .then(|| picker(text.mods_kind_label, &self.obs_kind_select, 140.)),
                     )
+                    // 价位表专属的两档开关:按币种,还是全部折成 divine。
+                    // 默认折算 —— 按币种那一栏答不了"这批货值多少 divine 卖得掉"。
+                    .children((tab == AggregateTab::Price).then(|| {
+                        Button::new("obs-price-by-currency")
+                            .ghost()
+                            .xsmall()
+                            .selected(price_mode == PriceMode::ByCurrency)
+                            .label(text.obs_price_by_currency)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.obs_price_mode = PriceMode::ByCurrency;
+                                this.obs_price_dirty = true;
+                                cx.notify();
+                            }))
+                    }))
+                    .children((tab == AggregateTab::Price).then(|| {
+                        Button::new("obs-price-in-divine")
+                            .ghost()
+                            .xsmall()
+                            .selected(price_mode == PriceMode::Converted)
+                            .label(text.obs_price_in_divine)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.obs_price_mode = PriceMode::Converted;
+                                this.obs_price_dirty = true;
+                                cx.notify();
+                            }))
+                    }))
                     .child(div().flex_grow())
                     .child(
                         div()
@@ -1269,6 +1401,19 @@ impl AppShell {
                             }))
                     })),
             )
+            // 汇率那一行只在价位表上出现:词缀表的中位价也折算过,但那张表
+            // 一行只有一个数,而这一行是整栏的前提。
+            .children((tab == AggregateTab::Price).then(|| {
+                div()
+                    .flex_none()
+                    .px(px(10.))
+                    .py(px(4.))
+                    .border_b_1()
+                    .border_color(c(HAIRLINE_SOFT))
+                    .text_size(fs(FS_11))
+                    .text_color(muted())
+                    .child(SharedString::from(rates_line))
+            }))
             .child(
                 div()
                     .flex_1()
@@ -1790,16 +1935,21 @@ impl AppShell {
             Ok((
                 store.observation_summary(&obs_id)?,
                 store.mod_aggregate(&obs_id, 1)?,
-                store.price_aggregate(&obs_id)?,
+                // 两种口径一次读齐:那个两档开关按一下就该换表,而为了换一栏
+                // 再打一次库不值当 —— 这两份一起变、一起过时。
+                store.price_aggregate(&obs_id, PriceMode::ByCurrency)?,
+                store.price_aggregate(&obs_id, PriceMode::Converted)?,
                 store.recent_gone(&obs_id, STREAM_ROWS)?,
                 store.oldest_active(&obs_id, STREAM_ROWS)?,
             ))
         })();
         match read {
-            Ok((summary, mods, prices, gone, active)) => {
+            Ok((summary, mods, by_currency, converted, gone, active)) => {
                 self.observe.summary = summary;
                 self.observe.mods = mods;
-                self.observe.prices = prices;
+                self.observe.prices_by_currency = by_currency.rows;
+                self.observe.prices_converted = converted.rows;
+                self.observe.unconverted = converted.unconverted;
                 self.observe.gone = self.stream_entries(&obs_id, gone);
                 self.observe.active = self.stream_entries(&obs_id, active);
             }
@@ -1993,6 +2143,8 @@ mod observations_page_tests {
             last_seen_at: NOW - HOUR,
             first_price: Some(Price::new(20_000, Currency::Exalted)),
             last_price: Some(Price::new(12_500, Currency::Exalted)),
+            first_price_div_milli: Some(240),
+            last_price_div_milli: Some(150),
             price_changes: 1,
             status: if class.is_some() {
                 ObservedStatus::Gone
@@ -2554,7 +2706,11 @@ mod observations_page_tests {
             price_outcome(3_000, 10, 2, 1),
             price_outcome(5_000, 4, 0, 0),
         ];
-        let rows = price_rows(&price_filtered(&outcomes, 1), &i18n::ENGLISH);
+        let rows = price_rows(
+            &price_filtered(&outcomes, 1),
+            PriceMode::ByCurrency,
+            &i18n::ENGLISH,
+        );
         assert_eq!(rows.len(), 3, "一档一行");
         assert_eq!(
             rows.iter().map(|row| row[0].text()).collect::<Vec<_>>(),
@@ -2578,7 +2734,7 @@ mod observations_page_tests {
     fn a_bucket_with_nothing_gone_yet_shows_a_dash_for_the_median_life() {
         let mut fresh = price_outcome(10_000, 5, 0, 0);
         fresh.median_lifetime_secs = None;
-        let rows = price_rows(&[&fresh], &i18n::ENGLISH);
+        let rows = price_rows(&[&fresh], PriceMode::ByCurrency, &i18n::ENGLISH);
         assert_eq!(rows[0][0].text(), "10 divine");
         assert_eq!(rows[0][5].text(), "—");
     }
@@ -2587,23 +2743,136 @@ mod observations_page_tests {
     /// 写成「0 divine」会读成"白送",而那一档恰恰是最好卖的一批。
     #[test]
     fn the_cheapest_bucket_says_under_one_in_both_languages() {
+        let floor = bucket_floor_milli(PriceMode::ByCurrency);
         assert_eq!(
-            price_bucket_label(0, "divine", &i18n::ENGLISH),
+            price_bucket_label(0, floor, "divine", &i18n::ENGLISH),
             "under 1 divine"
         );
         assert_eq!(
-            price_bucket_label(0, "divine", &i18n::SIMPLIFIED_CHINESE),
+            price_bucket_label(0, floor, "divine", &i18n::SIMPLIFIED_CHINESE),
             "不到 1 divine"
         );
         // 别的档就是"数字 + 货币",两种语言一样(货币码本来就是英文)。
         for text in [&i18n::ENGLISH, &i18n::SIMPLIFIED_CHINESE] {
-            assert_eq!(price_bucket_label(1_000, "divine", text), "1 divine");
-            assert_eq!(price_bucket_label(15_000, "chaos", text), "15 chaos");
+            assert_eq!(price_bucket_label(1_000, floor, "divine", text), "1 divine");
+            assert_eq!(price_bucket_label(15_000, floor, "chaos", text), "15 chaos");
             assert_eq!(
-                price_bucket_label(1_000_000, "exalted", text),
+                price_bucket_label(1_000_000, floor, "exalted", text),
                 "1000 exalted"
             );
         }
+    }
+
+    /// 折算那一栏的 1 以下几档要写成小数,而它的最低档是「不到 0.1 divine」——
+    /// 照按币种那条阶梯写成「不到 1 divine」的话,0.5 divine 那一档明明就在
+    /// 隔壁,整栏立刻变成一句自相矛盾的话。
+    #[test]
+    fn the_converted_ladder_writes_fractions_and_its_own_floor() {
+        let floor = bucket_floor_milli(PriceMode::Converted);
+        assert_eq!(floor, 100, "折算那条阶梯从 0.1 起步");
+        assert_eq!(
+            price_bucket_label(0, floor, "divine", &i18n::ENGLISH),
+            "under 0.1 divine"
+        );
+        assert_eq!(
+            price_bucket_label(0, floor, "divine", &i18n::SIMPLIFIED_CHINESE),
+            "不到 0.1 divine"
+        );
+        for text in [&i18n::ENGLISH, &i18n::SIMPLIFIED_CHINESE] {
+            assert_eq!(price_bucket_label(100, floor, "divine", text), "0.1 divine");
+            assert_eq!(price_bucket_label(500, floor, "divine", text), "0.5 divine");
+            assert_eq!(
+                price_bucket_label(750, floor, "divine", text),
+                "0.75 divine"
+            );
+            assert_eq!(price_bucket_label(2_000, floor, "divine", text), "2 divine");
+        }
+        // 整张表走的是同一条阶梯:行也得照 0.5 写。
+        let mut cheap = price_outcome(500, 6, 4, 4);
+        cheap.median_lifetime_secs = Some(3_600);
+        let rows = price_rows(&[&cheap], PriceMode::Converted, &i18n::ENGLISH);
+        assert_eq!(rows[0][0].text(), "0.5 divine");
+    }
+
+    /// 表上头那句汇率:两个数、从哪儿来的、还有多少条折不出来。
+    ///
+    /// 折算那一栏的每个数都建在这份汇率上,而按错汇率折出来的表和对的
+    /// 长得一模一样 —— 所以这一行必须写全,而且必须说清是谁给的数。
+    #[test]
+    fn the_rates_line_says_the_numbers_the_source_and_what_could_not_be_converted() {
+        let rates = CurrencyRates {
+            chaos_per_divine_milli: Some(13_000),
+            exalted_per_divine_milli: Some(186_000),
+            mirror_per_divine_milli: None,
+        };
+        let ninja = RateSources {
+            chaos: RateSource::Ninja,
+            exalted: RateSource::Ninja,
+            mirror: RateSource::Unknown,
+        };
+        assert_eq!(
+            rates_status_line(&rates, &ninja, 0, &i18n::SIMPLIFIED_CHINESE),
+            "汇率:1 divine = 13 chaos · 186 exalted(poe.ninja)"
+        );
+        assert_eq!(
+            rates_status_line(&rates, &ninja, 0, &i18n::ENGLISH),
+            "Rates: 1 divine = 13 chaos · 186 exalted (poe.ninja)"
+        );
+
+        // 手填的那几档要说出来:汇率不对时"去设置页改"和"等 ninja 恢复"
+        // 是两条不同的路。
+        let manual = RateSources {
+            chaos: RateSource::Manual,
+            exalted: RateSource::Manual,
+            mirror: RateSource::Unknown,
+        };
+        assert_eq!(
+            rates_status_line(&rates, &manual, 4, &i18n::SIMPLIFIED_CHINESE),
+            "汇率:1 divine = 13 chaos · 186 exalted(手动) · 4 条未折算"
+        );
+        // 一档手填、一档接口给的,两边都说。
+        let mixed = RateSources {
+            chaos: RateSource::Manual,
+            ..ninja
+        };
+        assert!(
+            rates_status_line(&rates, &mixed, 0, &i18n::ENGLISH).contains("poe.ninja + manual"),
+            "一半是自己填的,那正是最该看见的情况"
+        );
+
+        // 一档都没有:写"还没读到",而不是一行 0。
+        let nothing = rates_status_line(
+            &CurrencyRates::none(),
+            &RateSources::default(),
+            2,
+            &i18n::SIMPLIFIED_CHINESE,
+        );
+        assert!(nothing.starts_with("汇率:还没读到"), "{nothing}");
+        assert!(nothing.ends_with("2 条未折算"), "{nothing}");
+        // 只有一档时缺的那格写破折号,不写 0("值 0 chaos"是另一个意思)。
+        let half = CurrencyRates {
+            exalted_per_divine_milli: None,
+            ..rates
+        };
+        assert_eq!(
+            rates_status_line(&half, &ninja, 0, &i18n::ENGLISH),
+            "Rates: 1 divine = 13 chaos · — exalted (poe.ninja)"
+        );
+    }
+
+    /// 两种口径各画各的那一份,而且换一栏不用回库里重读。
+    #[test]
+    fn the_price_tab_keeps_both_ladders_in_memory() {
+        let data = ObservationData {
+            prices_by_currency: vec![price_outcome(2_000, 8, 6, 6)],
+            prices_converted: vec![price_outcome(500, 3, 2, 2), price_outcome(2_000, 5, 4, 4)],
+            unconverted: 1,
+            ..ObservationData::default()
+        };
+        assert_eq!(data.prices(PriceMode::ByCurrency).len(), 1);
+        assert_eq!(data.prices(PriceMode::Converted).len(), 2);
+        // 默认就是折算那一栏:按币种那一栏答不出"值 2 divine 的货卖不卖得掉"。
+        assert_eq!(PriceMode::default(), PriceMode::Converted);
     }
 
     /// 样本门槛对两张表是同一个:三件货里卖掉两件不能叫 67% 成交率,

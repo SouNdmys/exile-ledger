@@ -113,10 +113,101 @@ pub struct CurrencyRates {
     pub mirror_per_divine_milli: Option<i64>,
 }
 
+/// 手填的汇率。`None` = 这一档听 poe.ninja 的。
+///
+/// 为什么要有它:交易站自己那个"折合 exalted"的价格筛选按一个和市面差得
+/// 很远的内部汇率换算(2026-09-09 它把 700 exalted 当成 8 divine,而市面上
+/// 1 divine ≈ 186 exalted),而且一旦按某种货币筛,别的货币标价的挂单会
+/// **整批消失**。所以价格区间搬进这个程序里判,而程序手上那份汇率得能被
+/// 人工顶掉 —— poe.ninja 的经济接口也会有跟不上的那一天。
+///
+/// 只给 chaos 和 exalted:mirror 那一档是给"一件镜子货"用的,填它没有意义。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RateOverride {
+    pub chaos_per_divine_milli: Option<i64>,
+    pub exalted_per_divine_milli: Option<i64>,
+}
+
+/// 一档汇率是从哪儿来的。界面上那句「(poe.ninja)」/「(手动)」写的就是它。
+///
+/// 要单独记一笔,是因为"这个数是我自己填的"和"这个数是接口给的"在出错时
+/// 是两条完全不同的路:前者去设置页改,后者去看 ninja 是不是又抽风了。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateSource {
+    /// 这一档没有汇率:接口没给,人也没填。
+    #[default]
+    Unknown,
+    /// poe.ninja 的经济接口。
+    Ninja,
+    /// 设置页里手填的那个数。
+    Manual,
+}
+
+/// 三档货币各自的来路。和 [`CurrencyRates`] 分开放,是因为汇率表本身会
+/// 被存进事件、传给纯判定,而"来路"只有界面关心。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateSources {
+    pub chaos: RateSource,
+    pub exalted: RateSource,
+    pub mirror: RateSource,
+}
+
 impl CurrencyRates {
     /// 一张空表:还没读到经济接口时用它,异币种一律判 `DifferentCurrency`。
     pub fn none() -> CurrencyRates {
         CurrencyRates::default()
+    }
+
+    /// 手填的那几档盖上去,没填的原样留着。
+    ///
+    /// `or` 而不是 `unwrap_or`:填了就用填的(哪怕接口那一档也有值),
+    /// 没填就退回接口那一档 —— 清空输入框于是真的等于"重新听 poe.ninja 的"。
+    #[must_use]
+    pub fn with_override(&self, manual: &RateOverride) -> CurrencyRates {
+        CurrencyRates {
+            chaos_per_divine_milli: manual
+                .chaos_per_divine_milli
+                .or(self.chaos_per_divine_milli),
+            exalted_per_divine_milli: manual
+                .exalted_per_divine_milli
+                .or(self.exalted_per_divine_milli),
+            // mirror 填不了,所以它永远是接口那一档。
+            mirror_per_divine_milli: self.mirror_per_divine_milli,
+        }
+    }
+
+    /// 盖完之后每一档各是从哪儿来的。顺序和 [`CurrencyRates::with_override`]
+    /// 一致 —— 两个方法必须对同一份输入给出对得上的答案。
+    #[must_use]
+    pub fn rate_sources(&self, manual: &RateOverride) -> RateSources {
+        RateSources {
+            chaos: rate_source(self.chaos_per_divine_milli, manual.chaos_per_divine_milli),
+            exalted: rate_source(
+                self.exalted_per_divine_milli,
+                manual.exalted_per_divine_milli,
+            ),
+            mirror: rate_source(self.mirror_per_divine_milli, None),
+        }
+    }
+
+    /// 换算成 divine(千分整数)。汇率缺一个就返回 `None`,绝不用默认值糊弄。
+    ///
+    /// 中间用 i128 是因为 `amount_milli * 1000` 在 mirror 这种大数上会顶到
+    /// i64 边缘;除法向零取整,误差不超过 0.001 divine,对"够不够便宜"这个
+    /// 判断无所谓。
+    #[must_use]
+    pub fn to_divine_milli(&self, price: &Price) -> Option<i64> {
+        if price.currency == Currency::Divine {
+            return Some(price.amount_milli);
+        }
+        let rate_milli = self.per_divine_milli(&price.currency)?;
+        if rate_milli <= 0 {
+            return None;
+        }
+        let divine_milli = (price.amount_milli as i128) * 1000 / (rate_milli as i128);
+        i64::try_from(divine_milli).ok()
     }
 
     fn per_divine_milli(&self, currency: &Currency) -> Option<i64> {
@@ -129,20 +220,15 @@ impl CurrencyRates {
     }
 }
 
-/// 换算成 divine(千分整数)。汇率缺一个就返回 `None`,绝不用默认值糊弄。
-///
-/// 中间用 i128 是因为 `amount_milli * 1000` 在 mirror 这种大数上会顶到 i64 边缘;
-/// 除法向零取整,误差不超过 0.001 divine,对"够不够便宜"这个判断无所谓。
-pub fn to_divine_milli(price: &Price, rates: &CurrencyRates) -> Option<i64> {
-    if price.currency == Currency::Divine {
-        return Some(price.amount_milli);
+/// 手填的优先,其次接口,都没有就是"不知道"。
+fn rate_source(from_ninja: Option<i64>, manual: Option<i64>) -> RateSource {
+    if manual.is_some() {
+        RateSource::Manual
+    } else if from_ninja.is_some() {
+        RateSource::Ninja
+    } else {
+        RateSource::Unknown
     }
-    let rate_milli = rates.per_divine_milli(&price.currency)?;
-    if rate_milli <= 0 {
-        return None;
-    }
-    let divine_milli = (price.amount_milli as i128) * 1000 / (rate_milli as i128);
-    i64::try_from(divine_milli).ok()
 }
 
 /// 一条挂单相对你设的上限是什么结论。
@@ -171,7 +257,7 @@ pub fn judge(cap: &PriceCap, price: Option<&Price>, rates: &CurrencyRates) -> Ve
         };
     }
 
-    match (to_divine_milli(price, rates), to_divine_milli(cap, rates)) {
+    match (rates.to_divine_milli(price), rates.to_divine_milli(cap)) {
         (Some(listed), Some(limit)) if listed <= limit => Verdict::Hit,
         (Some(_), Some(_)) => Verdict::TooExpensive,
         _ => Verdict::DifferentCurrency,
@@ -311,19 +397,79 @@ mod price_tests {
     #[test]
     fn converts_to_divine() {
         let rates = rates_today();
-        assert_eq!(to_divine_milli(&divine(3.0), &rates), Some(3_000));
+        assert_eq!(rates.to_divine_milli(&divine(3.0)), Some(3_000));
         assert_eq!(
-            to_divine_milli(&Price::from_trade(90.0, "chaos"), &rates),
+            rates.to_divine_milli(&Price::from_trade(90.0, "chaos")),
             Some(3_570)
         );
         assert_eq!(
-            to_divine_milli(&Price::from_trade(1.0, "mirror"), &rates),
+            rates.to_divine_milli(&Price::from_trade(1.0, "mirror")),
             None
         );
         assert_eq!(
-            to_divine_milli(&Price::from_trade(1.0, "regal"), &rates),
+            rates.to_divine_milli(&Price::from_trade(1.0, "regal")),
             None
         );
+    }
+
+    /// 手填的汇率盖过 poe.ninja 那个,清空就退回去。
+    ///
+    /// 这一条是整件事的起点:交易站自己那个"等值"筛选把 700 exalted 当成
+    /// 8 divine(市面上是 1 divine ≈ 186 exalted),所以价格区间搬进程序里,
+    /// 而程序手上那份汇率必须能被人工顶掉。
+    #[test]
+    fn a_manual_rate_beats_the_one_from_ninja_and_clearing_it_falls_back() {
+        let ninja = rates_today();
+        let manual = RateOverride {
+            chaos_per_divine_milli: Some(13_000),
+            exalted_per_divine_milli: None,
+        };
+        let merged = ninja.with_override(&manual);
+        assert_eq!(merged.chaos_per_divine_milli, Some(13_000), "手填的说了算");
+        assert_eq!(
+            merged.exalted_per_divine_milli, ninja.exalted_per_divine_milli,
+            "没填的那一档还是 poe.ninja 的"
+        );
+        assert_eq!(
+            merged.mirror_per_divine_milli,
+            ninja.mirror_per_divine_milli
+        );
+
+        // 清空之后一切照旧 —— 手填过一次不该从此和 ninja 断了。
+        assert_eq!(ninja.with_override(&RateOverride::default()), ninja);
+
+        // 一张空表 + 手填的数,照样能换算:这正是 ninja 读不到时的救急路。
+        let only_manual = CurrencyRates::none().with_override(&manual);
+        assert_eq!(
+            only_manual.to_divine_milli(&Price::from_trade(65.0, "chaos")),
+            Some(5_000),
+            "65 chaos ÷ 13 = 5 divine"
+        );
+    }
+
+    /// 每一档汇率都要说得出自己是从哪儿来的 —— 界面上那句话靠它。
+    #[test]
+    fn each_currency_says_where_its_rate_came_from() {
+        let ninja = rates_today();
+        let manual = RateOverride {
+            chaos_per_divine_milli: Some(13_000),
+            exalted_per_divine_milli: None,
+        };
+        assert_eq!(
+            ninja.rate_sources(&manual),
+            RateSources {
+                chaos: RateSource::Manual,
+                exalted: RateSource::Ninja,
+                // 今天这张表里没有 mirror,而 mirror 是填不了的。
+                mirror: RateSource::Unknown,
+            }
+        );
+        // 什么都没有的时候三档都是"不知道",而不是默认成 poe.ninja。
+        assert_eq!(
+            CurrencyRates::none().rate_sources(&RateOverride::default()),
+            RateSources::default()
+        );
+        assert_eq!(RateSources::default().chaos, RateSource::Unknown);
     }
 
     #[test]

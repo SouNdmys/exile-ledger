@@ -20,11 +20,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pnd_domain::{GoneClass, ListingSummary, ObservationId, Price, next_check_after, price_bucket};
+use pnd_domain::{
+    GoneClass, ListingSummary, ObservationId, Price, divine_price_bucket, next_check_after,
+    price_bucket,
+};
 use pnd_ninja::character::{line_numbers, mod_template};
-use rusqlite::{OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::watch::{StorageError, WatchStore, decode_price, encode_price, to_u32};
+use crate::watch::{StorageError, WatchStore, decode_price, encode_price, has_column, to_u32};
 
 /// 建表语句。和 `BASELINE_SCHEMA` 一起在每次开库时跑一遍,所以必须能跑第二遍。
 pub(crate) const OBSERVE_SCHEMA: &str = r#"
@@ -90,6 +93,29 @@ CREATE TABLE IF NOT EXISTS observed_mods (
 CREATE INDEX IF NOT EXISTS observed_mods_template
     ON observed_mods(obs_id, template);
 "#;
+
+/// 折算价那三根新列:一条挂单**被看见的那一刻**折出来的 divine 价。
+///
+/// 为什么不写进上面那段建表语句里:这三张表已经在主人机器上跑了好几天,而
+/// `CREATE TABLE IF NOT EXISTS` 对一张已经存在的表一个字都改不动 —— 写进去
+/// 的话新库有这几列、老库没有,两条路当场分家。只加不改,新老走同一条路。
+/// SQLite 没有 `ADD COLUMN IF NOT EXISTS`,所以每一列都先问一句
+/// `PRAGMA table_info`。
+///
+/// 可空,而且没有默认值:加这一列之前记下的那些行**确实**不知道自己值多少
+/// divine,填 0 会让它们全落进最便宜那一档,凭空造出一批"白送也没人要"的货。
+pub(crate) fn add_divine_price_columns(conn: &Connection) -> Result<(), StorageError> {
+    for (table, column) in [
+        ("observed_listings", "first_price_div_milli"),
+        ("observed_listings", "last_price_div_milli"),
+        ("observed_price_history", "price_div_milli"),
+    ] {
+        if !has_column(conn, table, column)? {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} INTEGER"))?;
+        }
+    }
+    Ok(())
+}
 
 /// 交易站 `item` 里的词缀数组,和它在库里的那个名字。
 ///
@@ -198,6 +224,11 @@ pub struct ObservedListingRow {
     pub last_seen_at: i64,
     pub first_price: Option<Price>,
     pub last_price: Option<Price>,
+    /// 第一次见到它时,拿**那一刻**的汇率折出来的 divine 价(千分整数)。
+    /// `None` = 那一刻换不出来(没有那种货币的汇率),不是"值 0"。
+    pub first_price_div_milli: Option<i64>,
+    /// 同上,最后一次见到的那个价。降过价的话它和上面那个不一样。
+    pub last_price_div_milli: Option<i64>,
     pub price_changes: u32,
     pub status: ObservedStatus,
     pub gone_at: Option<i64>,
@@ -295,6 +326,31 @@ pub struct PriceOutcome {
     pub active: u32,
 }
 
+/// 价位战绩按哪种口径分档。
+///
+/// 两种口径回答的是两个问题:按币种问的是"标 2 divine 的货卖不卖得掉",
+/// 折算过的问的是"值 2 divine 的货卖不卖得掉" —— 后者才把标 chaos 的那批
+/// 和标 divine 的那批放在同一把尺子上量。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PriceMode {
+    /// 一种货币一套档位(这个程序原来的行为)。
+    ByCurrency,
+    /// 全部折成 divine,共用一条阶梯。
+    #[default]
+    Converted,
+}
+
+/// 一次价位聚合的结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PriceAggregate {
+    pub rows: Vec<PriceOutcome>,
+    /// 折算那一栏里**有价、但那一刻换不出 divine** 的挂单有几条。
+    ///
+    /// 单独数出来是因为它们在表上一行都看不见:不说一声的话,一条只跑过
+    /// 半天的观察看起来就像"总共才这么几件货"。按币种那一栏恒为 0。
+    pub unconverted: u32,
+}
+
 /// 一条挂单身上的一条词缀。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObservedMod {
@@ -382,10 +438,16 @@ impl WatchStore {
     /// 见到一条**先前标成没了**的挂单会把它重新算成还挂着:那说明上一轮的
     /// "没了"判错了(搜索那一刻它恰好不在前 100 条里,或者服务端抽了一下),
     /// 而"它还在"是眼见为实的事。
+    ///
+    /// `price_div_milli` 是**此刻**这个价折成 divine 值多少(调用方拿手上那份
+    /// 汇率算好传进来,换不出来就是 `None`)。存下来而不是以后现算:汇率天天
+    /// 变,一条三天前的 60 chaos 挂单今天再折一次得到的是今天的答案,而"什么
+    /// 价卖得掉"问的是它挂在那儿的那几天值多少。
     pub fn record_seen(
         &self,
         obs_id: &ObservationId,
         listing: &ListingSummary,
+        price_div_milli: Option<i64>,
         now: i64,
     ) -> Result<SeenKind, StorageError> {
         let (price_milli, currency) = encode_price(listing.price.as_ref());
@@ -404,8 +466,9 @@ impl WatchStore {
             tx.execute(
                 "INSERT INTO observed_listings (obs_id, listing_id, item_name, item_json, seller,
                      indexed_at, first_seen_at, last_seen_at, currency, first_price_milli,
-                     last_price_milli, price_changes, status, check_rung, next_check_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?9, 0, 'active', 0, ?10)",
+                     last_price_milli, first_price_div_milli, last_price_div_milli,
+                     price_changes, status, check_rung, next_check_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?9, ?10, ?10, 0, 'active', 0, ?11)",
                 params![
                     obs_id.as_str(),
                     listing.id,
@@ -416,13 +479,22 @@ impl WatchStore {
                     now,
                     currency,
                     price_milli,
+                    price_div_milli,
                     first_check_at(now),
                 ],
             )?;
             tx.execute(
-                "INSERT INTO observed_price_history (obs_id, listing_id, at, price_milli, currency)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![obs_id.as_str(), listing.id, now, price_milli, currency],
+                "INSERT INTO observed_price_history (obs_id, listing_id, at, price_milli,
+                     currency, price_div_milli)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    obs_id.as_str(),
+                    listing.id,
+                    now,
+                    price_milli,
+                    currency,
+                    price_div_milli
+                ],
             )?;
             for (ordinal_kind, entry) in observed_mods_from_item_json(&listing.item_json)
                 .into_iter()
@@ -448,6 +520,9 @@ impl WatchStore {
             return Ok(SeenKind::New);
         };
 
+        // 价没变就**连折算价也不动**。汇率是会变的,拿今天的汇率把三天前
+        // 那条挂单重折一遍,存下来的就成了"它今天值多少",而这张表要回答的
+        // 是"它挂出来的那天值多少"。换句话说:这里少写一次,历史才是历史。
         if old_milli == price_milli && old_currency == currency {
             self.conn.execute(
                 "UPDATE observed_listings
@@ -462,6 +537,7 @@ impl WatchStore {
         tx.execute(
             "UPDATE observed_listings
              SET last_seen_at = ?3, last_price_milli = ?4, currency = ?5,
+                 last_price_div_milli = ?6,
                  price_changes = price_changes + 1,
                  status = 'active', gone_at = NULL, gone_class = NULL
              WHERE obs_id = ?1 AND listing_id = ?2",
@@ -470,13 +546,22 @@ impl WatchStore {
                 listing.id,
                 now,
                 price_milli,
-                currency.clone()
+                currency.clone(),
+                price_div_milli,
             ],
         )?;
         tx.execute(
-            "INSERT INTO observed_price_history (obs_id, listing_id, at, price_milli, currency)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![obs_id.as_str(), listing.id, now, price_milli, currency],
+            "INSERT INTO observed_price_history (obs_id, listing_id, at, price_milli,
+                 currency, price_div_milli)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                obs_id.as_str(),
+                listing.id,
+                now,
+                price_milli,
+                currency,
+                price_div_milli
+            ],
         )?;
         tx.commit()?;
         Ok(SeenKind::PriceChanged {
@@ -913,7 +998,8 @@ impl WatchStore {
         // (两条 `+#% to Fire Resistance` 合不到一起),不去重会把它算成两件。
         let mut statement = self.conn.prepare(
             "SELECT DISTINCT m.mod_kind, m.template, m.listing_id, l.status, l.gone_class,
-                    l.last_price_milli, l.currency, l.first_seen_at, l.last_seen_at
+                    l.last_price_milli, l.currency, l.first_seen_at, l.last_seen_at,
+                    l.last_price_div_milli
              FROM observed_mods m
              JOIN observed_listings l
                ON l.obs_id = m.obs_id AND l.listing_id = m.listing_id
@@ -931,6 +1017,7 @@ impl WatchStore {
                 currency: row.get(6)?,
                 first_seen_at: row.get(7)?,
                 last_seen_at: row.get(8)?,
+                price_div_milli: row.get(9)?,
             })
         })?;
 
@@ -974,9 +1061,11 @@ impl WatchStore {
     pub fn price_aggregate(
         &self,
         obs_id: &ObservationId,
-    ) -> Result<Vec<PriceOutcome>, StorageError> {
+        mode: PriceMode,
+    ) -> Result<PriceAggregate, StorageError> {
         let mut statement = self.conn.prepare(
-            "SELECT currency, last_price_milli, status, gone_class, first_seen_at, last_seen_at
+            "SELECT currency, last_price_milli, last_price_div_milli, status, gone_class,
+                    first_seen_at, last_seen_at
              FROM observed_listings
              WHERE obs_id = ?1 AND currency <> ''",
         )?;
@@ -984,23 +1073,39 @@ impl WatchStore {
             Ok(PriceAggregateRow {
                 currency: row.get(0)?,
                 price_milli: row.get(1)?,
-                status: ObservedStatus::parse(&row.get::<_, String>(2)?),
+                price_div_milli: row.get(2)?,
+                status: ObservedStatus::parse(&row.get::<_, String>(3)?),
                 gone_class: row
-                    .get::<_, Option<String>>(3)?
+                    .get::<_, Option<String>>(4)?
                     .map(|raw| GoneClass::parse(&raw)),
-                first_seen_at: row.get(4)?,
-                last_seen_at: row.get(5)?,
+                first_seen_at: row.get(5)?,
+                last_seen_at: row.get(6)?,
             })
         })?;
 
         let mut buckets: BTreeMap<(String, i64), PriceAccumulator> = BTreeMap::new();
+        let mut unconverted = 0u32;
         for row in rows {
             let row = row?;
-            let bucket = price_bucket(row.price_milli).lower_bound_milli;
-            buckets
-                .entry((row.currency.clone(), bucket))
-                .or_default()
-                .add(&row);
+            let key = match mode {
+                PriceMode::ByCurrency => (
+                    row.currency.clone(),
+                    price_bucket(row.price_milli).lower_bound_milli,
+                ),
+                PriceMode::Converted => {
+                    // 那一刻换不出来的行整条不进表 —— 它归不进任何一档,
+                    // 但必须数一笔,不然界面上看不出少了什么。
+                    let Some(div_milli) = row.price_div_milli else {
+                        unconverted += 1;
+                        continue;
+                    };
+                    (
+                        DIVINE.to_string(),
+                        divine_price_bucket(div_milli).lower_bound_milli,
+                    )
+                }
+            };
+            buckets.entry(key).or_default().add(&row);
         }
 
         let mut out: Vec<PriceOutcome> = buckets
@@ -1016,7 +1121,10 @@ impl WatchStore {
                 .then_with(|| left.currency.cmp(&right.currency))
                 .then_with(|| left.bucket_milli.cmp(&right.bucket_milli))
         });
-        Ok(out)
+        Ok(PriceAggregate {
+            rows: out,
+            unconverted,
+        })
     }
 
     /// 删掉一条观察:四张表全清。
@@ -1045,7 +1153,8 @@ impl WatchStore {
 /// 挂单行的列清单。三处查询共用,免得加一列漏改一处。
 const LISTING_COLUMNS: &str = "SELECT listing_id, item_name, item_json, seller, indexed_at,
         first_seen_at, last_seen_at, currency, first_price_milli, last_price_milli,
-        price_changes, status, gone_at, gone_class, check_rung, next_check_at
+        price_changes, status, gone_at, gone_class, check_rung, next_check_at,
+        first_price_div_milli, last_price_div_milli
  FROM observed_listings";
 
 /// 刚记下的挂单十分钟后第一次回头看(阶梯第 0 档)。
@@ -1066,6 +1175,7 @@ struct AggregateRow {
     currency: String,
     first_seen_at: i64,
     last_seen_at: i64,
+    price_div_milli: Option<i64>,
 }
 
 /// 一条词缀模板的账本。
@@ -1074,11 +1184,15 @@ struct Accumulator {
     seen: u32,
     gone: u32,
     sold: u32,
-    /// 每种货币出现了几次 —— 中位价只按最常见的那种算。
+    /// 每种货币出现了几次 —— 退回按币种算中位价时只按最常见的那种。
     currencies: BTreeMap<String, u32>,
     /// (货币, 金额),分别来自卖掉的和还挂着的。
     sold_prices: Vec<(String, i64)>,
     active_prices: Vec<(String, i64)>,
+    /// 同上,但已经折成 divine 的那些。有它们就用它们:跨货币的中位数
+    /// 只有折算过才算得出来。
+    sold_div_prices: Vec<i64>,
+    active_div_prices: Vec<i64>,
     /// 卖掉的那些看得见的存活时间(秒)。
     sold_lifetimes: Vec<i64>,
 }
@@ -1093,6 +1207,9 @@ impl Accumulator {
             if !row.currency.is_empty() {
                 self.active_prices
                     .push((row.currency.clone(), row.price_milli));
+            }
+            if let Some(div_milli) = row.price_div_milli {
+                self.active_div_prices.push(div_milli);
             }
             return;
         }
@@ -1109,19 +1226,40 @@ impl Accumulator {
             self.sold_prices
                 .push((row.currency.clone(), row.price_milli));
         }
+        if let Some(div_milli) = row.price_div_milli {
+            self.sold_div_prices.push(div_milli);
+        }
     }
 
-    fn finish(self, mod_kind: String, template: String) -> ModOutcome {
-        let currency = dominant_currency(&self.currencies);
+    /// 中位价优先按 divine 算:只要这一组里有**一条**折得出来的,就把折得出
+    /// 来的那些一起算,得数标成 divine。折不出来的那几条只是不进中位数,
+    /// 见过 / 没了 / 卖掉的件数照样算它们。
+    ///
+    /// 一条都折不出来的组退回老规矩(最常见那种货币)——— 加这一列之前记下
+    /// 的老行全是那个样子,不该整片变成破折号。
+    fn finish(mut self, mod_kind: String, template: String) -> ModOutcome {
+        let (currency, mut sold, mut active) =
+            if self.sold_div_prices.is_empty() && self.active_div_prices.is_empty() {
+                let currency = dominant_currency(&self.currencies);
+                let sold = in_currency(&self.sold_prices, &currency);
+                let active = in_currency(&self.active_prices, &currency);
+                (currency, sold, active)
+            } else {
+                (
+                    DIVINE.to_string(),
+                    std::mem::take(&mut self.sold_div_prices),
+                    std::mem::take(&mut self.active_div_prices),
+                )
+            };
         ModOutcome {
             template,
             mod_kind,
             seen: self.seen,
             gone: self.gone,
             sold_likely: self.sold,
-            median_gone_price_milli: median_i64(&mut in_currency(&self.sold_prices, &currency)),
-            median_active_price_milli: median_i64(&mut in_currency(&self.active_prices, &currency)),
-            median_hours_alive: median_i64(&mut self.sold_lifetimes.clone())
+            median_gone_price_milli: median_i64(&mut sold),
+            median_active_price_milli: median_i64(&mut active),
+            median_hours_alive: median_i64(&mut self.sold_lifetimes)
                 .map(|secs| secs as f64 / 3_600.0),
             currency,
         }
@@ -1132,6 +1270,7 @@ impl Accumulator {
 struct PriceAggregateRow {
     currency: String,
     price_milli: i64,
+    price_div_milli: Option<i64>,
     status: ObservedStatus,
     gone_class: Option<GoneClass>,
     first_seen_at: i64,
@@ -1179,9 +1318,12 @@ impl PriceAccumulator {
     }
 }
 
+/// 库里 divine 那个货币码。折算过的行一律标它。
+const DIVINE: &str = "divine";
+
 /// 排序时货币的先后。divine 是主币,排最前;其余并列,由字典序分先后。
 fn currency_rank(currency: &str) -> u8 {
-    u8::from(currency != "divine")
+    u8::from(currency != DIVINE)
 }
 
 /// 这一组里最常见的货币;打平了按字典序小的,同样的库永远给同样的答案。
@@ -1318,6 +1460,8 @@ fn observed_listing_from_row(row: &Row<'_>) -> rusqlite::Result<ObservedListingR
         last_seen_at: row.get(6)?,
         first_price: decode_price(first_milli, &currency),
         last_price: decode_price(last_milli, &currency),
+        first_price_div_milli: row.get(16)?,
+        last_price_div_milli: row.get(17)?,
         price_changes: to_u32(price_changes),
         status: ObservedStatus::parse(&status),
         gone_at: row.get(12)?,
@@ -1446,7 +1590,7 @@ mod observe_tests {
             &["+115 to maximum Life", "Adds 29 to 38 [Cold|Cold] Damage"],
         );
         assert_eq!(
-            store.record_seen(&id, &item, 1_000).expect("record"),
+            store.record_seen(&id, &item, None, 1_000).expect("record"),
             SeenKind::New
         );
 
@@ -1491,7 +1635,7 @@ mod observe_tests {
 
         // 再见到同一条:只推 last_seen_at,first_seen_at 和词缀都不动。
         assert_eq!(
-            store.record_seen(&id, &item, 2_000).expect("record"),
+            store.record_seen(&id, &item, None, 2_000).expect("record"),
             SeenKind::Unchanged
         );
         let row = store
@@ -1509,12 +1653,14 @@ mod observe_tests {
         let store = store();
         let id = obs("o-1");
         store
-            .record_seen(&id, &listing("aaa", divine(20_000), &[]), 1_000)
+            .record_seen(&id, &listing("aaa", divine(20_000), &[]), None, 1_000)
             .expect("first");
 
         let cheaper = listing("aaa", divine(15_000), &[]);
         assert_eq!(
-            store.record_seen(&id, &cheaper, 2_000).expect("record"),
+            store
+                .record_seen(&id, &cheaper, None, 2_000)
+                .expect("record"),
             SeenKind::PriceChanged {
                 from: divine(20_000),
                 to: divine(15_000),
@@ -1544,7 +1690,9 @@ mod observe_tests {
 
         // 同一个价再见到就只是 Unchanged,不会重复记账。
         assert_eq!(
-            store.record_seen(&id, &cheaper, 3_000).expect("record"),
+            store
+                .record_seen(&id, &cheaper, None, 3_000)
+                .expect("record"),
             SeenKind::Unchanged
         );
         assert_eq!(
@@ -1564,7 +1712,7 @@ mod observe_tests {
         let id = obs("o-1");
         let item = listing("bbb", None, &[]);
         assert_eq!(
-            store.record_seen(&id, &item, 1_000).expect("record"),
+            store.record_seen(&id, &item, None, 1_000).expect("record"),
             SeenKind::New
         );
         let row = store
@@ -1580,7 +1728,7 @@ mod observe_tests {
         // 后来标价了 = 一次改价。
         assert_eq!(
             store
-                .record_seen(&id, &listing("bbb", divine(9_000), &[]), 2_000)
+                .record_seen(&id, &listing("bbb", divine(9_000), &[]), None, 2_000)
                 .expect("record"),
             SeenKind::PriceChanged {
                 from: None,
@@ -1596,7 +1744,7 @@ mod observe_tests {
         let id = obs("o-1");
         for (listing_id, at) in [("aaa", 3_000i64), ("bbb", 1_000), ("ccc", 2_000)] {
             store
-                .record_seen(&id, &listing(listing_id, divine(1_000), &[]), at)
+                .record_seen(&id, &listing(listing_id, divine(1_000), &[]), None, at)
                 .expect("record");
         }
         assert_eq!(
@@ -1606,7 +1754,7 @@ mod observe_tests {
 
         // 另一条观察见到同样的货,两边各记各的。
         store
-            .record_seen(&obs("o-2"), &listing("zzz", divine(1_000), &[]), 500)
+            .record_seen(&obs("o-2"), &listing("zzz", divine(1_000), &[]), None, 500)
             .expect("record");
         assert_eq!(store.active_listing_ids(&obs("o-2")).expect("ids"), ["zzz"]);
     }
@@ -1617,7 +1765,7 @@ mod observe_tests {
         let store = store();
         let id = obs("o-1");
         store
-            .record_seen(&id, &listing("aaa", divine(20_000), &[]), 1_000)
+            .record_seen(&id, &listing("aaa", divine(20_000), &[]), None, 1_000)
             .expect("record");
 
         let touched = store
@@ -1647,7 +1795,7 @@ mod observe_tests {
         let store = store();
         let id = obs("o-1");
         let item = listing("aaa", divine(20_000), &[]);
-        store.record_seen(&id, &item, 1_000).expect("record");
+        store.record_seen(&id, &item, None, 1_000).expect("record");
         // 中间回查过一次,它还在。
         store
             .touch_listings(&id, &["aaa".to_string()], 5_000)
@@ -1684,13 +1832,13 @@ mod observe_tests {
         let store = store();
         let id = obs("o-1");
         let item = listing("aaa", divine(20_000), &[]);
-        store.record_seen(&id, &item, 1_000).expect("record");
+        store.record_seen(&id, &item, None, 1_000).expect("record");
         store
             .mark_gone(&id, "aaa", 5_000, GoneClass::SoldLikely)
             .expect("gone");
         assert!(store.active_listing_ids(&id).expect("ids").is_empty());
 
-        store.record_seen(&id, &item, 6_000).expect("record");
+        store.record_seen(&id, &item, None, 6_000).expect("record");
         let row = store
             .observed_listing(&id, "aaa")
             .expect("read")
@@ -1716,7 +1864,7 @@ mod observe_tests {
         let store = store();
         let id = obs("o-1");
         store
-            .record_seen(&id, &listing("aaa", divine(20_000), &[]), 1_000)
+            .record_seen(&id, &listing("aaa", divine(20_000), &[]), None, 1_000)
             .expect("record");
         store
             .mark_gone(&id, "aaa", 5_000, GoneClass::SoldLikely)
@@ -1739,7 +1887,7 @@ mod observe_tests {
         let id = obs("o-1");
         for listing_id in ["a", "b", "c", "d", "e"] {
             store
-                .record_seen(&id, &listing(listing_id, divine(1_000), &[]), 1_000)
+                .record_seen(&id, &listing(listing_id, divine(1_000), &[]), None, 1_000)
                 .expect("record");
         }
         store
@@ -1779,7 +1927,12 @@ mod observe_tests {
         for (listing_id, first_seen) in [("a", 1_000i64), ("b", 2_000), ("c", 3_000), ("d", 4_000)]
         {
             store
-                .record_seen(&id, &listing(listing_id, divine(1_000), &[]), first_seen)
+                .record_seen(
+                    &id,
+                    &listing(listing_id, divine(1_000), &[]),
+                    None,
+                    first_seen,
+                )
                 .expect("record");
         }
         store
@@ -1827,7 +1980,7 @@ mod observe_tests {
         ];
         for (listing_id, price, alive, class) in rows {
             let item = listing(listing_id, divine(price), &["+115 to maximum Life"]);
-            store.record_seen(&id, &item, 1_000).expect("record");
+            store.record_seen(&id, &item, None, 1_000).expect("record");
             // 存活时间是"看见的那一段":推一次 last_seen 就是它。
             store
                 .touch_listings(&id, &[listing_id.to_string()], 1_000 + alive)
@@ -1869,7 +2022,7 @@ mod observe_tests {
                 "+35% to [Resistances|Fire Resistance]",
             ],
         );
-        store.record_seen(&id, &item, 1_000).expect("record");
+        store.record_seen(&id, &item, None, 1_000).expect("record");
         // 两条词缀行都进了库(ordinal 不同),但聚合时是一件货。
         assert_eq!(store.observed_mods(&id, "aaa").expect("mods").len(), 2);
 
@@ -1891,7 +2044,7 @@ mod observe_tests {
             ("c", Price::new(900_000, Currency::Chaos)),
         ] {
             let item = listing(listing_id, Some(price), &mods);
-            store.record_seen(&id, &item, 1_000).expect("record");
+            store.record_seen(&id, &item, None, 1_000).expect("record");
         }
         let aggregate = store.mod_aggregate(&id, 1).expect("aggregate");
         assert_eq!(aggregate[0].currency, "divine");
@@ -1925,7 +2078,7 @@ mod observe_tests {
         ];
         for (listing_id, price, alive, class) in rows {
             let item = listing(listing_id, divine(price), &[]);
-            store.record_seen(&id, &item, 1_000).expect("record");
+            store.record_seen(&id, &item, None, 1_000).expect("record");
             // 存活时间是"看见的那一段":推一次 last_seen 就是它。
             store
                 .touch_listings(&id, &[listing_id.to_string()], 1_000 + alive)
@@ -1937,7 +2090,10 @@ mod observe_tests {
             }
         }
 
-        let aggregate = store.price_aggregate(&id).expect("aggregate");
+        let aggregate = store
+            .price_aggregate(&id, PriceMode::ByCurrency)
+            .expect("aggregate")
+            .rows;
         assert_eq!(aggregate.len(), 2, "两档:{aggregate:#?}");
 
         let cheap = &aggregate[0];
@@ -1970,16 +2126,19 @@ mod observe_tests {
         let store = store();
         let id = obs("o-1");
         store
-            .record_seen(&id, &listing("a", divine(3_500), &[]), 1_000)
+            .record_seen(&id, &listing("a", divine(3_500), &[]), None, 1_000)
             .expect("first");
         store
-            .record_seen(&id, &listing("a", divine(2_200), &[]), 5_000)
+            .record_seen(&id, &listing("a", divine(2_200), &[]), None, 5_000)
             .expect("cut");
         store
             .mark_gone(&id, "a", 6_000, GoneClass::SoldAfterCuts)
             .expect("gone");
 
-        let aggregate = store.price_aggregate(&id).expect("aggregate");
+        let aggregate = store
+            .price_aggregate(&id, PriceMode::ByCurrency)
+            .expect("aggregate")
+            .rows;
         assert_eq!(aggregate.len(), 1);
         assert_eq!(aggregate[0].bucket_milli, 2_000, "降到 2.2 才卖掉的");
         assert_eq!(aggregate[0].looks_sold, 1);
@@ -1998,10 +2157,13 @@ mod observe_tests {
             ("d", Price::new(500, Currency::Divine)),
         ] {
             store
-                .record_seen(&id, &listing(listing_id, Some(price), &[]), 1_000)
+                .record_seen(&id, &listing(listing_id, Some(price), &[]), None, 1_000)
                 .expect("record");
         }
-        let aggregate = store.price_aggregate(&id).expect("aggregate");
+        let aggregate = store
+            .price_aggregate(&id, PriceMode::ByCurrency)
+            .expect("aggregate")
+            .rows;
         assert_eq!(
             aggregate
                 .iter()
@@ -2028,10 +2190,10 @@ mod observe_tests {
         let store = store();
         let id = obs("o-1");
         store
-            .record_seen(&id, &listing("priced", divine(2_000), &[]), 1_000)
+            .record_seen(&id, &listing("priced", divine(2_000), &[]), None, 1_000)
             .expect("record");
         store
-            .record_seen(&id, &listing("unpriced", None, &[]), 1_000)
+            .record_seen(&id, &listing("unpriced", None, &[]), None, 1_000)
             .expect("record");
         assert!(
             store
@@ -2039,7 +2201,10 @@ mod observe_tests {
                 .expect("record")
         );
 
-        let aggregate = store.price_aggregate(&id).expect("aggregate");
+        let aggregate = store
+            .price_aggregate(&id, PriceMode::ByCurrency)
+            .expect("aggregate")
+            .rows;
         assert_eq!(aggregate.len(), 1, "只有那条有价的进表:{aggregate:#?}");
         assert_eq!(aggregate[0].bucket_milli, 2_000);
         assert_eq!(aggregate[0].seen, 1);
@@ -2068,9 +2233,11 @@ mod observe_tests {
                 })
                 .expect("state");
             let item = listing("aaa", divine(20_000), &["+115 to maximum Life"]);
-            store.record_seen(target, &item, 1_000).expect("record");
             store
-                .record_seen(target, &listing("aaa", divine(10_000), &[]), 2_000)
+                .record_seen(target, &item, None, 1_000)
+                .expect("record");
+            store
+                .record_seen(target, &listing("aaa", divine(10_000), &[]), None, 2_000)
                 .expect("record");
         }
 
@@ -2127,7 +2294,7 @@ mod observe_tests {
         let store = store();
         let id = obs("o-1");
         store
-            .record_seen(&id, &listing("aaa", divine(20_000), &[]), 1_000)
+            .record_seen(&id, &listing("aaa", divine(20_000), &[]), None, 1_000)
             .expect("record");
         let row = store
             .observed_listing(&id, "aaa")
@@ -2145,14 +2312,14 @@ mod observe_tests {
         let one = obs("o-1");
         let two = obs("o-2");
         store
-            .record_seen(&one, &listing("a", divine(1_000), &[]), 1_000)
+            .record_seen(&one, &listing("a", divine(1_000), &[]), None, 1_000)
             .expect("record");
         store
-            .record_seen(&two, &listing("b", divine(1_000), &[]), 900)
+            .record_seen(&two, &listing("b", divine(1_000), &[]), None, 900)
             .expect("record");
         // 还没到点的那条不该被捞出来。
         store
-            .record_seen(&one, &listing("c", divine(1_000), &[]), 5_000)
+            .record_seen(&one, &listing("c", divine(1_000), &[]), None, 5_000)
             .expect("record");
 
         let due = store
@@ -2205,7 +2372,7 @@ mod observe_tests {
         let id = obs("o-1");
         for (listing_id, at) in [("a", 1_000), ("b", 1_100), ("c", 1_200)] {
             store
-                .record_seen(&id, &listing(listing_id, divine(1_000), &[]), at)
+                .record_seen(&id, &listing(listing_id, divine(1_000), &[]), None, at)
                 .expect("record");
         }
         // 三条都到点了(第一档是 +600 秒)。
@@ -2233,7 +2400,7 @@ mod observe_tests {
         let store = store();
         let id = obs("o-1");
         store
-            .record_seen(&id, &listing("aaa", divine(1_000), &[]), 1_000)
+            .record_seen(&id, &listing("aaa", divine(1_000), &[]), None, 1_000)
             .expect("record");
 
         store
@@ -2347,6 +2514,7 @@ mod observe_tests {
             .record_seen(
                 &id,
                 &listing_with_item_json("amulet", CHOIR_ITEM_JSON),
+                None,
                 1_000,
             )
             .expect("record");
@@ -2410,12 +2578,18 @@ mod observe_tests {
                         r#"{"explicitMods":[{"description":"+80 to maximum Life",
                              "hash":"stat.explicit.stat_3299347043"}]}"#,
                     ),
+                    None,
                     1_000 + i64::from(index),
                 )
                 .expect("record");
         }
         store
-            .record_seen(&id, &listing_with_item_json("new", CHOIR_ITEM_JSON), 9_000)
+            .record_seen(
+                &id,
+                &listing_with_item_json("new", CHOIR_ITEM_JSON),
+                None,
+                9_000,
+            )
             .expect("record");
 
         assert_eq!(
@@ -2442,7 +2616,12 @@ mod observe_tests {
         let two = obs("o-2");
         for (target, listing_id) in [(&one, "a"), (&one, "b"), (&two, "c")] {
             store
-                .record_seen(target, &listing(listing_id, divine(1_000), &[]), 1_000)
+                .record_seen(
+                    target,
+                    &listing(listing_id, divine(1_000), &[]),
+                    None,
+                    1_000,
+                )
                 .expect("record");
         }
         store.mark_gone(&one, "b", 1_100, GoneClass::Unknown).ok();
@@ -2467,10 +2646,10 @@ mod observe_tests {
         let id = obs("o-1");
         assert_eq!(store.next_check_due_at(&id).expect("next"), None);
         store
-            .record_seen(&id, &listing("a", divine(1_000), &[]), 1_000)
+            .record_seen(&id, &listing("a", divine(1_000), &[]), None, 1_000)
             .expect("record");
         store
-            .record_seen(&id, &listing("b", divine(1_000), &[]), 2_000)
+            .record_seen(&id, &listing("b", divine(1_000), &[]), None, 2_000)
             .expect("record");
         assert_eq!(store.next_check_due_at(&id).expect("next"), Some(1_600));
         // 不再回查的那条不算数。
@@ -2493,6 +2672,7 @@ mod observe_tests {
             .record_seen(
                 &id,
                 &listing("alive", divine(20_000), &["+115 to maximum Life"]),
+                None,
                 1_000,
             )
             .expect("record");
@@ -2545,6 +2725,289 @@ mod observe_tests {
                 .status,
             ObservedStatus::Active
         );
+    }
+
+    // ---- 折成 divine ----------------------------------------------------
+
+    fn chaos(amount_milli: i64) -> Option<Price> {
+        Some(Price::new(amount_milli, Currency::Chaos))
+    }
+
+    /// 这条挂单的价格轨迹上存下来的 divine 等价,老的在前。
+    fn history_div(
+        store: &WatchStore,
+        obs_id: &ObservationId,
+        listing_id: &str,
+    ) -> Vec<Option<i64>> {
+        let mut statement = store
+            .conn
+            .prepare(
+                "SELECT price_div_milli FROM observed_price_history
+                 WHERE obs_id = ?1 AND listing_id = ?2 ORDER BY at ASC",
+            )
+            .expect("prepare");
+        let rows = statement
+            .query_map(params![obs_id.as_str(), listing_id], |row| row.get(0))
+            .expect("query");
+        rows.map(|row| row.expect("row")).collect()
+    }
+
+    /// 记下一条挂单的同时,把**当时**那个汇率折出来的 divine 价一起存下来。
+    ///
+    /// 为什么当场折、不留到以后再算:汇率天天变。一条三天前记下的 60 chaos
+    /// 挂单,今天再折一次得到的是今天的答案,而我们想问的是"它挂在那儿的
+    /// 那几天值多少" —— 后者才撑得起"什么价卖得掉"。
+    #[test]
+    fn a_listing_stores_the_divine_equivalent_it_had_when_it_was_seen() {
+        let store = store();
+        let id = obs("o-1");
+        // 那天 1 divine = 13 chaos:60 chaos ≈ 4.615 divine。
+        store
+            .record_seen(&id, &listing("aaa", chaos(60_000), &[]), Some(4_615), 1_000)
+            .expect("record");
+        let row = store
+            .observed_listing(&id, "aaa")
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.first_price_div_milli, Some(4_615));
+        assert_eq!(row.last_price_div_milli, Some(4_615));
+        assert_eq!(history_div(&store, &id, "aaa"), vec![Some(4_615)]);
+
+        // 降价到 39 chaos ≈ 3 divine:第一个折算价不动,最后一个跟着走。
+        store
+            .record_seen(&id, &listing("aaa", chaos(39_000), &[]), Some(3_000), 2_000)
+            .expect("record");
+        let row = store
+            .observed_listing(&id, "aaa")
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            row.first_price_div_milli,
+            Some(4_615),
+            "第一个折算价永远不动"
+        );
+        assert_eq!(row.last_price_div_milli, Some(3_000));
+        assert_eq!(
+            history_div(&store, &id, "aaa"),
+            vec![Some(4_615), Some(3_000)]
+        );
+
+        // 换不出来的(没有 mirror 汇率、认不出的货币)存空,不猜一个数。
+        store
+            .record_seen(
+                &id,
+                &listing("bbb", Some(Price::new(1_000, Currency::Mirror)), &[]),
+                None,
+                1_000,
+            )
+            .expect("record");
+        let row = store
+            .observed_listing(&id, "bbb")
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.first_price_div_milli, None);
+        assert_eq!(row.last_price_div_milli, None);
+        assert_eq!(history_div(&store, &id, "bbb"), vec![None]);
+
+        // 第一眼就没了的那种连价都没见过,自然也没有折算价。
+        store
+            .record_gone_before_first_look(&id, "quick", 2_000)
+            .expect("record");
+        let row = store
+            .observed_listing(&id, "quick")
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.last_price_div_milli, None);
+    }
+
+    /// 折算那一栏把所有货币归到一条 divine 阶梯上,换不出来的单独数一笔。
+    ///
+    /// 按币种分的那张表回答不了"这批货到底什么价卖得掉":标 chaos 的碑牌
+    /// 全挤在"不到 1 chaos"以外的另一套档位里,和标 divine 的那批各算各的。
+    #[test]
+    fn the_converted_price_table_folds_every_currency_onto_one_divine_ladder() {
+        let store = store();
+        let id = obs("o-1");
+        // 两条落在 2 divine 那一档(一条本来就是 divine,一条是 chaos 折过来的)。
+        store
+            .record_seen(&id, &listing("a", divine(2_400), &[]), Some(2_400), 1_000)
+            .expect("record");
+        store
+            .record_seen(&id, &listing("b", chaos(31_000), &[]), Some(2_384), 1_000)
+            .expect("record");
+        // 一条落在 1 以下那几根新横档上(0.5)。
+        store
+            .record_seen(&id, &listing("c", chaos(6_500), &[]), Some(500), 1_000)
+            .expect("record");
+        // 一条有价、但那天换不出来。
+        store
+            .record_seen(
+                &id,
+                &listing("d", Some(Price::new(1_000, Currency::Mirror)), &[]),
+                None,
+                1_000,
+            )
+            .expect("record");
+
+        let converted = store
+            .price_aggregate(&id, PriceMode::Converted)
+            .expect("aggregate");
+        assert_eq!(
+            converted
+                .rows
+                .iter()
+                .map(|row| (row.currency.as_str(), row.bucket_milli, row.seen))
+                .collect::<Vec<_>>(),
+            vec![("divine", 500, 1), ("divine", 2_000, 2)],
+            "全部按 divine 分档,1 以下也分得开"
+        );
+        assert_eq!(converted.unconverted, 1, "换不出来的那条要说出来");
+
+        // 按币种那一栏一个字都没变。
+        let by_currency = store
+            .price_aggregate(&id, PriceMode::ByCurrency)
+            .expect("aggregate");
+        assert_eq!(
+            by_currency
+                .rows
+                .iter()
+                .map(|row| (row.currency.as_str(), row.bucket_milli, row.seen))
+                .collect::<Vec<_>>(),
+            vec![
+                ("divine", 2_000, 1),
+                ("chaos", 6_000, 1),
+                ("chaos", 30_000, 1),
+                ("mirror", 1_000, 1),
+            ]
+        );
+        assert_eq!(
+            by_currency.unconverted, 0,
+            "按币种那一栏没有'换不出来'这回事"
+        );
+    }
+
+    /// 词缀战绩的中位价按 divine 一起算,不再只统计最常见那种货币。
+    ///
+    /// 三条 chaos 标价 + 两条 divine 标价的成交,老写法只拿 chaos 那三条算
+    /// 中位数,另外两条整条丢掉 —— 样本先被砍掉四成,得数还是 chaos。
+    #[test]
+    fn mod_medians_are_taken_in_divine_across_every_currency() {
+        let store = store();
+        let id = obs("o-1");
+        let mods = ["+115 to maximum Life"];
+        // 卖掉的五条:三条 chaos、两条 divine,折算价分别是 1 / 2 / 3 / 4 / 5 divine。
+        for (index, (price, div)) in [
+            (chaos(13_000), 1_000),
+            (chaos(26_000), 2_000),
+            (chaos(39_000), 3_000),
+            (divine(4_000), 4_000),
+            (divine(5_000), 5_000),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let listing_id = format!("sold-{index}");
+            store
+                .record_seen(&id, &listing(&listing_id, price, &mods), Some(div), 1_000)
+                .expect("record");
+            store
+                .mark_gone(&id, &listing_id, 10_000, GoneClass::SoldLikely)
+                .expect("gone");
+        }
+        // 还挂着的两条:折算价 8 和 10 divine。
+        store
+            .record_seen(
+                &id,
+                &listing("live-0", chaos(104_000), &mods),
+                Some(8_000),
+                1_000,
+            )
+            .expect("record");
+        store
+            .record_seen(
+                &id,
+                &listing("live-1", divine(10_000), &mods),
+                Some(10_000),
+                1_000,
+            )
+            .expect("record");
+
+        let aggregate = store.mod_aggregate(&id, 1).expect("aggregate");
+        assert_eq!(aggregate.len(), 1);
+        let row = &aggregate[0];
+        assert_eq!((row.seen, row.gone, row.sold_likely), (7, 5, 5));
+        assert_eq!(row.currency, "divine", "折算过之后中位数就是 divine 的");
+        assert_eq!(
+            row.median_gone_price_milli,
+            Some(3_000),
+            "五条一起算,中位是 3 divine —— 老写法只看 chaos 那三条"
+        );
+        assert_eq!(row.median_active_price_milli, Some(8_000));
+    }
+
+    /// 一条折算价都没有的那一组还是照老规矩来:取最常见那种货币的中位数。
+    ///
+    /// 库里那些在加这一列之前记下的老行就是这个样子,它们不该整片变成破折号。
+    #[test]
+    fn a_group_without_any_equivalent_keeps_its_own_currency_median() {
+        let store = store();
+        let id = obs("o-1");
+        let mods = ["+115 to maximum Life"];
+        for (index, price) in [chaos(13_000), chaos(26_000), chaos(39_000)]
+            .into_iter()
+            .enumerate()
+        {
+            let listing_id = format!("old-{index}");
+            store
+                .record_seen(&id, &listing(&listing_id, price, &mods), None, 1_000)
+                .expect("record");
+            store
+                .mark_gone(&id, &listing_id, 10_000, GoneClass::SoldLikely)
+                .expect("gone");
+        }
+        let aggregate = store.mod_aggregate(&id, 1).expect("aggregate");
+        assert_eq!(aggregate[0].currency, "chaos");
+        assert_eq!(aggregate[0].median_gone_price_milli, Some(26_000));
+    }
+
+    /// 三根新列是 `ALTER TABLE` 加上去的(那三张表已经在主人机器上跑了几天),
+    /// 所以开库这段必须能在同一个文件上跑第二遍而不炸。
+    #[test]
+    fn the_new_divine_columns_are_added_once_and_only_once() {
+        let path = std::env::temp_dir().join(format!(
+            "pnd-observe-migrate-{}-{}.sqlite",
+            std::process::id(),
+            line!()
+        ));
+        for suffix in ["", "-wal", "-shm"] {
+            let mut with_suffix = path.clone().into_os_string();
+            with_suffix.push(suffix);
+            let _ = std::fs::remove_file(with_suffix);
+        }
+        let columns = |store: &WatchStore, table: &str| -> Vec<String> {
+            let mut statement = store
+                .conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .expect("prepare");
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("query");
+            rows.map(|row| row.expect("row")).collect()
+        };
+        for _ in 0..2 {
+            let store = WatchStore::open(&path).expect("open");
+            let listing_columns = columns(&store, "observed_listings");
+            assert!(listing_columns.contains(&"first_price_div_milli".to_string()));
+            assert!(listing_columns.contains(&"last_price_div_milli".to_string()));
+            assert!(
+                columns(&store, "observed_price_history").contains(&"price_div_milli".to_string())
+            );
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let mut with_suffix = path.clone().into_os_string();
+            with_suffix.push(suffix);
+            let _ = std::fs::remove_file(with_suffix);
+        }
     }
 
     #[test]

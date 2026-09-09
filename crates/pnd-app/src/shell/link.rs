@@ -250,8 +250,9 @@ impl AppShell {
                 self.push_log(format!("runtime: cloudflare hold until {until}"));
                 self.set_sticky_notice(i18n::fill(text.notice_cloudflare, &[&local_clock(until)]));
             }
-            RuntimeEvent::RatesUpdated(rates) => {
+            RuntimeEvent::RatesUpdated { rates, sources } => {
                 self.rates = rates;
+                self.rate_sources = sources;
                 self.watches_dirty = true;
                 // 暗金榜那一列写的是"N exalted ≈ M divine",换算就靠这份汇率。
                 self.uniques_dirty = true;

@@ -173,8 +173,8 @@ pub struct PriceBucket {
 impl PriceBucket {
     /// 是不是最低那一档。
     ///
-    /// 单独问一句是因为它的写法和别的档不一样:界面上要写「不到 1 divine」,
-    /// 写成「0 divine」会读成"白送"。
+    /// 单独问一句是因为它的写法和别的档不一样:界面上要写「不到 1 divine」
+    /// (折算那条阶梯上是「不到 0.1 divine」),写成「0 divine」会读成"白送"。
     #[must_use]
     pub fn is_under_one(self) -> bool {
         self.lower_bound_milli == 0
@@ -195,6 +195,32 @@ pub fn price_bucket(amount_milli: i64) -> PriceBucket {
             break;
         }
         lower_bound_milli = bound;
+    }
+    PriceBucket { lower_bound_milli }
+}
+
+/// 折成 divine 之后那条阶梯在 1 以下的几根横档(千分整数)。
+///
+/// 只有折算过的那条要它们:按币种分的时候,"不到 1 chaos"那一格里本来就
+/// 几乎没有货;而全部折成 divine 之后,原先标着几十 chaos 的碑牌一整批都
+/// 落在 1 divine 以下 —— 挤在最低那一格里等于什么都没说。
+pub const SUB_DIVINE_BUCKET_MILLI: [i64; 5] = [100, 200, 300, 500, 750];
+
+/// 一个**折算成 divine** 的价落在哪一档。
+///
+/// 1 以上完全交给 [`price_bucket`]:两条阶梯在 1 以上是同一条,分成两份写
+/// 迟早会有一天对不上号。
+#[must_use]
+pub fn divine_price_bucket(amount_milli: i64) -> PriceBucket {
+    if amount_milli >= 1_000 {
+        return price_bucket(amount_milli);
+    }
+    let mut lower_bound_milli = 0;
+    for rung in SUB_DIVINE_BUCKET_MILLI {
+        if rung > amount_milli {
+            break;
+        }
+        lower_bound_milli = rung;
     }
     PriceBucket { lower_bound_milli }
 }
@@ -410,6 +436,44 @@ mod observe_tests {
         for units in PRICE_BUCKET_UNITS {
             assert_eq!(bound(units * 1_000), units * 1_000, "{units} 那一档");
         }
+    }
+
+    /// 折成 divine 之后那条阶梯,1 以下多五根横档。
+    ///
+    /// 为什么只有折算过的那条要:按币种分的时候,"不到 1 chaos"里几乎没有货,
+    /// 分再细也是空的;而全部折成 divine 之后,原先标着几十 chaos 的碑牌全落
+    /// 在 1 divine 以下 —— 整批货挤在最低那一格里,等于什么都没说。
+    #[test]
+    fn the_divine_ladder_splits_everything_below_one() {
+        let bound = |milli| divine_price_bucket(milli).lower_bound_milli;
+        // 1 以下的五根横档:0.1、0.2、0.3、0.5、0.75。
+        assert_eq!(bound(0), 0);
+        assert_eq!(bound(99), 0, "不到 0.1 的还是落在最低那一格");
+        assert_eq!(bound(100), 100);
+        assert_eq!(bound(150), 100);
+        assert_eq!(bound(200), 200);
+        assert_eq!(bound(499), 300);
+        assert_eq!(bound(500), 500);
+        assert_eq!(bound(749), 500);
+        assert_eq!(bound(750), 750);
+        assert_eq!(bound(999), 750);
+        // 1 以上和按币种那条阶梯一个字都不差。
+        for milli in [1_000, 2_500, 9_999, 15_000, 1_000_000, 9_999_999] {
+            assert_eq!(
+                bound(milli),
+                price_bucket(milli).lower_bound_milli,
+                "{milli}"
+            );
+        }
+        // 按币种那条阶梯**不动**:0.5 chaos 还是"不到 1 chaos"。
+        assert_eq!(price_bucket(500).lower_bound_milli, 0);
+        // 阶梯本身严格递增。
+        assert!(
+            SUB_DIVINE_BUCKET_MILLI
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        assert_eq!(SUB_DIVINE_BUCKET_MILLI[0], 100);
     }
 
     /// 阶梯的全程:10 分钟、30 分钟、2 小时、6 小时、1 天、3 天,

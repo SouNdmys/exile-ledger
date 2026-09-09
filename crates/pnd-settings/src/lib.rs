@@ -10,7 +10,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use pnd_domain::{Currency, Game, ObservationId, Price, SearchRef, WatchId};
+use pnd_domain::{Currency, Game, ObservationId, Price, RateOverride, SearchRef, WatchId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -342,6 +342,11 @@ pub struct AppSettings {
     pub alert: AlertTuning,
     pub ninja: NinjaTuning,
     pub user_agent_mode: UserAgentMode,
+    /// 手填的汇率。两档都留空(默认)= 一切听 poe.ninja 的。
+    ///
+    /// schema 版本还是 1:老文件缺这个键就读成"两档都没填",和加观察列表、
+    /// 加收藏那两次一样,不该逼用户重设一遍整页设置。
+    pub rate_override: RateOverride,
 }
 
 impl Default for AppSettings {
@@ -360,6 +365,7 @@ impl Default for AppSettings {
             alert: AlertTuning::default(),
             ninja: NinjaTuning::default(),
             user_agent_mode: UserAgentMode::default(),
+            rate_override: RateOverride::default(),
         }
     }
 }
@@ -388,6 +394,16 @@ impl AppSettings {
         }
         if self.ui_language != "zh" && self.ui_language != "en" {
             self.ui_language = "zh".to_string();
+        }
+        // 手填的汇率里 0 和负数一律当没填:除以 0 换不出价,而一个手滑打进去的
+        // 负数会让每一条 chaos 挂单都换出一个负的 divine 价 —— 那比没有汇率坏。
+        for value in [
+            &mut self.rate_override.chaos_per_divine_milli,
+            &mut self.rate_override.exalted_per_divine_milli,
+        ] {
+            if value.is_some_and(|milli| milli <= 0) {
+                *value = None;
+            }
         }
     }
 
@@ -1028,6 +1044,39 @@ mod settings_tests {
         assert_eq!(settings.observations[1].discover_interval_secs, 3_600);
         assert_eq!(settings.observations[1].recheck_interval_secs, 172_800);
         assert_eq!(settings.observations[1].sample_every, 4);
+    }
+
+    /// 手填的汇率:存得下、读得回,老文件缺这个键读出来是"两档都没填"。
+    ///
+    /// 非正数一律当没填 —— `1 divine = 0 chaos` 换算出来是除以零那一类的东西,
+    /// 而一个手滑打进去的 `-13` 会让每一条 chaos 挂单都换出负价。
+    #[test]
+    fn a_manual_rate_round_trips_and_nonsense_values_are_dropped() {
+        let store = temp_store("manual-rate");
+        write_file(
+            &store,
+            r#"{"schema_version":1,"league":"Forbidden Rites","watches":[]}"#,
+        );
+        let loaded = store.load();
+        assert_eq!(loaded.status, LoadStatus::Loaded);
+        assert_eq!(
+            loaded.settings.rate_override,
+            RateOverride::default(),
+            "老文件里没有这个键,读出来该是两档都没填"
+        );
+
+        let mut settings = loaded.settings;
+        settings.rate_override.chaos_per_divine_milli = Some(13_000);
+        settings.rate_override.exalted_per_divine_milli = Some(186_000);
+        store.save(&settings).expect("save");
+        let back = store.load().settings;
+        assert_eq!(back.rate_override, settings.rate_override);
+        assert_eq!(back.schema_version, CURRENT_SCHEMA_VERSION, "还是 schema 1");
+
+        settings.rate_override.chaos_per_divine_milli = Some(0);
+        settings.rate_override.exalted_per_divine_milli = Some(-186_000);
+        settings.normalize();
+        assert_eq!(settings.rate_override, RateOverride::default());
     }
 
     /// 收藏一条词缀:同一个联赛里再问就是"收藏过了",第二次按同一下就取消。

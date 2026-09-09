@@ -260,6 +260,7 @@ impl WatchStore {
         if !has_column(&conn, "alerts", "game")? {
             conn.execute_batch(ALERTS_GAME_COLUMN)?;
         }
+        crate::observe::add_divine_price_columns(&conn)?;
         Ok(Self { conn })
     }
 
@@ -699,7 +700,11 @@ fn alert_row_from_row(row: &Row<'_>) -> rusqlite::Result<AlertRow> {
 }
 
 /// 这张表上有没有这一列。加列前问一句 —— 见 [`ALERTS_GAME_COLUMN`]。
-fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, StorageError> {
+pub(crate) fn has_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, StorageError> {
     let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
