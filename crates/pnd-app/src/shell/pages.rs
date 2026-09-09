@@ -371,7 +371,12 @@ mod pages_tests {
             listings: Some(131),
             change_percent: Some(-4.5),
         }];
-        ninja_uniques::table_content_for(&rows, &pnd_domain::CurrencyRates::none(), false, text)
+        ninja_uniques::table_content_for(
+            &rows,
+            &pnd_domain::CurrencyRates::none(),
+            ninja_uniques::UniquesView::default(),
+            text,
+        )
     }
 
     /// 一行词缀统计,拿来量词缀表。

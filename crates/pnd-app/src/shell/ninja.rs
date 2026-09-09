@@ -209,6 +209,77 @@ pub fn share_percent(count: u64, total: Option<u64>) -> f64 {
     }
 }
 
+/// 一件暗金的供需档位。
+///
+/// 三档是**相对这张表自己**评的,不是一条写死的线:全联赛的比值和某个职业
+/// 分区的比值差一个数量级(分母是"这个分区里有多少人"),写死一条线的话,
+/// 换个分区要么整张表全绿,要么一条都评不上。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DemandTier {
+    /// 想要的人远多于在卖的:比中位数还高三倍。
+    Scarce,
+    /// 中间那一大片。挂单数缺席的也归这里。
+    #[default]
+    Balanced,
+    /// 在卖的远多于想要的:低到中位数的三分之一。
+    Glut,
+}
+
+/// 供需比 ×1000:多少个角色穿着它,摊到市面上每一件挂单上。
+///
+/// 挂单数是 0、或者经济接口里压根没这件东西时返回 `None` —— 那是"我不知道",
+/// 不是"抢手到买不着"。真按 0 件挂单去算,榜上最"紧俏"的永远是那些谁都
+/// 不认识、也没人挂单的冷门货。
+#[must_use]
+pub fn demand_ratio_milli(users: u64, listings: Option<i64>) -> Option<i64> {
+    let listings = listings.filter(|count| *count > 0)?;
+    let users = i64::try_from(users).ok()?;
+    users.checked_mul(1_000).map(|scaled| scaled / listings)
+}
+
+/// 一串供需比的中位数。
+///
+/// 偶数条取中间两条的平均,整数除法把余数丢掉:这个数只拿去和三倍 / 三分之一
+/// 比大小,半个千分位改不了任何一行的档位。
+#[must_use]
+pub fn median_milli(values: &[i64]) -> Option<i64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        return Some(sorted[middle]);
+    }
+    Some((sorted[middle - 1] + sorted[middle]) / 2)
+}
+
+/// 这一行落在哪一档。
+///
+/// 用乘法比,不用除法:整数里的 `ratio <= median / 3` 会把中位数 10 的
+/// 那条线算成 3(10/3 向下取整),而 `ratio * 3 <= median` 是原原本本的那句话。
+///
+/// 两种情况一律 `Balanced`:自己没有比值(挂单数缺席),或者整张表算不出
+/// 中位数 / 中位数是 0。后者尤其要挡 —— 3 × 0 = 0,不挡的话每一行都
+/// "≥ 三倍中位数",整张表会一起变成紧俏。
+#[must_use]
+pub fn demand_tier(ratio_milli: Option<i64>, median_milli: Option<i64>) -> DemandTier {
+    let (Some(ratio), Some(median)) = (ratio_milli, median_milli) else {
+        return DemandTier::Balanced;
+    };
+    if median <= 0 {
+        return DemandTier::Balanced;
+    }
+    if ratio >= median.saturating_mul(3) {
+        return DemandTier::Scarce;
+    }
+    if ratio.saturating_mul(3) <= median {
+        return DemandTier::Glut;
+    }
+    DemandTier::Balanced
+}
+
 /// 一行词缀统计里"带着它的角色占这个部位样本的百分之几"。
 #[must_use]
 pub fn mod_share_percent(stat: &SlotModStat) -> f64 {
@@ -699,6 +770,50 @@ mod ninja_tests {
         assert!((mod_share_percent(&stat("BodyArmour", 13, 47)) - 27.66).abs() < 0.01);
         assert_eq!(mod_share_percent(&stat("BodyArmour", 13, 0)), 0.0);
         assert_eq!(percent_text(11.418, &i18n::ENGLISH), "11.4%");
+    }
+
+    /// 供需比:多少个人穿着它,摊到市面上每一件挂单上。
+    #[test]
+    fn the_demand_ratio_counts_wearers_per_listing() {
+        // 7,464 个人穿,131 件在卖 —— 一件挂单背后站着 56.97 个人。
+        assert_eq!(demand_ratio_milli(7_464, Some(131)), Some(56_977));
+        assert_eq!(demand_ratio_milli(44, Some(100)), Some(440));
+        // 挂单数是 0、或者经济接口里压根没这件东西:没有比值可言。
+        // 这不是"抢手到买不着",而是"我不知道"。
+        assert_eq!(demand_ratio_milli(7_464, Some(0)), None);
+        assert_eq!(demand_ratio_milli(7_464, None), None);
+    }
+
+    /// 中位数:奇数条取中间那条,偶数条取中间两条的平均。
+    #[test]
+    fn the_median_takes_the_middle_of_the_list() {
+        assert_eq!(median_milli(&[3_000, 1_000, 2_000]), Some(2_000));
+        assert_eq!(median_milli(&[1_000, 2_000, 3_000, 6_000]), Some(2_500));
+        assert_eq!(median_milli(&[7_000]), Some(7_000));
+        // 一行都没有(表是空的,或者一行挂单数都没抓到)时没有中位数。
+        assert_eq!(median_milli(&[]), None);
+    }
+
+    /// 三倍中位数以上算紧俏,三分之一以下算过剩,中间是常态。
+    #[test]
+    fn three_times_the_median_is_scarce_and_a_third_is_glut() {
+        let median = Some(3_000);
+        assert_eq!(demand_tier(Some(9_000), median), DemandTier::Scarce);
+        assert_eq!(demand_tier(Some(8_999), median), DemandTier::Balanced);
+        assert_eq!(demand_tier(Some(1_000), median), DemandTier::Glut);
+        assert_eq!(demand_tier(Some(1_001), median), DemandTier::Balanced);
+    }
+
+    /// 挂单数缺席的那一行永远算常态 —— 一个没抓到的数不是"抢手"。
+    #[test]
+    fn a_missing_listing_count_is_never_scarce() {
+        assert_eq!(demand_tier(None, Some(1_000)), DemandTier::Balanced);
+        // 整张表一行挂单数都没有:没有中位数,谁也不评档。
+        assert_eq!(demand_tier(Some(999_000), None), DemandTier::Balanced);
+        // 中位数是 0:3 × 0 = 0,不挡这一下的话每一行都 ≥ 0,
+        // 整张表会一起变成"紧俏"。
+        assert_eq!(demand_tier(Some(0), Some(0)), DemandTier::Balanced);
+        assert_eq!(demand_tier(Some(5_000), Some(0)), DemandTier::Balanced);
     }
 
     /// 每一种事件都得说得出一句人话,两种语言都是。

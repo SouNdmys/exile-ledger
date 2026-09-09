@@ -390,6 +390,13 @@ pub struct AppShell {
     /// 两页各自的"显示全部"开关。
     pub(crate) uniques_show_all: bool,
     pub(crate) mods_show_all: bool,
+    /// 暗金榜只留下"紧俏"那一档。
+    pub(crate) uniques_scarce_only: bool,
+    /// 暗金榜按供需比排,而不是按人数。
+    ///
+    /// 做成一个开关而不是点列头:上游那张表的列头不支持排序,而这一页
+    /// 真正想按的只有这一列 —— 别的列(人数)本来就是库给的默认顺序。
+    pub(crate) uniques_sort_by_demand: bool,
     /// 到这个时刻重读一次提醒历史(等 actor 把命令写进库)。
     pub(crate) alerts_refresh_at: Option<Instant>,
     /// 同上,观察数据那一份:actor 每跑完一轮发一句"变了",这里延迟一点再读。
@@ -691,6 +698,8 @@ impl AppShell {
             poesessid_dirty: false,
             uniques_show_all: false,
             mods_show_all: false,
+            uniques_scarce_only: false,
+            uniques_sort_by_demand: false,
             alerts_refresh_at: None,
             observe_refresh_at: None,
             last_second: 0,
@@ -870,7 +879,7 @@ impl AppShell {
         let content = pages::ninja_uniques::table_content_for(
             &self.ninja.uniques,
             &self.rates,
-            self.uniques_show_all,
+            self.uniques_view(),
             self.text(),
         );
         apply_content(&self.uniques_table, content, cx);

@@ -361,6 +361,20 @@ catalogue! {
     /// "参考价取自 {}"
     uniques_price_age,
     uniques_empty,
+    /// 供需比那一列:多少人在穿,摊到市面上每一件挂单上。
+    uniques_col_demand,
+    /// 只留下"紧俏"那一档的开关。
+    uniques_scarce_only,
+    /// 两档排序开关:按供需比从高到低,还是按人数(库给的顺序)。
+    uniques_sort_by_demand,
+    /// "紧俏 {} · 过剩 {}" —— 表下面那一句,说清按下"只看紧俏"会剩几行。
+    uniques_tier_line,
+    /// 选中那件暗金的动作条抬头。
+    uniques_row_actions,
+    /// 一键把选中那件暗金做成一条蹲价。
+    uniques_make_watch,
+    /// 填完表单之后状态行上那句话。
+    uniques_prefilled,
 
     // -- 词缀热度页 --
     mods_heading,
@@ -1069,6 +1083,14 @@ pub static ENGLISH: Text = Text {
     tray_menu_quit: "Quit",
     settings_close_to_tray: "Close button hides to the tray",
     settings_close_to_tray_hint: "right-click the tray icon to quit",
+
+    uniques_col_demand: "Demand",
+    uniques_scarce_only: "Scarce only",
+    uniques_sort_by_demand: "Sort by demand",
+    uniques_tier_line: "{} scarce · {} glut",
+    uniques_row_actions: "Selected unique",
+    uniques_make_watch: "Make a watch",
+    uniques_prefilled: "Filled in from that unique. Nothing has been added yet — check it over, then press Add.",
 };
 
 pub static SIMPLIFIED_CHINESE: Text = Text {
@@ -1476,6 +1498,14 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     tray_menu_quit: "退出程序",
     settings_close_to_tray: "点关闭时缩到右下角托盘",
     settings_close_to_tray_hint: "托盘图标右键可退出",
+
+    uniques_col_demand: "供需",
+    uniques_scarce_only: "只看紧俏",
+    uniques_sort_by_demand: "按供需排序",
+    uniques_tier_line: "紧俏 {} · 过剩 {}",
+    uniques_row_actions: "选中的暗金",
+    uniques_make_watch: "做成蹲价",
+    uniques_prefilled: "已按那件暗金填好表单。还没有新增任何东西 —— 检查一遍再按新增。",
 };
 
 #[cfg(test)]

@@ -8,19 +8,24 @@
 //! 穿着某件暗金 / 职业+技能)。换一个分区,占比的**分母也跟着换** ——
 //! "Deadeye 里有 41% 的人穿它"和"全联赛 11%"是两句不同的话。
 
-use gpui::{Context, ParentElement, SharedString, Styled, div, px};
+use gpui::{Context, ParentElement, SharedString, Styled, Window, div, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::switch::Switch;
 use gpui_component::{Disableable as _, Selectable as _, Sizable as _, Size, StyledExt as _};
+use serde_json::Value;
 
-use pnd_domain::{Currency, CurrencyRates, Game};
+use pnd_domain::{Currency, CurrencyRates, Game, encode_search_id};
 use pnd_runtime::now_secs;
 
+use super::observations::WatchDraft;
 use super::watches::milli_text;
 use super::{Cell, TableContent, Tone, column, number_column};
 use crate::i18n::{self, Text};
 use crate::shell::link::ago_text;
-use crate::shell::ninja::{NinjaData, UniqueRow, game_league_text, partition_label, percent_text};
+use crate::shell::ninja::{
+    DemandTier, NinjaData, UniqueRow, demand_ratio_milli, demand_tier, game_league_text,
+    median_milli, ninja_league_name, partition_label, percent_text,
+};
 use crate::shell::{AppShell, Choice, hint, page_heading, panel, picker, table};
 use crate::theme::*;
 
@@ -29,6 +34,148 @@ use crate::theme::*;
 /// 0.5% 不是洁癖:全联赛的 `items` 分面有四百多条,其中三百多条是"某个人
 /// 捡到一件就穿上了"。全铺出来,真正的热门装备反而要往下翻半天。
 pub const MIN_SHARE_PERCENT: f64 = 0.5;
+
+/// 一键蹲价的上限是参考价的**八成**(分子/分母写成两个整数,免得碰浮点)。
+///
+/// 参考价是"现在市面上大概多少钱",而蹲价要等的是比市价便宜的那一件:
+/// 填成十成的话,市价一波动就响,每一条都是白跑一趟。
+const CAP_NUMERATOR: i64 = 4;
+const CAP_DENOMINATOR: i64 = 5;
+
+/// 表格现在按什么筛、按什么排。
+///
+/// 三个 `bool` 装进一个结构体,不是三个并排的参数:调用处写成
+/// `unique_rows(rows, rates, false, true, false, text)` 的话,谁也说不出
+/// 中间那个 `true` 是哪一个开关。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UniquesView {
+    /// 占比不足 [`MIN_SHARE_PERCENT`] 的也铺出来。
+    pub show_all: bool,
+    /// 只留下 [`DemandTier::Scarce`] 那一档。
+    pub scarce_only: bool,
+    /// 按供需比从高到低排,而不是按人数(库给的顺序)。
+    pub sort_by_demand: bool,
+}
+
+/// 表上的一行:那件暗金,加上算给它的供需比和档位。
+///
+/// 借着榜里那一行而不是复制一份:这份清单每次重画都重算,活不过一帧。
+#[derive(Clone, Copy, Debug)]
+pub struct DemandRow<'a> {
+    /// **没筛之前**的名次,1 起。收起冷门行、换个排序都不会改它。
+    pub rank: usize,
+    pub row: &'a UniqueRow,
+    /// 供需比 ×1000。`None` = 挂单数缺席,算不出来。
+    pub ratio_milli: Option<i64>,
+    pub tier: DemandTier,
+}
+
+/// 0.5% 那一刀筛完、档位也评完的那一批行 —— 「只看紧俏」和排序还没生效。
+///
+/// 为什么这一步要单独拿出来:档位是相对**这一批**评的,而「只看紧俏」是按
+/// 档位筛的。拿筛完的结果再去算中位数就成了一个咬自己尾巴的循环 —— 留下的
+/// 全是紧俏,中位数被抬高,下一轮又有一半掉出紧俏。
+#[must_use]
+pub fn tiered_rows(rows: &[UniqueRow], show_all: bool) -> Vec<DemandRow<'_>> {
+    let shown: Vec<(usize, &UniqueRow)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| show_all || row.share_percent >= MIN_SHARE_PERCENT)
+        .collect();
+    // 中位数只认算得出比值的那些行:挂单数缺席的一行既不是高也不是低,
+    // 让它参与只会把这条线往下拽。
+    let ratios: Vec<i64> = shown
+        .iter()
+        .filter_map(|(_, row)| demand_ratio_milli(row.users, row.listings))
+        .collect();
+    let median = median_milli(&ratios);
+    shown
+        .into_iter()
+        .map(|(index, row)| {
+            let ratio_milli = demand_ratio_milli(row.users, row.listings);
+            DemandRow {
+                rank: index + 1,
+                row,
+                ratio_milli,
+                tier: demand_tier(ratio_milli, median),
+            }
+        })
+        .collect()
+}
+
+/// 表上真正画出来的那些行:筛过、排过。
+#[must_use]
+pub fn visible_rows(rows: &[UniqueRow], view: UniquesView) -> Vec<DemandRow<'_>> {
+    let mut shown = tiered_rows(rows, view.show_all);
+    if view.scarce_only {
+        shown.retain(|shown| shown.tier == DemandTier::Scarce);
+    }
+    if view.sort_by_demand {
+        // 算不出比值的沉到最后:它不是"供需比 0",而是"不知道" ——
+        // 混在过剩那一头会让人以为它烂大街。`sort_by_key` 是稳定的,
+        // 所以比值打平的几行还按人数排(库给的顺序)。
+        shown.sort_by_key(|shown| std::cmp::Reverse(shown.ratio_milli.unwrap_or(i64::MIN)));
+    }
+    shown
+}
+
+/// 紧俏几件、过剩几件。
+///
+/// 数的是**「只看紧俏」筛之前**的那一批:开着那个开关的时候,过剩那个数
+/// 才不会永远是 0 —— 而"按下去会剩几行"正是这句话要回答的问题。
+#[must_use]
+pub fn demand_counts(rows: &[UniqueRow], show_all: bool) -> (usize, usize) {
+    let tiered = tiered_rows(rows, show_all);
+    let count = |want: DemandTier| tiered.iter().filter(|shown| shown.tier == want).count();
+    (count(DemandTier::Scarce), count(DemandTier::Glut))
+}
+
+/// 一件暗金 → 一份蹲价草稿。
+///
+/// 查询里只写一个名字:底子名是 poe.ninja 那边的写法,和交易站不一定逐字
+/// 一致,而多写一个对不上的条件,搜出来的是零件 —— 一条永远不响的蹲价
+/// 比没有这条还坏,因为它看起来在工作。
+///
+/// **只做草稿,不加**:按下"新增"的永远是用户自己(同观察页那条一键蹲价)。
+#[must_use]
+pub fn unique_watch_draft(row: &UniqueRow, league: &str) -> WatchDraft {
+    WatchDraft {
+        search_id: encode_search_id(&unique_query_json(&row.name)),
+        league: league.to_owned(),
+        label: row.name.clone(),
+        cap_milli: row.price_milli.map(cap_milli),
+        currency: row
+            .price_currency
+            .as_ref()
+            .map_or_else(String::new, |currency| currency.code().to_owned()),
+    }
+}
+
+/// 蹲这件暗金的那条查询:在线的,按价格从低到高。
+///
+/// 手拼字符串而不是 `json!`:`serde_json` 的对象是有序表,`json!` 拼出来的
+/// 键会按字母重排,而这条查询的形状是照着交易站网页发出去的那份抄的。
+/// 名字仍旧走 `Value::String` 转义 —— 暗金名里有撇号(`Beira's Anguish`),
+/// 哪天再冒出个引号,手写的引号就会把整段 JSON 断成两半。
+fn unique_query_json(name: &str) -> String {
+    let name = Value::String(name.to_owned());
+    format!(
+        r#"{{"query":{{"status":{{"option":"online"}},"name":{name},"stats":[{{"type":"and","filters":[]}}]}},"sort":{{"price":"asc"}}}}"#
+    )
+}
+
+/// 参考价 → 蹲价上限,整数运算。
+///
+/// 折出来还有一个整单位以上就抹掉零头(23.92 → 23):蹲价上限是要念给
+/// 自己听的一个数,`23` 比 `23.92` 好记。不到一个整单位的原样留着千分位
+/// (0.085 的八成是 0.068)—— 抹成 0 的话那条蹲价永远不会响。
+fn cap_milli(price_milli: i64) -> i64 {
+    let cap = price_milli.saturating_mul(CAP_NUMERATOR) / CAP_DENOMINATOR;
+    if cap >= 1_000 {
+        return cap / 1_000 * 1_000;
+    }
+    cap
+}
 
 /// 分区下拉的选项。库里还什么都没有时留一条"全联赛",免得下拉是空的。
 pub fn partition_choices(keys: &[String], text: &'static Text) -> Vec<Choice> {
@@ -50,6 +197,9 @@ pub fn table_content(text: &'static Text) -> TableContent {
             number_column("share", text.uniques_col_share, 70.),
             number_column("price", text.uniques_col_reference_price, 170.),
             number_column("listings", text.uniques_col_listings, 80.),
+            // 紧挨着挂单数:这一列就是"人数 ÷ 挂单数",两个数分开摆的话,
+            // 中间隔着的那些列会让人以为它是另一件事。
+            number_column("demand", text.uniques_col_demand, 70.),
             number_column("seven_day", text.uniques_col_seven_day, 70.),
         ],
         rows: Vec::new(),
@@ -61,36 +211,32 @@ pub fn table_content(text: &'static Text) -> TableContent {
 pub fn table_content_for(
     rows: &[UniqueRow],
     rates: &CurrencyRates,
-    show_all: bool,
+    view: UniquesView,
     text: &'static Text,
 ) -> TableContent {
     TableContent {
-        rows: unique_rows(rows, rates, show_all, text),
+        rows: unique_rows(rows, rates, view, text),
         ..table_content(text)
     }
 }
 
-/// 每件暗金一行。人数已经由库排好序(多的在前),这里只管挑和画。
+/// 每件暗金一行。筛和排都在 [`visible_rows`] 里做完了,这里只管画。
 ///
 /// **名次按没筛之前算**:收起冷门行之后第 12 名还是第 12 名,不会因为
-/// 前面藏了几条就变成第 9 名。
+/// 前面藏了几条就变成第 9 名;按供需重排之后也一样跟着行走。
 pub fn unique_rows(
     rows: &[UniqueRow],
     rates: &CurrencyRates,
-    show_all: bool,
+    view: UniquesView,
     text: &'static Text,
 ) -> Vec<Vec<Cell>> {
-    rows.iter()
-        .enumerate()
-        .filter(|(_, row)| show_all || row.share_percent >= MIN_SHARE_PERCENT)
-        .map(|(index, row)| {
+    visible_rows(rows, view)
+        .into_iter()
+        .map(|shown| {
+            let row = shown.row;
             vec![
-                Cell::muted((index + 1).to_string()),
-                if index == 0 {
-                    Cell::accent(row.name.clone())
-                } else {
-                    Cell::plain(row.name.clone())
-                },
+                Cell::muted(shown.rank.to_string()),
+                Cell::new(row.name.clone(), name_tone(shown.tier, shown.rank)),
                 Cell::data(row.users.to_string()),
                 Cell::data(percent_text(row.share_percent, text)),
                 match price_text(row, rates, text) {
@@ -101,10 +247,52 @@ pub fn unique_rows(
                     Some(listings) => Cell::data(listings.to_string()),
                     None => Cell::muted(text.common_none),
                 },
+                Cell::new(
+                    demand_text(shown.ratio_milli, text),
+                    demand_tone(shown.tier, shown.ratio_milli),
+                ),
                 change_cell(row.change_percent, text),
             ]
         })
         .collect()
+}
+
+/// 供需那一格:`56.98`。算不出来就写"—"。
+///
+/// 两位小数直接从千分整数上取,不经过浮点:这一列排序用的是同一个整数,
+/// 显示和排序读同一个数,才不会出现"印得更小的那行却排在前面"。
+fn demand_text(ratio_milli: Option<i64>, text: &'static Text) -> String {
+    let Some(milli) = ratio_milli else {
+        return text.common_none.to_owned();
+    };
+    // 千分位 → 百分位,四舍五入(+5 再除 10)。
+    let hundredths = (milli + 5) / 10;
+    format!("{}.{:02}", hundredths / 100, hundredths % 100)
+}
+
+/// 暗金名那一格的语气。
+///
+/// 紧俏压过榜首那一抹金色:榜首本来就在第一行、名次那一列还写着 1,
+/// 而"这件东西市面上不够卖"正是这一列存在的理由,不该被排名的装饰盖掉。
+fn name_tone(tier: DemandTier, rank: usize) -> Tone {
+    match tier {
+        DemandTier::Scarce => Tone::Good,
+        DemandTier::Glut => Tone::Muted,
+        DemandTier::Balanced if rank == 1 => Tone::Accent,
+        DemandTier::Balanced => Tone::Plain,
+    }
+}
+
+/// 供需那一格的语气。算不出来的那一格是安静的灰,和表上别的"—"一样。
+fn demand_tone(tier: DemandTier, ratio_milli: Option<i64>) -> Tone {
+    if ratio_milli.is_none() {
+        return Tone::Muted;
+    }
+    match tier {
+        DemandTier::Scarce => Tone::Good,
+        DemandTier::Glut => Tone::Muted,
+        DemandTier::Balanced => Tone::Data,
+    }
 }
 
 /// 收起来了几行。写在筛选器那一条上 —— 藏东西必须说出来,否则"表里没有它"
@@ -312,6 +500,7 @@ impl AppShell {
                     .overflow_hidden()
                     .child(table(&self.uniques_table)),
             )
+            .child(self.uniques_row_actions(cx))
             .child(self.uniques_footer())
     }
 
@@ -382,6 +571,27 @@ impl AppShell {
                                 cx.notify();
                             })),
                     )
+                    .child(
+                        Switch::new("uniques-scarce-only")
+                            .checked(self.uniques_scarce_only)
+                            .label(SharedString::from(text.uniques_scarce_only))
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.uniques_scarce_only = *checked;
+                                this.uniques_dirty = true;
+                                cx.notify();
+                            })),
+                    )
+                    // 上游那张表的列头不支持点一下排序,所以排序做成一个开关。
+                    .child(
+                        Switch::new("uniques-sort-demand")
+                            .checked(self.uniques_sort_by_demand)
+                            .label(SharedString::from(text.uniques_sort_by_demand))
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.uniques_sort_by_demand = *checked;
+                                this.uniques_dirty = true;
+                                cx.notify();
+                            })),
+                    )
                     .children((hidden > 0).then(|| {
                         hint(i18n::fill(
                             text.common_hidden_rows,
@@ -391,9 +601,55 @@ impl AppShell {
             )
     }
 
-    /// 脚注:采样跑到哪了,以及参考价是什么时候抓的。
+    /// 选中那件暗金能做的一件事:一键做成蹲价。
+    ///
+    /// PoE1 上整条不出现:本地拼搜索 id 只对 PoE2 成立(PoE1 的 id 只有
+    /// 服务端发得出来),做出来的草稿粘到蹲价页也用不了 —— 同观察页那个
+    /// [`make_watch_offered`](super::observations::make_watch_offered)。
+    fn uniques_row_actions(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        let text = self.text();
+        let offered = self.ninja_game() == Game::Poe2;
+        let selected = self.selected_unique(cx);
+        let label = selected
+            .as_ref()
+            .map_or_else(|| text.common_select_row.to_owned(), |row| row.name.clone());
+        panel()
+            .flex_none()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .px(px(10.))
+            .py(px(6.))
+            .child(
+                div()
+                    .text_size(fs(FS_11_5))
+                    .text_color(muted())
+                    .child(text.uniques_row_actions),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(fs(FS_11_5))
+                    .text_color(c(TEXT_SECONDARY))
+                    .child(SharedString::from(label)),
+            )
+            .children(offered.then(|| {
+                Button::new("uniques-make-watch")
+                    .label(text.uniques_make_watch)
+                    .with_size(Size::Small)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.make_watch_from_unique(window, cx);
+                    }))
+            }))
+    }
+
+    /// 脚注:紧俏 / 过剩各几件,采样跑到哪了,参考价是什么时候抓的。
     fn uniques_footer(&self) -> gpui::Div {
         let text = self.text();
+        let (scarce, glut) = demand_counts(&self.ninja.uniques, self.uniques_show_all);
         let price_age = self
             .ninja
             .prices_fetched_at
@@ -405,16 +661,80 @@ impl AppShell {
             .gap(px(16.))
             .children((!self.sampler_line.is_empty()).then(|| hint(self.sampler_line.clone())))
             .children(price_age.map(hint))
+            .child(hint(i18n::fill(
+                text.uniques_tier_line,
+                &[&scarce.to_string(), &glut.to_string()],
+            )))
+    }
+
+    /// 三个开关合起来就是"表上现在画的是哪一份"。
+    ///
+    /// 重建表格和"选中的是第几行"都要读它,而两处算出不一样的一份,
+    /// 按钮作用的就是另一件暗金了。
+    pub(crate) fn uniques_view(&self) -> UniquesView {
+        UniquesView {
+            show_all: self.uniques_show_all,
+            scarce_only: self.uniques_scarce_only,
+            sort_by_demand: self.uniques_sort_by_demand,
+        }
+    }
+
+    /// 表里选中的那件暗金。
+    ///
+    /// 表上画的是筛过、排过的那一份,所以这里用同一套参数再算一遍 ——
+    /// 直接拿行号去 `self.ninja.uniques`(库给的原始顺序)里取的话,
+    /// 选中的和按钮作用的就是两件不同的东西(同 `selected_mod`)。
+    fn selected_unique(&self, cx: &mut Context<Self>) -> Option<UniqueRow> {
+        let row = self.uniques_table.read(cx).selected_row()?;
+        visible_rows(&self.ninja.uniques, self.uniques_view())
+            .get(row)
+            .map(|shown| shown.row.clone())
+    }
+
+    /// 一键蹲价:把选中那件暗金做成一份草稿,翻到蹲价页填进表单。
+    ///
+    /// **只填,不加**:按下"新增"的永远是用户自己 —— 一条自动加进去的搜索
+    /// 会立刻开始花限速预算,而它是不是用户要的还没人确认过。
+    fn make_watch_from_unique(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.text();
+        let Some(row) = self.selected_unique(cx) else {
+            self.set_notice(text.common_select_row.to_owned());
+            cx.notify();
+            return;
+        };
+        // 表上画的是哪个联赛,草稿就写哪个 —— 这条按钮只在 PoE2 上出现,
+        // 所以取到的是 `settings.league`。
+        let league = ninja_league_name(&self.settings, self.ninja_game()).to_owned();
+        let draft = unique_watch_draft(&row, &league);
+        self.push_log(format!("watch draft from unique: {}", draft.label));
+        self.prefill_add_form(draft, window, cx);
+        self.show_page(crate::shell::Page::Watches);
+        self.set_notice(text.uniques_prefilled.to_owned());
+        cx.notify();
     }
 }
 
 #[cfg(test)]
 mod ninja_uniques_tests {
     use gpui_component::select::SelectItem as _;
+    use pnd_domain::decode_search_id;
     use pnd_storage::{SnapshotRow, SnapshotStage};
 
     use super::*;
     use crate::i18n;
+
+    /// 默认视图:收起冷门行,不筛紧俏,按人数排(库给的顺序)。
+    fn view() -> UniquesView {
+        UniquesView::default()
+    }
+
+    /// 全铺出来的那一份。
+    fn view_all() -> UniquesView {
+        UniquesView {
+            show_all: true,
+            ..UniquesView::default()
+        }
+    }
 
     fn rates() -> CurrencyRates {
         CurrencyRates {
@@ -468,7 +788,7 @@ mod ninja_uniques_tests {
     /// 榜上一行要同时回答"多少人在用"和"现在多少钱"。
     #[test]
     fn a_row_carries_both_the_usage_and_the_price() {
-        let built = unique_rows(&rows(), &rates(), false, &i18n::ENGLISH);
+        let built = unique_rows(&rows(), &rates(), view(), &i18n::ENGLISH);
         assert_eq!(built.len(), 3, "占比 0.18% 的那条默认收起来");
         assert_eq!(built[0][0].text(), "1");
         assert_eq!(built[0][1].text(), "Wake of Destruction");
@@ -478,10 +798,10 @@ mod ninja_uniques_tests {
         // 29.9 divine(接口今天的基准币),按 1 divine = 83.42 exalted 换算。
         assert_eq!(built[0][4].text(), "29.9 div ≈ 2494 ex");
         assert_eq!(built[0][5].text(), "131");
-        assert_eq!(built[0][6].text(), "+6.0%");
-        assert_eq!(built[0][6].tone(), Tone::Good);
-        assert_eq!(built[1][6].text(), "-9.0%");
-        assert_eq!(built[1][6].tone(), Tone::Warn);
+        assert_eq!(built[0][7].text(), "+6.0%");
+        assert_eq!(built[0][7].tone(), Tone::Good);
+        assert_eq!(built[1][7].text(), "-9.0%");
+        assert_eq!(built[1][7].tone(), Tone::Warn);
     }
 
     /// 跌了 99.53% 就写 `-99.5%`,不是 `-100%`。
@@ -501,7 +821,7 @@ mod ninja_uniques_tests {
                 listings: Some(1_509),
                 change_percent: change,
             }];
-            unique_rows(&rows, &rates(), false, text)[0][6].clone()
+            unique_rows(&rows, &rates(), view(), text)[0][7].clone()
         };
         assert_eq!(cell(Some(-99.53)).text(), "-99.5%");
         // 小到看不见的涨幅也是涨,别被抹成 +0%。
@@ -512,20 +832,21 @@ mod ninja_uniques_tests {
         assert_eq!(cell(None).tone(), Tone::Muted);
     }
 
-    /// 经济接口里没有的那件东西,三格都写"—",不写 0 —— 0 会被读成"不值钱"。
+    /// 经济接口里没有的那件东西,四格都写"—",不写 0 —— 0 会被读成"不值钱"。
     #[test]
     fn a_unique_without_a_listing_says_so_instead_of_showing_zero() {
-        let built = unique_rows(&rows(), &rates(), false, &i18n::ENGLISH);
+        let built = unique_rows(&rows(), &rates(), view(), &i18n::ENGLISH);
         assert_eq!(built[2][1].text(), "Breath of the Mountains");
         assert_eq!(built[2][4].text(), "—");
         assert_eq!(built[2][5].text(), "—");
-        assert_eq!(built[2][6].text(), "—");
+        assert_eq!(built[2][6].text(), "—", "挂单数都没有,供需比更算不出来");
+        assert_eq!(built[2][7].text(), "—");
     }
 
     /// 汇率还没读到就只写它自己的单位,不猜一个换算值。
     #[test]
     fn without_rates_the_price_keeps_its_own_currency() {
-        let built = unique_rows(&rows(), &CurrencyRates::none(), false, &i18n::ENGLISH);
+        let built = unique_rows(&rows(), &CurrencyRates::none(), view(), &i18n::ENGLISH);
         assert_eq!(built[0][4].text(), "29.9 div");
     }
 
@@ -642,12 +963,12 @@ mod ninja_uniques_tests {
         assert_eq!(hidden_count(&rows, false), 1);
         assert_eq!(hidden_count(&rows, true), 0);
 
-        let all = unique_rows(&rows, &rates(), true, &i18n::ENGLISH);
+        let all = unique_rows(&rows, &rates(), view_all(), &i18n::ENGLISH);
         assert_eq!(all.len(), 4);
         assert_eq!(all[3][0].text(), "4");
         assert_eq!(all[3][1].text(), "Somebody's Trinket");
-        assert_eq!(all[3][6].text(), "+0.0%", "有历史、真的没涨没跌,也是一个数");
-        assert_eq!(all[3][6].tone(), Tone::Muted);
+        assert_eq!(all[3][7].text(), "+0.0%", "有历史、真的没涨没跌,也是一个数");
+        assert_eq!(all[3][7].tone(), Tone::Muted);
     }
 
     /// 抬头必须说清这份数据是什么时候的 —— 不知道多旧的热度榜没法用。
@@ -699,6 +1020,186 @@ mod ninja_uniques_tests {
             header_line(Game::Poe1, "", &NinjaData::default(), &i18n::ENGLISH, 5_000),
             "PoE1 · no snapshot yet"
         );
+    }
+
+    /// 五件供需比故意排得很开的暗金,专门喂给档位那几条测试。
+    ///
+    /// 后两条的占比在 0.5% 以下 —— 默认收起来,放出来之后中位数会往下掉,
+    /// 于是每一行的档位都得重算一遍。
+    fn demand_rows() -> Vec<UniqueRow> {
+        let row = |name: &str, users: u64, share: f64, listings: i64| UniqueRow {
+            name: name.to_owned(),
+            users,
+            share_percent: share,
+            price_milli: Some(1_000),
+            price_currency: Some(Currency::Divine),
+            listings: Some(listings),
+            change_percent: None,
+        };
+        vec![
+            row("Tight", 9_000, 20.0, 100),  // 90.00
+            row("Middle", 3_000, 10.0, 100), // 30.00
+            row("Loose", 1_000, 5.0, 100),   // 10.00
+            row("Cold", 100, 0.2, 100),      // 1.00,默认收起来
+            row("Colder", 60, 0.1, 100),     // 0.60,默认收起来
+        ]
+    }
+
+    /// 供需那一格:两位小数,算不出来就是"—"。
+    ///
+    /// "—" 而不是 0:挂单数缺席的意思是"经济接口里没有这件东西",而 0
+    /// 会被读成"一个人都没在用"。
+    #[test]
+    fn the_demand_column_shows_two_decimals_or_a_dash() {
+        let built = unique_rows(&rows(), &rates(), view(), &i18n::ENGLISH);
+        // 7464 人 / 131 件挂单 = 56.977…,四舍五入到两位。
+        assert_eq!(built[0][6].text(), "56.98");
+        assert_eq!(built[1][6].text(), "164.09");
+        assert_eq!(built[2][6].text(), "—");
+        assert_eq!(built[2][6].tone(), Tone::Muted);
+    }
+
+    /// 紧俏的那一行标绿(名字和比值都是),过剩的那一行整体压暗。
+    #[test]
+    fn a_scarce_row_goes_green_and_a_glut_row_goes_quiet() {
+        let built = unique_rows(&demand_rows(), &rates(), view(), &i18n::ENGLISH);
+        assert_eq!(built.len(), 3, "占比不足 0.5% 的两条默认收起来");
+
+        assert_eq!(built[0][1].text(), "Tight");
+        assert_eq!(built[0][6].text(), "90.00");
+        assert_eq!(built[0][1].tone(), Tone::Good, "紧俏压过榜首那抹金色");
+        assert_eq!(built[0][6].tone(), Tone::Good);
+
+        assert_eq!(built[1][1].tone(), Tone::Plain, "常态那一行不着色");
+        assert_eq!(built[1][6].tone(), Tone::Data);
+
+        assert_eq!(built[2][1].text(), "Loose");
+        assert_eq!(built[2][1].tone(), Tone::Muted, "过剩的压暗");
+        assert_eq!(built[2][6].tone(), Tone::Muted);
+    }
+
+    /// 档位是**相对这张表**算的:放出冷门行,中位数跟着掉,每一行都得重评。
+    ///
+    /// 这一条是整个功能的支点。写死一条"5 个人抢一件就算紧俏"的线,换到
+    /// 某个职业分区(分母小一个数量级)之后要么整张表全绿,要么一条都没有。
+    #[test]
+    fn hiding_the_cold_rows_moves_the_median_and_re_tiers_everything() {
+        let rows = demand_rows();
+        let tier_of = |view: UniquesView, name: &str| {
+            visible_rows(&rows, view)
+                .into_iter()
+                .find(|shown| shown.row.name == name)
+                .expect("行还在表上")
+                .tier
+        };
+
+        // 只看三条热门的:中位数 30.00。
+        assert_eq!(tier_of(view(), "Tight"), DemandTier::Scarce);
+        assert_eq!(tier_of(view(), "Middle"), DemandTier::Balanced);
+        assert_eq!(tier_of(view(), "Loose"), DemandTier::Glut);
+
+        // 放出两条冷门的:中位数掉到 10.00,于是常态的变紧俏、过剩的变常态。
+        assert_eq!(tier_of(view_all(), "Tight"), DemandTier::Scarce);
+        assert_eq!(tier_of(view_all(), "Middle"), DemandTier::Scarce);
+        assert_eq!(tier_of(view_all(), "Loose"), DemandTier::Balanced);
+        assert_eq!(tier_of(view_all(), "Cold"), DemandTier::Glut);
+
+        // 表下面那一句数的是筛之前的那一批 —— 不然开了"只看紧俏"之后
+        // 过剩那个数永远是 0,那句话就白写了。
+        assert_eq!(demand_counts(&rows, false), (1, 1));
+        assert_eq!(demand_counts(&rows, true), (2, 2));
+    }
+
+    /// 「只看紧俏」只留紧俏那一档,而中位数**不跟着变** —— 跟着变的话
+    /// 就成了一个咬自己尾巴的循环:留下的全是紧俏,中位数被抬高,
+    /// 下一轮又有一半掉出紧俏。
+    #[test]
+    fn scarce_only_keeps_the_tight_rows_without_moving_the_line() {
+        let rows = demand_rows();
+        let scarce = UniquesView {
+            scarce_only: true,
+            ..view()
+        };
+        let names: Vec<&str> = visible_rows(&rows, scarce)
+            .iter()
+            .map(|shown| shown.row.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Tight"]);
+
+        let scarce_all = UniquesView {
+            scarce_only: true,
+            ..view_all()
+        };
+        let names: Vec<&str> = visible_rows(&rows, scarce_all)
+            .iter()
+            .map(|shown| shown.row.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Tight", "Middle"]);
+    }
+
+    /// 「按供需排序」把最紧俏的提到最前,而名次还是原来那个名次。
+    ///
+    /// 算不出比值的排到最后:它不是"供需比 0",而是"不知道" —— 混在
+    /// 过剩那一头会让人以为它烂大街。
+    #[test]
+    fn sorting_by_demand_puts_the_tightest_first_and_the_unknown_last() {
+        let sorted = UniquesView {
+            sort_by_demand: true,
+            ..view_all()
+        };
+        let built = unique_rows(&rows(), &rates(), sorted, &i18n::ENGLISH);
+        let names: Vec<&str> = built.iter().map(|row| row[1].text()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Beira's Anguish",
+                "Wake of Destruction",
+                "Somebody's Trinket",
+                "Breath of the Mountains",
+            ]
+        );
+        // 名次跟着行走,不跟着位置走:排到第一位的还是榜上第 2 名。
+        assert_eq!(built[0][0].text(), "2");
+        assert_eq!(built[1][0].text(), "1");
+        assert_eq!(built[3][6].text(), "—");
+    }
+
+    /// 一键蹲价:查询只写名字,上限压到参考价的八成。
+    ///
+    /// 八成是"比市价便宜才值得响一声";只写名字是因为底子名是 poe.ninja
+    /// 那边的写法,和交易站不一定逐字一致 —— 多写一个对不上的条件,
+    /// 搜出来的是零件。
+    #[test]
+    fn a_unique_turns_into_a_watch_draft_at_four_fifths_of_the_reference_price() {
+        let rows = rows();
+        let draft = unique_watch_draft(&rows[0], "Forbidden Rites");
+        assert_eq!(draft.label, "Wake of Destruction");
+        assert_eq!(draft.league, "Forbidden Rites");
+        assert_eq!(draft.currency, "divine");
+        // 29.9 div 的八成是 23.92 —— 一个整单位以上就抹掉零头。
+        assert_eq!(draft.cap_milli, Some(23_000));
+        assert_eq!(
+            decode_search_id(&draft.search_id).expect("解得开"),
+            r#"{"query":{"status":{"option":"online"},"name":"Wake of Destruction","stats":[{"type":"and","filters":[]}]},"sort":{"price":"asc"}}"#
+        );
+    }
+
+    /// 不到一个整单位的价格保留千分位 —— 抹成 0 的话那条蹲价永远不会响。
+    #[test]
+    fn a_sub_unit_price_keeps_its_thousandths() {
+        let mut cheap = rows()[0].clone();
+        cheap.price_milli = Some(85);
+        // 0.085 div 的八成是 0.068。
+        assert_eq!(
+            unique_watch_draft(&cheap, "Forbidden Rites").cap_milli,
+            Some(68)
+        );
+
+        // 经济接口里压根没有这件东西:上限和货币都留空,让用户自己填。
+        let draft = unique_watch_draft(&rows()[2], "Forbidden Rites");
+        assert_eq!(draft.label, "Breath of the Mountains");
+        assert_eq!(draft.cap_milli, None);
+        assert_eq!(draft.currency, "");
     }
 
     /// 下拉里的值必须是库里那个分区键(界面拿它回去查),显示的却是人话。
