@@ -296,7 +296,7 @@ fn capture_own_window(_title: &str, _path: &Path) -> Result<(i32, i32), String> 
 #[cfg(windows)]
 fn write_bmp(path: &Path, width: i32, height: i32, mut pixels: Vec<u8>) -> std::io::Result<()> {
     // PrintWindow 出来的 alpha 常常是 0,那样有些看图程序会画成全透明。
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel[3] = 0xFF;
     }
     const FILE_HEADER: u32 = 14;

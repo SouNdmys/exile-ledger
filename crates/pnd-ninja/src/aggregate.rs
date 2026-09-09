@@ -345,7 +345,7 @@ pub fn unique_usage_from_facet(entries: &[(String, u64)], total: u64) -> Vec<Uni
             },
         })
         .collect();
-    out.sort_by(|left, right| right.count.cmp(&left.count));
+    out.sort_by_key(|usage| std::cmp::Reverse(usage.count));
     out
 }
 

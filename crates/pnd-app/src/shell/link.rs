@@ -159,32 +159,23 @@ impl AppShell {
     /// 把两个事件源抽干。返回"有没有东西变了",由 tick 决定要不要重画。
     pub(crate) fn drain_events(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
-        loop {
-            let Some(event) = self
-                .runtime
-                .as_ref()
-                .and_then(RuntimeHandle::try_next_event)
-            else {
-                break;
-            };
+        while let Some(event) = self
+            .runtime
+            .as_ref()
+            .and_then(RuntimeHandle::try_next_event)
+        {
             self.on_runtime_event(event);
             changed = true;
         }
-        loop {
-            let Some(event) = self
-                .alert_card
-                .as_ref()
-                .and_then(AlertCardService::try_next_event)
-            else {
-                break;
-            };
+        while let Some(event) = self
+            .alert_card
+            .as_ref()
+            .and_then(AlertCardService::try_next_event)
+        {
             self.on_card_event(event, cx);
             changed = true;
         }
-        loop {
-            let Some(event) = self.login.as_ref().and_then(LoginService::try_next_event) else {
-                break;
-            };
+        while let Some(event) = self.login.as_ref().and_then(LoginService::try_next_event) {
             self.on_login_event(event);
             changed = true;
         }

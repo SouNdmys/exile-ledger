@@ -1004,7 +1004,7 @@ impl TradeGateway {
     /// 关门前给每一封还在排队的请求回一句 `Cancelled`:上层可能正等着回信,
     /// 没有这一步它就会一直挂着 `in_flight`。
     fn drain_cancelled(&mut self, rx: &Receiver<GatewayMessage>) {
-        let queued: Vec<Pending> = self.queue.drain(..).collect();
+        let queued: Vec<Pending> = std::mem::take(&mut self.queue);
         for pending in queued {
             self.reply(pending, GatewayError::Cancelled);
         }

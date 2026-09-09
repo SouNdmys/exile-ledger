@@ -207,7 +207,7 @@ fn pump(
                 // 一次超时 = 一个读超时那么久的沉默。攒够一分钟才吭一声,
                 // 不然 5 秒一行的 "idle" 会把真正的推送冲出屏幕。
                 idle_secs += PROBE_READ_TIMEOUT.as_secs();
-                if idle_secs % HEARTBEAT_SECS == 0 {
+                if idle_secs.is_multiple_of(HEARTBEAT_SECS) {
                     println!(
                         "{} idle       still connected, {idle_secs}s without a push",
                         stamp()
@@ -523,7 +523,7 @@ fn report_failure(error: &LiveError, had_session: bool) {
 
     let delay = error
         .retry_after()
-        .map_or_else(|| reconnect_delay(0, MID_JITTER).as_secs(), |secs| secs);
+        .unwrap_or_else(|| reconnect_delay(0, MID_JITTER).as_secs());
     println!(
         "next try    {delay} s from now (attempt 1 of the 5/10/20/40/80/160/300 s ladder, ±20% jitter)"
     );

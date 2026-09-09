@@ -566,7 +566,7 @@ fn print_index(client: &NinjaClient, args: &Args) -> Result<(), Box<dyn Error>> 
     }
 
     let mut leagues = builds.league_builds.clone();
-    leagues.sort_by(|left, right| right.total.cmp(&left.total));
+    leagues.sort_by_key(|league| std::cmp::Reverse(league.total));
 
     println!();
     println!("== build leagues ({}) ==", leagues.len());
@@ -1098,7 +1098,7 @@ fn run_aggregate(args: &Args) -> Result<(), Box<dyn Error>> {
         // 阈值给 0:探针要看的是原始统计,过滤是界面的事。
         let mut rows =
             store.slot_mods(&config.league_url, &snapshot.version, Some(slot), None, 0.0)?;
-        rows.sort_by(|left, right| right.characters.cmp(&left.characters));
+        rows.sort_by_key(|row| std::cmp::Reverse(row.characters));
         println!();
         println!("-- {slot} ({} rows) --", rows.len());
         println!(

@@ -90,8 +90,10 @@ mod alert_cue_tests {
         assert_eq!(wave.format().bits_per_sample, 16);
         assert!(
             wave.bytes()[44..]
-                .chunks_exact(2)
-                .any(|sample| sample != [0, 0])
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .any(|sample| *sample != [0, 0])
         );
         assert_eq!(
             format!("{:x}", Sha256::digest(wave.bytes())),

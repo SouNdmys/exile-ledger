@@ -232,7 +232,7 @@ impl SearchResponse {
                 (label, entry.count)
             })
             .collect();
-        resolved.sort_by(|left, right| right.1.cmp(&left.1));
+        resolved.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
         resolved
     }
 

@@ -524,14 +524,11 @@ impl AppShell {
     /// 把采样线程的事件抽干。返回"有没有东西变了"。
     pub(crate) fn drain_sampler_events(&mut self) -> bool {
         let mut changed = false;
-        loop {
-            let Some(event) = self
-                .sampler
-                .as_ref()
-                .and_then(SamplerHandle::try_next_event)
-            else {
-                break;
-            };
+        while let Some(event) = self
+            .sampler
+            .as_ref()
+            .and_then(SamplerHandle::try_next_event)
+        {
             self.on_sampler_event(&event);
             changed = true;
         }

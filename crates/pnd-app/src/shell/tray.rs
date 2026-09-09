@@ -93,10 +93,7 @@ impl AppShell {
     /// 把托盘线程报回来的事件抽干。返回"有没有东西变了"。
     pub(crate) fn drain_tray_events(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
-        loop {
-            let Some(event) = self.tray.as_ref().and_then(TrayHandle::try_next_event) else {
-                break;
-            };
+        while let Some(event) = self.tray.as_ref().and_then(TrayHandle::try_next_event) {
             changed = true;
             match event {
                 TrayEvent::Restore => self.restore_from_tray(),
