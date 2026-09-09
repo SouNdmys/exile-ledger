@@ -342,6 +342,13 @@ pub struct AppSettings {
     pub alert: AlertTuning,
     pub ninja: NinjaTuning,
     pub user_agent_mode: UserAgentMode,
+    /// 点窗口右上角那个叉时,是缩到通知区("托盘")还是真的退出。
+    ///
+    /// **默认缩起来**:这个程序一开就是几个小时(蹲价在轮询、市场观察在攒数据、
+    /// ninja 在采样),手滑点一下叉就把它们全掐了,而那些数据是攒不回来的。
+    /// 想退出的话托盘图标上右键有一条"退出程序"。schema 版本还是 1:
+    /// 老文件缺这个键时 `#[serde(default)]` 会补上默认值。
+    pub close_to_tray: bool,
 }
 
 impl Default for AppSettings {
@@ -360,6 +367,7 @@ impl Default for AppSettings {
             alert: AlertTuning::default(),
             ninja: NinjaTuning::default(),
             user_agent_mode: UserAgentMode::default(),
+            close_to_tray: true,
         }
     }
 }
@@ -1079,6 +1087,33 @@ mod settings_tests {
             store.load().settings.favourite_mods,
             settings.favourite_mods
         );
+        assert_eq!(store.load().settings.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    /// 点叉默认是"缩到托盘",不是"退出"。
+    ///
+    /// 这一条守的是默认值本身:程序一开就是几个小时,而它的窗口右上角那个叉
+    /// 离"关掉整个后台"只有一下。老的 `settings.json` 里没有这个键,缺了也得
+    /// 是缩起来 —— 升级一次程序就变回"点叉退出",等于把这个功能悄悄关掉。
+    #[test]
+    fn closing_the_window_hides_to_the_tray_unless_you_say_otherwise() {
+        assert!(AppSettings::default().close_to_tray);
+
+        let store = temp_store("close-to-tray-missing");
+        write_file(
+            &store,
+            r#"{"schema_version":1,"league":"Forbidden Rites","watches":[]}"#,
+        );
+        let loaded = store.load();
+        assert_eq!(loaded.status, LoadStatus::Loaded);
+        assert!(loaded.settings.close_to_tray, "老文件缺这个键也该是缩起来");
+
+        // 关掉之后要存得住:这是一个用户明确表过态的选择。
+        let mut settings = loaded.settings;
+        settings.close_to_tray = false;
+        settings.normalize();
+        store.save(&settings).expect("save");
+        assert!(!store.load().settings.close_to_tray);
         assert_eq!(store.load().settings.schema_version, CURRENT_SCHEMA_VERSION);
     }
 

@@ -191,6 +191,8 @@ impl AppShell {
         // ninja 采样是第三个事件源。它和交易那两条完全无关(不碰交易站、
         // 不碰 actor),只是同样需要有人定期来取。
         changed |= self.drain_sampler_events();
+        // 托盘图标是第四个:点一下图标要把窗口拿回来,菜单里选退出要真的退出。
+        changed |= self.drain_tray_events(cx);
         changed
     }
 

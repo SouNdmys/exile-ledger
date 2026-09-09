@@ -560,6 +560,16 @@ catalogue! {
     log_empty,
     /// "写到 {}"
     log_file_path,
+
+    // -- 通知区("托盘")图标 --
+    // 窗口藏起来之后,托盘图标是唯一能把它拿回来的地方,所以那两条菜单
+    // 必须说人话 —— 尤其是"退出程序":那是关掉这个程序的唯一一条路。
+    tray_menu_open,
+    tray_menu_quit,
+    /// 设置页上那个开关:点叉是缩到托盘还是真的退出。
+    settings_close_to_tray,
+    /// 开关旁边那句话。关掉窗口之后怎么退出,必须写在开关旁边。
+    settings_close_to_tray_hint,
 }
 
 /// 支持的语言码。设置里存的就是这两个字符串。
@@ -984,6 +994,11 @@ pub static ENGLISH: Text = Text {
     log_copied: "Log copied to the clipboard.",
     log_empty: "Nothing logged yet.",
     log_file_path: "written to {}",
+
+    tray_menu_open: "Open the main window",
+    tray_menu_quit: "Quit",
+    settings_close_to_tray: "Close button hides to the tray",
+    settings_close_to_tray_hint: "right-click the tray icon to quit",
 };
 
 pub static SIMPLIFIED_CHINESE: Text = Text {
@@ -1363,6 +1378,11 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     log_copied: "日志已复制到剪贴板。",
     log_empty: "还没有日志。",
     log_file_path: "写到 {}",
+
+    tray_menu_open: "打开主窗口",
+    tray_menu_quit: "退出程序",
+    settings_close_to_tray: "点关闭时缩到右下角托盘",
+    settings_close_to_tray_hint: "托盘图标右键可退出",
 };
 
 #[cfg(test)]

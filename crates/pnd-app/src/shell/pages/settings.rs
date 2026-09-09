@@ -348,6 +348,7 @@ impl AppShell {
         let read_only = self.read_only;
         let form = &self.settings_form;
         let sound = self.settings.alert.sound;
+        let close_to_tray = self.settings.close_to_tray;
 
         let general = section(
             text.settings_section_general,
@@ -529,6 +530,28 @@ impl AppShell {
                 field_row()
                     .child(field_label(""))
                     .child(hint(text.settings_toast_unavailable)),
+                // 点叉是"藏起来"还是"退出"。放在这一段是因为它和上面几条一样,
+                // 说的都是"程序怎么打扰你 / 怎么待在旁边",而不是它怎么跑。
+                field_row()
+                    .child(field_label(text.settings_close_to_tray))
+                    .child(
+                        Switch::new("settings-close-to-tray")
+                            .checked(close_to_tray)
+                            .label(SharedString::from(if close_to_tray {
+                                text.common_on
+                            } else {
+                                text.common_off
+                            }))
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.settings.close_to_tray = *checked;
+                                cx.notify();
+                            })),
+                    ),
+                // 窗口藏起来之后怎么退出,必须写在开关旁边 —— 否则打开这个
+                // 开关就等于"再也关不掉这个程序"。
+                field_row()
+                    .child(field_label(""))
+                    .child(hint(text.settings_close_to_tray_hint)),
             ],
         );
 

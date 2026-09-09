@@ -4167,6 +4167,7 @@ dependencies = [
  "pnd-settings",
  "pnd-storage",
  "pnd-trade",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "winresource",

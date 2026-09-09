@@ -5,11 +5,13 @@ mod alert_card;
 mod login_window;
 mod paint;
 mod shell;
+mod tray;
 mod wave;
 
 pub(crate) use alert_card::{spawn_card_worker, wake_card};
 pub(crate) use login_window::{spawn_login_worker, wake_login};
 pub use shell::open_url;
+pub(crate) use tray::{show_main_window, spawn_tray_worker, stop_tray};
 pub(crate) use wave::{play_wave, stop_wave};
 
 use windows::Win32::Foundation::RECT;

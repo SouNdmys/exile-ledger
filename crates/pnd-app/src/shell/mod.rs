@@ -12,6 +12,7 @@
 pub mod link;
 pub mod ninja;
 pub mod pages;
+pub mod tray;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -28,7 +29,7 @@ use gpui_component::table::{TableEvent, TableState};
 use gpui_component::{IndexPath, Selectable as _, Sizable as _, Size, StyledExt as _};
 
 use pnd_domain::{CurrencyRates, Game, ObservationId, WatchId};
-use pnd_platform_win::{AlertCardService, LoginService};
+use pnd_platform_win::{AlertCardService, LoginService, TrayHandle};
 use pnd_runtime::{
     MatchedListing, ObservationStatus, RuntimeHandle, SamplerHandle, WatchStatus, now_secs,
 };
@@ -272,6 +273,8 @@ pub struct AppShell {
     pub(crate) runtime: Option<RuntimeHandle>,
     /// 提醒卡片线程。`None` = 没有卡片,提醒只落在提醒记录页。
     pub(crate) alert_card: Option<AlertCardService>,
+    /// 通知区图标那条线程。`None` = 图标没起来,点叉就照旧退出。
+    pub(crate) tray: Option<TrayHandle>,
     /// 登录窗那条线程。第一次点"登录官网"时才建 —— 大多数启动根本用不上它,
     /// 没必要每次开程序都拉起一条 WebView2 线程。
     pub(crate) login: Option<LoginService>,
@@ -455,6 +458,8 @@ impl AppShell {
                 None
             }
         };
+        // 托盘图标要等窗口存在才起得来 —— 它得知道藏的是哪一个窗口。
+        let tray = tray::start_tray(text, window, &mut startup);
         // 界面这一侧的库连接是只读用途(提醒历史),但 SQLite 的连接本来就
         // 是读写的;WAL + busy_timeout 让它和 actor 那条互不打断。
         let alerts_store = match WatchStore::open(crate::watch_db_path()) {
@@ -624,6 +629,7 @@ impl AppShell {
             notice_at: None,
             runtime,
             alert_card,
+            tray,
             login: None,
             login_language: String::new(),
             login_phase: LoginPhase::default(),

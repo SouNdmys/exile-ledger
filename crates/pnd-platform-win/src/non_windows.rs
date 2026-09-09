@@ -10,6 +10,7 @@ use std::thread::{self, JoinHandle};
 use crate::PlatformError;
 use crate::alert_card::{CardConfig, CardError, CardEvent, CardOwnership, CardShared};
 use crate::login::{LoginConfig, LoginEvent, LoginShared};
+use crate::tray::{TrayConfig, TrayError, TrayEvent, TrayShared};
 
 pub(crate) fn play_wave(_bytes: &[u8]) -> Result<(), PlatformError> {
     Err(PlatformError::unsupported("WinMM WAV playback"))
@@ -68,4 +69,33 @@ pub(crate) fn spawn_login_worker(
 
 pub(crate) fn wake_login(_thread_id: u32) -> Result<(), PlatformError> {
     Err(PlatformError::unsupported("WebView2 login window"))
+}
+
+pub(crate) fn spawn_tray_worker(
+    _config: TrayConfig,
+    _shared: Arc<TrayShared>,
+    _events: mpsc::Sender<TrayEvent>,
+    ready: mpsc::SyncSender<Result<String, TrayError>>,
+) -> Result<JoinHandle<()>, TrayError> {
+    // 和卡片一样:立刻通过握手通道报错,`TrayService::start` 就不会白等 750 ms。
+    thread::Builder::new()
+        .name("pnd-tray".to_owned())
+        .spawn(move || {
+            let _ = ready.send(Err(TrayError::Platform(PlatformError::unsupported(
+                "notification area icon",
+            ))));
+        })
+        .map_err(|error| TrayError::Thread(format!("could not start pnd-tray: {error}")))
+}
+
+pub(crate) fn stop_tray(_thread_id: u32) -> Result<(), TrayError> {
+    Err(TrayError::Platform(PlatformError::unsupported(
+        "notification area icon",
+    )))
+}
+
+pub(crate) fn show_main_window(_hwnd: isize, _visible: bool) -> Result<(), TrayError> {
+    Err(TrayError::Platform(PlatformError::unsupported(
+        "ShowWindow",
+    )))
 }
