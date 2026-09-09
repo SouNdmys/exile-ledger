@@ -13,10 +13,11 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-authors = ["SouNd <soundmys1994@gmail.com>"]
+authors = ["SouNd"]
 edition = "2024"
+description = "Path of Exile price watcher and market ledger"
 license = "PolyForm-Noncommercial-1.0.0"
-repository = "https://github.com/SouNdmys/POE-Ninja-Data"
+repository = "https://github.com/SouNdmys/exile-ledger"
 rust-version = "1.88"
 
 [workspace.dependencies]

@@ -808,7 +808,7 @@ mod alert_card_tests {
     fn card_text_rejects_only_the_field_that_is_too_long() {
         let ok = CardText::new(
             "Choir of the Storm · 15 divine",
-            "Tongzii#6639 · online",
+            "Seller#1234 · online",
             "cap 20 divine",
             "search 6h 41/299",
             ["Open trade", "Copy whisper", "Hideout", "Dismiss"],

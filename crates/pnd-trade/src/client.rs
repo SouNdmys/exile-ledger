@@ -753,7 +753,7 @@ mod client_tests {
     /// `application/json` 不一样。
     #[test]
     fn a_whisper_request_carries_the_browser_headers() {
-        let client = TradeClient::new("PoeNinjaData/0.1.0".to_string());
+        let client = TradeClient::new("ExileLedger/0.1.0".to_string());
         let referer = "https://www.pathofexile.com/trade2/search/poe2/Standard/abcd1234";
         let request = client.whisper_request("not-a-real-session", referer);
         let headers = request.headers_ref().expect("builder has no error");
@@ -762,7 +762,7 @@ mod client_tests {
         assert_eq!(headers["X-Requested-With"], "XMLHttpRequest");
         assert_eq!(headers["Content-Type"], "application/json");
         assert_eq!(headers["Accept"], "*/*");
-        assert_eq!(headers["User-Agent"], "PoeNinjaData/0.1.0");
+        assert_eq!(headers["User-Agent"], "ExileLedger/0.1.0");
         assert_eq!(headers["Referer"], referer);
         assert_eq!(headers["Cookie"], "POESESSID=not-a-real-session");
     }

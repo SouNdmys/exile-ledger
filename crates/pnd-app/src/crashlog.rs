@@ -7,8 +7,8 @@
 
 use std::path::PathBuf;
 
-/// `%LOCALAPPDATA%\PoeNinjaData\panic.log`:和两个数据库同一个目录,
-/// 所以 `PND_DATA_DIR` 也把它一起搬走。
+/// `%LOCALAPPDATA%\ExileLedger\panic.log`:和两个数据库同一个目录,
+/// 所以 `EXILE_LEDGER_DATA_DIR` 也把它一起搬走。
 pub fn panic_log_path() -> PathBuf {
     crate::redirect(
         &pnd_storage::default_data_dir().join("panic.log"),

@@ -14,7 +14,7 @@ pub mod wire;
 /// poe.ninja 的 API 文档明确要求带一个能认出调用方、并留有联系方式的
 /// User-Agent。带上它,对面出问题时能直接找到人,而不是把我们当匿名爬虫掐掉。
 pub const USER_AGENT: &str = concat!(
-    "PoeNinjaData/",
+    "ExileLedger/",
     env!("CARGO_PKG_VERSION"),
-    " (contact: soundmys1994@gmail.com)"
+    " (contact: https://github.com/SouNdmys/exile-ledger)"
 );

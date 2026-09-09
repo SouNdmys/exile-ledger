@@ -45,7 +45,7 @@ impl Default for Options {
     }
 }
 
-const WINDOW_TITLE: &str = "POE Ninja Data — login probe";
+const WINDOW_TITLE: &str = "Exile Ledger — login probe";
 
 fn main() -> ExitCode {
     let options = match parse_args() {

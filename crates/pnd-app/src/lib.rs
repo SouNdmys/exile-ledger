@@ -1,4 +1,4 @@
-//! POE Ninja Data 的 GPUI 前端。
+//! Exile Ledger 的 GPUI 前端。
 //!
 //! 库 + 一层薄薄的二进制:窗口是 `run()` 开的,`main.rs` 只调它一句。这样
 //! 以后要再加一个入口(比如只画组件的预览窗)时,共用的这套模块只编译一次。
@@ -29,9 +29,9 @@ use shell::AppShell;
 /// 有真会话、真搜索列表的 `settings.json`。测试用例设一下这个变量,就不会
 /// 碰到它。**只有 `pnd-app` 认这两个变量**,`pnd-settings` / `pnd-storage`
 /// 里的默认路径不受影响。
-pub const SETTINGS_PATH_ENV: &str = "PND_SETTINGS_PATH";
-/// 同上,换的是两个 sqlite 和 `panic.log` 所在的目录。
-pub const DATA_DIR_ENV: &str = "PND_DATA_DIR";
+pub const SETTINGS_PATH_ENV: &str = "EXILE_LEDGER_SETTINGS_PATH";
+/// 同上,换的是两个 sqlite、`app.log`、`panic.log` 所在的目录。
+pub const DATA_DIR_ENV: &str = "EXILE_LEDGER_DATA_DIR";
 
 /// 这次启动要用的设置文件。
 #[must_use]
@@ -62,7 +62,7 @@ pub fn ninja_db_path_for(game: pnd_domain::Game) -> PathBuf {
 
 /// 日志文件的位置。
 ///
-/// 和两个 sqlite 放在同一个数据目录下,所以 `PND_DATA_DIR` 一并搬走它 ——
+/// 和两个 sqlite 放在同一个数据目录下,所以 `EXILE_LEDGER_DATA_DIR` 一并搬走它 ——
 /// 手测时不该往本机那份真日志里掺测试的行。
 #[must_use]
 pub fn app_log_path() -> PathBuf {
@@ -79,6 +79,26 @@ pub fn webview2_data_dir() -> PathBuf {
     data_dir().join("webview2")
 }
 
+/// 程序改名之前那个数据目录搬家。搬了就返回该记进日志的那一行。
+///
+/// 必须在打开这个目录里任何一个文件**之前**调:先搬再开,老文件夹里的
+/// 会话、搜索列表、提醒历史才跟着一起过来;反过来的话新文件夹会被
+/// SQLite 先建出来,搬家条件就永远不成立了。
+///
+/// 设了 [`DATA_DIR_ENV`] 的那次启动一律不搬 —— 那是手测,不该动真数据。
+#[must_use]
+pub fn migrate_data_dir() -> Option<String> {
+    if env_override(DATA_DIR_ENV).is_some() {
+        return None;
+    }
+    let (old, new) = pnd_storage::migrate_data_dir()?;
+    Some(format!(
+        "data dir: moved {} to {}",
+        old.display(),
+        new.display()
+    ))
+}
+
 /// 这次启动往哪个目录写东西。
 fn data_dir() -> PathBuf {
     env_override(DATA_DIR_ENV)
@@ -86,7 +106,7 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(pnd_storage::default_data_dir)
 }
 
-/// 环境变量的值,空串当成没设 —— `set PND_DATA_DIR=` 的意思是"别改",
+/// 环境变量的值,空串当成没设 —— `set EXILE_LEDGER_DATA_DIR=` 的意思是"别改",
 /// 不是"把数据写到当前目录"。
 fn env_override(name: &str) -> Option<String> {
     std::env::var(name)
@@ -135,7 +155,7 @@ pub fn run() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     window_min_size: Some(size(px(min_width), px(min_height))),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("POE Ninja Data".into()),
+                        title: Some("Exile Ledger".into()),
                         ..Default::default()
                     }),
                     ..Default::default()

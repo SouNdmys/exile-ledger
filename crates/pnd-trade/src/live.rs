@@ -690,7 +690,7 @@ mod live_tests {
             league: "Forbidden Rites".to_string(),
             search_id: "H4sIAAAA-_09".to_string(),
             poesessid: SECRET.to_string(),
-            user_agent: "PoeNinjaData/0.1.0 (contact: someone@example.com)".to_string(),
+            user_agent: "ExileLedger/0.1.0 (contact: someone@example.com)".to_string(),
             read_timeout: Duration::from_secs(30),
         }
     }
@@ -764,7 +764,7 @@ mod live_tests {
             headers["User-Agent"]
                 .to_str()
                 .unwrap()
-                .starts_with("PoeNinjaData/")
+                .starts_with("ExileLedger/")
         );
         assert_eq!(headers["Origin"], "https://www.pathofexile.com");
         assert_eq!(

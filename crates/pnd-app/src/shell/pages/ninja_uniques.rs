@@ -35,6 +35,20 @@ use crate::theme::*;
 /// 捡到一件就穿上了"。全铺出来,真正的热门装备反而要往下翻半天。
 pub const MIN_SHARE_PERCENT: f64 = 0.5;
 
+/// 7 天涨跌那一列现在画不画。
+///
+/// **现在是 `false`。** poe.ninja 在 2026-09-07 把经济接口的计价基准币换掉了
+/// (从 exalted 换成 divine)。7 天窗口只要还跨着那一天,这个百分比就是拿
+/// 两把不同的尺子相减的结果:榜上整片 `-99%` 说的不是"这东西跌没了",
+/// 是"分母换了一个近百倍的单位"。一个看着像价格、其实是量纲事故的数字,
+/// 比没有这个数字更坏 —— 所以整列先闭嘴,画成一个安静的破折号。
+///
+/// **什么时候翻回 `true`**:等 7 天窗口整个滚过 2026-09-07 之后(也就是
+/// 2026-09-14 起),再对着榜上几行手动核一次涨跌方向,确认不再出现整片
+/// `-99%`,就把这里改成 `true`,同时改掉
+/// `the_seven_day_column_is_a_dash_while_the_switch_is_off` 那个测试。
+const SHOW_SEVEN_DAY_CHANGE: bool = false;
+
 /// 一键蹲价的上限是参考价的**八成**(分子/分母写成两个整数,免得碰浮点)。
 ///
 /// 参考价是"现在市面上大概多少钱",而蹲价要等的是比市价便宜的那一件:
@@ -251,7 +265,7 @@ pub fn unique_rows(
                     demand_text(shown.ratio_milli, text),
                     demand_tone(shown.tier, shown.ratio_milli),
                 ),
-                change_cell(row.change_percent, text),
+                seven_day_cell(row.change_percent, text),
             ]
         })
         .collect()
@@ -400,6 +414,18 @@ fn currency_label<'a>(currency: &'a Currency, text: &'static Text) -> &'a str {
         Currency::Chaos => text.common_currency_chaos,
         other => other.code(),
     }
+}
+
+/// 表上那一格,先过一遍 [`SHOW_SEVEN_DAY_CHANGE`] 这个闸。
+///
+/// 闸和格式分成两个函数,是为了让 [`change_cell`] 那套涨跌写法在闸关着的
+/// 这段时间里仍然有测试盯着 —— 否则等到哪天把闸推回去,推开的会是一段
+/// 谁也没验过多久的代码。
+fn seven_day_cell(change: Option<f64>, text: &'static Text) -> Cell {
+    if !SHOW_SEVEN_DAY_CHANGE {
+        return Cell::muted(text.common_none);
+    }
+    change_cell(change, text)
 }
 
 /// 7 天涨跌。涨了标绿、跌了标琥珀 —— 这一列是给"现在该不该买"用的。
@@ -798,31 +824,26 @@ mod ninja_uniques_tests {
         // 29.9 divine(接口今天的基准币),按 1 divine = 83.42 exalted 换算。
         assert_eq!(built[0][4].text(), "29.9 div ≈ 2494 ex");
         assert_eq!(built[0][5].text(), "131");
-        assert_eq!(built[0][7].text(), "+6.0%");
-        assert_eq!(built[0][7].tone(), Tone::Good);
-        assert_eq!(built[1][7].text(), "-9.0%");
-        assert_eq!(built[1][7].tone(), Tone::Warn);
+        // 7 天那一列现在是关着的,见 `SHOW_SEVEN_DAY_CHANGE`;涨跌怎么写
+        // 由 `a_big_drop_keeps_its_decimal_instead_of_reading_as_zero` 盯着。
+        let text = &i18n::ENGLISH;
+        assert_eq!(change_cell(Some(6.0), text).text(), "+6.0%");
+        assert_eq!(change_cell(Some(6.0), text).tone(), Tone::Good);
+        assert_eq!(change_cell(Some(-9.0), text).text(), "-9.0%");
+        assert_eq!(change_cell(Some(-9.0), text).tone(), Tone::Warn);
     }
 
     /// 跌了 99.53% 就写 `-99.5%`,不是 `-100%`。
     ///
     /// 那个 `-100%` 是四舍五入印出来的,而 `-100%` 在人眼里是"归零了"——
     /// 完全不同的一句话。Trenchtimbre 那条榜上的怪数字就是这么来的。
+    ///
+    /// 直接问 [`change_cell`],不走表格:表上那一列眼下被
+    /// [`SHOW_SEVEN_DAY_CHANGE`] 关着,而这段写法要在闸推回去的那天还是对的。
     #[test]
     fn a_big_drop_keeps_its_decimal_instead_of_reading_as_zero() {
         let text = &i18n::ENGLISH;
-        let cell = |change: Option<f64>| {
-            let rows = vec![UniqueRow {
-                name: "Trenchtimbre".to_owned(),
-                users: 1_000,
-                share_percent: 5.0,
-                price_milli: Some(85),
-                price_currency: Some(Currency::Divine),
-                listings: Some(1_509),
-                change_percent: change,
-            }];
-            unique_rows(&rows, &rates(), view(), text)[0][7].clone()
-        };
+        let cell = |change: Option<f64>| change_cell(change, text);
         assert_eq!(cell(Some(-99.53)).text(), "-99.5%");
         // 小到看不见的涨幅也是涨,别被抹成 +0%。
         assert_eq!(cell(Some(0.4)).text(), "+0.4%");
@@ -830,6 +851,22 @@ mod ninja_uniques_tests {
         // 真的没有一周历史时是"—",不是一个编出来的 0。
         assert_eq!(cell(None).text(), "—");
         assert_eq!(cell(None).tone(), Tone::Muted);
+    }
+
+    /// 开关关着的时候,7 天那一格一律是安静的"—",连算都不算。
+    ///
+    /// 有涨有跌的两行都要验:关掉这一列不是"把负数藏起来",是整列都不说话。
+    ///
+    /// **这个测试描述的是 `SHOW_SEVEN_DAY_CHANGE == false` 时的样子**,所以
+    /// 哪天把那个开关翻回 `true`,第一个变红的就是它 —— 那正是提醒你回来改
+    /// 这一条的机制。
+    #[test]
+    fn the_seven_day_column_is_a_dash_while_the_switch_is_off() {
+        let built = unique_rows(&rows(), &rates(), view(), &i18n::ENGLISH);
+        for (row, built) in built.iter().enumerate() {
+            assert_eq!(built[7].text(), "—", "第 {row} 行");
+            assert_eq!(built[7].tone(), Tone::Muted, "第 {row} 行");
+        }
     }
 
     /// 经济接口里没有的那件东西,四格都写"—",不写 0 —— 0 会被读成"不值钱"。
@@ -967,8 +1004,11 @@ mod ninja_uniques_tests {
         assert_eq!(all.len(), 4);
         assert_eq!(all[3][0].text(), "4");
         assert_eq!(all[3][1].text(), "Somebody's Trinket");
-        assert_eq!(all[3][7].text(), "+0.0%", "有历史、真的没涨没跌,也是一个数");
-        assert_eq!(all[3][7].tone(), Tone::Muted);
+        // "有历史、真的没涨没跌"也是一个数,不是"—"。这一条问的是
+        // `change_cell` 本身:表上那一列被 `SHOW_SEVEN_DAY_CHANGE` 关着。
+        let flat = change_cell(Some(0.0), &i18n::ENGLISH);
+        assert_eq!(flat.text(), "+0.0%");
+        assert_eq!(flat.tone(), Tone::Muted);
     }
 
     /// 抬头必须说清这份数据是什么时候的 —— 不知道多旧的热度榜没法用。

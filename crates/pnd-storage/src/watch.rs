@@ -232,7 +232,7 @@ pub struct WatchStore {
 impl WatchStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
-        // 第一次启动时 `%LOCALAPPDATA%\PoeNinjaData` 还不存在,SQLite 不会替你建目录。
+        // 第一次启动时 `%LOCALAPPDATA%\ExileLedger` 还不存在,SQLite 不会替你建目录。
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {

@@ -56,7 +56,7 @@ use crate::hotkey::Hotkey;
 use crate::wave::LoopingWavePlayer;
 
 const CARD_CLASS: PCWSTR = w!("PndAlertCard");
-const CARD_TITLE: PCWSTR = w!("POE Ninja Data alert");
+const CARD_TITLE: PCWSTR = w!("Exile Ledger alert");
 /// 唤醒消息:命令本身在 `CardShared` 的队列里,这条消息只负责把线程从
 /// `GetMessageW` 里叫醒。
 const WM_CARD_COMMANDS: u32 = WM_APP + 0x2A1;

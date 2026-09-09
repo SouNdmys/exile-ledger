@@ -361,7 +361,7 @@ mod search_tests {
             string_field(1, "name"),
             string_field(2, "name"),
             varint_field(4, 1),
-            string_field(7, "ResurrectForbidden"),
+            string_field(7, "ExileCharacter"),
             string_field(7, "KingPinUwU"),
             string_field(7, "sqvoznyak"),
             varint_field(13, 3),
@@ -369,7 +369,7 @@ mod search_tests {
         let account_column = concat(&[
             string_field(1, "account"),
             string_field(2, "account"),
-            string_field(7, "heygyus-0416"),
+            string_field(7, "player-0416"),
             string_field(7, "dota2enjoyer-1809"),
             string_field(7, "elinskiy2002-4257"),
         ]);
@@ -551,8 +551,8 @@ mod search_tests {
         assert_eq!(
             refs[0],
             CharacterRef {
-                account: "heygyus-0416".to_owned(),
-                name: "ResurrectForbidden".to_owned(),
+                account: "player-0416".to_owned(),
+                name: "ExileCharacter".to_owned(),
                 class: "Gemling Legionnaire".to_owned(),
                 level: 98,
             }

@@ -153,7 +153,7 @@ mod listing_tests {
     use super::*;
     use pnd_domain::Currency;
 
-    /// 照今天实测的形状剪的:第一条是计划里那单(山箏#5319、90 chaos、
+    /// 照今天实测的形状剪的:第一条是计划里那单(Seller#1234、90 chaos、
     /// zh_TW 的私聊文本、afk),第二条带两个 token 且没有 price,
     /// 第三条是 null(id 过期),第四条是稀有物品(name 为空)。
     const FETCH_JSON: &str = r#"{
@@ -166,13 +166,13 @@ mod listing_tests {
             "stash": {"name": "~price 90 chaos", "x": 3, "y": 1},
             "price": {"type": "~price", "amount": 90, "currency": "chaos"},
             "account": {
-              "name": "山箏#5319",
+              "name": "Seller#1234",
               "online": {"league": "Forbidden Rites", "status": "afk"},
-              "lastCharacterName": "箏箏放電",
+              "lastCharacterName": "測試角色",
               "language": "zh_TW",
               "realm": "poe2"
             },
-            "whisper": "@箏箏放電 你好，我想購買 天雷之詠 標價 90 混沌石 在 Forbidden Rites (倉庫頁 \"~price 90 chaos\"; 位置: 左 3, 上 1)"
+            "whisper": "@測試角色 你好，我想購買 天雷之詠 標價 90 混沌石 在 Forbidden Rites (倉庫頁 \"~price 90 chaos\"; 位置: 左 3, 上 1)"
           },
           "item": {
             "name": "Choir of the Storm",
@@ -240,14 +240,14 @@ mod listing_tests {
             Some(Price::new(90_000, Currency::Chaos)),
             "90 chaos 存成千分整数"
         );
-        assert_eq!(first.account, "山箏#5319");
-        assert_eq!(first.character, "箏箏放電");
+        assert_eq!(first.account, "Seller#1234");
+        assert_eq!(first.character, "測試角色");
         assert!(first.online, "online 是个对象就算在线");
         assert!(first.afk, "对象里 status=afk");
         assert_eq!(first.indexed, "2026-09-06T09:12:31Z");
         assert_eq!(first.item_name, "Choir of the Storm");
         assert_eq!(first.type_line, "Lapis Amulet");
-        assert!(first.whisper.starts_with("@箏箏放電"));
+        assert!(first.whisper.starts_with("@測試角色"));
         assert_eq!(first.icon, "https://web.poecdn.com/gen/image/choir.png");
         assert_eq!(first.whisper_token, None, "没带 POESESSID 就没有 token");
         assert_eq!(first.hideout_token, None);
@@ -345,7 +345,7 @@ mod listing_tests {
         let body = format!(
             r#"{{"result":[{{"id":"{real}","listing":{{"indexed":"2026-09-07T12:47:39Z",
                "price":{{"type":"~price","amount":1,"currency":"divine"}},
-               "account":{{"name":"poeSayad25#5334","online":{{"league":"Forbidden Rites"}}}},
+               "account":{{"name":"Seller#1234","online":{{"league":"Forbidden Rites"}}}},
                "whisper":"@x hi"}},
                "item":{{"name":"Choir of the Storm","typeLine":"Lapis Amulet"}}}},null]}}"#
         );
@@ -354,7 +354,7 @@ mod listing_tests {
 
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].0, real);
-        assert_eq!(pairs[0].1.as_ref().unwrap().account, "poeSayad25#5334");
+        assert_eq!(pairs[0].1.as_ref().unwrap().account, "Seller#1234");
         assert_eq!(pairs[1].0, fake);
         assert!(pairs[1].1.is_none(), "查不到的 id 就是 None");
     }

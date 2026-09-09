@@ -1,4 +1,107 @@
-# POE Ninja Data
+# Exile Ledger
+
+A Windows desktop tool for Path of Exile 1 and Path of Exile 2. It watches a
+trade search you paste in — over live search when you are logged in, and over
+gentle polling when you are not — and when something lands at or under the
+price cap you set, it plays a sound and drops a small always-on-top card in the
+corner of the screen with one-click open-trade, copy-whisper and travel-to-
+hideout buttons. Alongside that it keeps a market ledger: the trade site
+publishes no sale history, but a listing that vanishes an hour after it was
+indexed tells you something, so the tool follows listings until they disappear
+and reports which modifiers actually sell, how fast, and at what price. A third
+page reads poe.ninja to show which uniques and which modifiers the popular
+builds are actually using, with reference prices next to them.
+
+*(The rest of this README is in Chinese — it is the author's own manual. The
+sections below in English are the ones a new reader needs.)*
+
+## Disclaimer
+
+Exile Ledger is an unofficial third-party tool. It is **not affiliated with,
+endorsed by, or connected to Grinding Gear Games or poe.ninja**. Path of Exile
+is a trademark of Grinding Gear Games.
+
+- It talks to public endpoints only — the official trade site and poe.ninja's
+  documented API. There is no private or reverse-engineered game protocol in it.
+- It spends at most **50 % of the rate limit the server itself advertises** in
+  its response headers, and backs off when told to. It never runs flat out.
+- **It never sends input to the game.** No key presses, no mouse events, no
+  macros. It does not whisper a seller and does not travel to a hideout on its
+  own: the "copy whisper" button puts text on your clipboard for you to paste,
+  and "hideout" goes through the trade site's own endpoint and only ever fires
+  when you click it. One click, one action.
+- Your `POESESSID` session cookie is stored in a file on your own machine —
+  encrypted with Windows DPAPI, scoped to your Windows user, so the file is
+  useless on another machine or under another account — and is sent to the
+  official trade site and nowhere else. Nothing is uploaded anywhere, there is
+  no telemetry, and there is no server on the other end.
+
+Use of the trade site is subject to Grinding Gear Games' terms. You are
+responsible for how you use this tool.
+
+## Requirements
+
+- Windows 10 or 11 (x64). The tool is Windows-only by design — the tray icon,
+  the alert card and the login window are Win32.
+- The **WebView2 runtime**, used only by the in-app login window. It ships with
+  current Windows; if it is missing, the settings page offers a link to it, and
+  you can skip it entirely by pasting `POESESSID` in by hand.
+- To build from source: a Rust toolchain (1.88 or newer) and the Windows SDK
+  (for `rc.exe`, which embeds the icon — without it the build still succeeds,
+  just with the default icon).
+
+## Build
+
+```
+cargo build --release -p pnd-app
+```
+
+The binary lands at `target\release\exile-ledger.exe`. Or run the script, which
+builds and then puts an `Exile Ledger` shortcut on your desktop:
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
+```
+
+## First three minutes
+
+1. **Get it.** Download the zip from the Releases page, or build it as above.
+2. **Open it.** Double-click `exile-ledger.exe`. No installer, no service, no
+   auto-start; it runs when you run it.
+3. **Log in.** Settings → *Log in on pathofexile.com*. A separate window opens
+   with the site's own login page — your password goes to the site, never
+   through this program, and only the `POESESSID` cookie is read back. Then set
+   your league name and press *Save*. Logging in is optional: polling works
+   without a session; live search and travel-to-hideout need one.
+4. **Paste a search.** On the *Watches* page, paste a trade search URL straight
+   out of your browser's address bar (PoE1 and PoE2 URLs are both recognised —
+   the tool tells them apart on its own).
+5. **Set a cap.** Give it a price cap and a currency. A listing at or below the
+   cap is a hit. Do not set a price range on the website itself; let the tool do
+   the comparison, because it converts other currencies at poe.ninja's rates.
+
+Everything the program writes lives in one folder: `%LOCALAPPDATA%\ExileLedger\`
+— settings, the two SQLite databases, the logs and the login window's browser
+profile. Delete that folder and you are back to a fresh install.
+
+When something looks wrong, the **log** button in the top right opens a drawer
+with the live contents of `app.log`. If the window vanished instead, read
+`%LOCALAPPDATA%\ExileLedger\panic.log` — if that file exists, the last run
+crashed.
+
+## Roadmap
+
+- **PoE1 live search and poe.ninja sampling have not been exercised on a real
+  account yet.** The code paths exist and are unit-tested; the PoE2 ones are the
+  ones with real mileage on them.
+- **Seller-filter delisting detection** — narrowing a re-check to one seller's
+  listings so a disappearance can be told apart from a search-index hiccup.
+- **Price × modifier cross-tab** — today the market ledger reports by modifier
+  and by price band separately; the interesting question is the two together.
+- **A "search for this character's item" page** — go from a build on poe.ninja
+  straight to a trade search for the item it is wearing.
+
+---
 
 一个人自己用的 PoE2 小工具,Windows 桌面程序。做两件事:
 
@@ -22,8 +125,9 @@
 powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
 ```
 
-它做两件事:编出 `target\release\pnd-app.exe`,然后在**桌面**放一个
-「POE Ninja Data」快捷方式。以后就双击那个快捷方式,不用再开命令行。
+它做两件事:编出 `target\release\exile-ledger.exe`,然后在**桌面**放一个
+「Exile Ledger」快捷方式。以后就双击那个快捷方式,不用再开命令行。
+(旧版那个「POE Ninja Data」快捷方式指着一个已经不存在的文件,脚本会顺手删掉。)
 
 exe 换了地方(比如仓库搬盘)之后,不用重编,只要重刷快捷方式:
 
@@ -140,7 +244,9 @@ powershell -ExecutionPolicy Bypass -File scripts\make-shortcut.ps1
 暗金热度表里的**挂单数**是 poe.ninja 看到的这件暗金现在市集上在卖的数量,**供需** = 人数 ÷ 挂单数:
 用的人多、货少,价格有支撑。程序按全表中位数给每行贴标签 —— 3 倍以上是**紧俏**(绿),三分之一以下是**过剩**(灰),
 「只看紧俏」「按供需排序」两个开关在分区旁边。选中一行按「做成蹲价」,会按名字生成搜索、价格上限预填参考价的 80%,
-跳到蹲价页等你确认。「7 天」那列在 poe.ninja 换计价基准后的一周内会全是 -99%,先别看。
+跳到蹲价页等你确认。「7 天」那列**眼下整列关着**,画的是一个破折号:poe.ninja 在
+2026-09-07 换了计价基准币,7 天窗口只要还跨着那一天,算出来的就是两把尺子相减,
+榜上会整片 -99%。窗口滚过那一天之后再打开它(代码里那个 `SHOW_SEVEN_DAY_CHANGE`)。
 
 刷新一轮的代价:默认采 **2000 个角色**,**每秒 1 个请求**,大约 **35 分钟** 跑完。
 跑的时候你可以照常用别的页面。同一个联赛 **24 小时内不会重采**,所以关掉程序再打开
@@ -170,12 +276,15 @@ poe.ninja 自己会说,不用你每三个月回来改一次。
 
 ## 东西都存在哪儿
 
-全在这一个文件夹里:`%LOCALAPPDATA%\PoeNinjaData\`
+全在这一个文件夹里:`%LOCALAPPDATA%\ExileLedger\`
 (地址栏直接粘这一串就能打开)
+
+程序改名之前这个文件夹叫 `PoeNinjaData`。第一次开新版本时它会自己整个改名搬过来,
+日志里会写一行 `data dir: moved …`;老数据一个字节都不用你手动搬。
 
 | 文件 | 是什么 |
 | --- | --- |
-| `settings.json` | 你在设置页填的一切,**包括明文的 POESESSID** |
+| `settings.json` | 你在设置页填的一切。**POESESSID 是加密存的**(Windows DPAPI),只有这台电脑上的这个 Windows 账户解得开;旧版写进去的明文还能读,下次保存时自动换成密文 |
 | `watch.sqlite` | 搜索列表、轮询状态、提醒历史 |
 | `ninja.sqlite` | poe.ninja 的 **PoE2** 采样缓存(两张热度榜读它) |
 | `ninja-poe1.sqlite` | 同上,**PoE1** 那一份。没采过 PoE1 就是个空文件 |
@@ -199,7 +308,7 @@ poe.ninja 自己会说,不用你每三个月回来改一次。
   的那个时间点再继续,什么都不用做。等就是了。
 - **登录窗打不开** —— 这台机器缺 WebView2。按「去装 WebView2」,或者用浏览器登录后从
   开发者工具 → Application → Cookies → pathofexile.com 里把 `POESESSID` 手动粘进设置页。
-- **程序一闪就没了** —— 去看 `%LOCALAPPDATA%\PoeNinjaData\panic.log`。
+- **程序一闪就没了** —— 去看 `%LOCALAPPDATA%\ExileLedger\panic.log`。
 
 ---
 
@@ -212,3 +321,12 @@ cargo run -p pnd-runtime --bin trade_probe -- --league "Forbidden Rites" --searc
 cargo run -p pnd-runtime --bin ninja_probe -- --search --class "Gemling Legionnaire"
 cargo run -p pnd-platform-win --bin alert_probe -- --corner bottom_right --auto-hide 1
 ```
+
+---
+
+## License
+
+Licensed under the PolyForm Noncommercial License 1.0.0 ([LICENSE.md](LICENSE.md)).
+You are free to use, modify and share it for personal and any other
+non-commercial purpose; it may not be sold or used commercially. See the license
+text for the exact terms.

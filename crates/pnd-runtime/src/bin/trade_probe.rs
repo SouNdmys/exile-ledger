@@ -103,9 +103,9 @@ use pnd_trade::rate_limit::{
 /// 计划里定的 User-Agent:能认出是谁、留了联系方式。今天实测交易站接受它。
 /// (以后这个字符串会从设置里来,可以切成浏览器样式;探针写死是为了少一个变量。)
 const USER_AGENT: &str = concat!(
-    "PoeNinjaData/",
+    "ExileLedger/",
     env!("CARGO_PKG_VERSION"),
-    " (contact: soundmys1994@gmail.com)"
+    " (contact: https://github.com/SouNdmys/exile-ledger)"
 );
 
 /// 两轮之间至少歇这么久。限速器算出来的等待通常更长,这只是个下限,

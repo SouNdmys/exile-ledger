@@ -693,7 +693,7 @@ pub(crate) mod live_worker_tests {
             league: "Forbidden Rites".to_string(),
             search_id: "H4sIAAAA-_09".to_string(),
         };
-        LiveConfig::new(&search, session, "PoeNinjaData/test")
+        LiveConfig::new(&search, session, "ExileLedger/test")
     }
 
     fn worker_config(watch: &str, session: &str) -> LiveWorkerConfig {

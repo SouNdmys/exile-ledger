@@ -48,7 +48,7 @@ fn main() -> ExitCode {
     };
 
     let config = TrayConfig {
-        tooltip: "POE Ninja Data".to_owned(),
+        tooltip: "Exile Ledger".to_owned(),
         // 探针没有主窗口:服务必须照样起得来。
         main_hwnd: 0,
         menu_open: "Open the main window".to_owned(),
