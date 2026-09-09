@@ -624,9 +624,10 @@ impl AppShell {
             .detach();
         }
 
-        // 开局按设置里选中的那一代建视图。PoE1 的联赛可以是空的("用当季挑战
-        // 联赛"),那时短名由 `resync_ninja_league` 回头去问库。
-        let ninja = NinjaData::empty(ninja::ninja_league_url(&settings, settings.ninja_game));
+        // 开局先给一份空的:短名和数据都由下面那句 `resync_ninja_league` 一起
+        // 定。这里不提前把短名算出来 —— 算了也是白算(马上被覆盖),而且看起来
+        // 像"视图已经建好了"。
+        let ninja = NinjaData::default();
 
         let mut shell = Self {
             focus_handle: cx.focus_handle(),

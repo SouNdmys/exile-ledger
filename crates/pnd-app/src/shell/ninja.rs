@@ -61,6 +61,12 @@ pub struct UniqueRow {
 pub struct NinjaData {
     /// builds 接口用的联赛短名,库里所有行都按它分。
     pub league_url: String,
+    /// 这份视图**回库里问过一次**了没有。
+    ///
+    /// 空视图的短名不是空的:它是拿设置里的联赛名现算出来的,所以"短名对得上"
+    /// 并不代表"数据已经在手上"。区分这两件事的只有这一位,
+    /// [`view_needs_rebuild`] 靠它决定开局那一次要不要读库。
+    pub loaded: bool,
     pub snapshot: Option<SnapshotRow>,
     /// 跑完了的分区键,就是筛选器里那一串。
     pub partition_keys: Vec<String>,
@@ -127,6 +133,20 @@ pub fn ninja_league_url(settings: &AppSettings, game: Game) -> String {
     } else {
         league_url_guess(name)
     }
+}
+
+/// 手上这份视图还能不能接着用,还是得回库里重读一份。
+///
+/// 光比短名不够:开局那一份视图的短名是**从设置里算出来的**,一行库都还没读过
+/// 的时候它就已经等于解析结果了。只比名字的话开局这一次会被当成"没变",两页
+/// 于是空到用户去拨一下游戏开关为止。所以"读没读过"得单独算一票。
+#[must_use]
+pub fn view_needs_rebuild(
+    current_league_url: &str,
+    current_is_loaded: bool,
+    resolved_league_url: &str,
+) -> bool {
+    !current_is_loaded || resolved_league_url != current_league_url
 }
 
 /// 抬头和状态行上的"哪一代 · 哪个联赛"。
@@ -220,8 +240,11 @@ pub fn load(
     want_class: &str,
 ) -> Result<NinjaData, StorageError> {
     let (characters_pending, characters_done, _failed) = store.character_counts(league_url)?;
+    // 这一趟已经问过库了,后面哪怕一行都没查到也算"读过":空库和没读过是
+    // 两件事,混起来就会每次 resync 都白跑一趟。
     let mut data = NinjaData {
         league_url: league_url.to_owned(),
+        loaded: true,
         characters_done,
         characters_pending,
         prices_fetched_at: store.unique_prices_age(league_url)?,
@@ -471,7 +494,8 @@ impl AppShell {
         {
             self.push_log(format!("settings save failed: {error}"));
         }
-        // 短名清空,`resync_ninja_league` 才会认为"这一代的视图还没建"。
+        // 换一份还没读过库的空视图:两代各有一个 sqlite 文件,就算两边的联赛
+        // 短名撞在一起,`resync_ninja_league` 也得照样回**这一代**的库里读一遍。
         self.ninja = NinjaData::empty(String::new());
         self.resync_ninja_league();
         cx.notify();
@@ -609,7 +633,7 @@ impl AppShell {
                 }
             };
         }
-        if league_url == self.ninja.league_url && !self.ninja.league_url.is_empty() {
+        if !view_needs_rebuild(&self.ninja.league_url, self.ninja.loaded, &league_url) {
             return;
         }
         self.ninja = NinjaData::empty(league_url);
@@ -853,6 +877,30 @@ mod ninja_tests {
         assert_eq!(ninja_league_url(&blank, Game::Poe1), "");
         // PoE2 那一侧不受影响。
         assert_eq!(ninja_league_url(&blank, Game::Poe2), "forbiddenrites");
+    }
+
+    /// 开局那一次必须真的回库里读一遍,哪怕短名早就对上了。
+    ///
+    /// 开局的视图是拿设置里的联赛名现算出来的短名建的,库还一行没读过。只比
+    /// 短名的话这一次会被当成"没变"而跳过,两页于是空着 —— 直到用户把游戏开关
+    /// 拨过去再拨回来(那条路会先把短名清空)才冒出数据。
+    #[test]
+    fn a_never_loaded_view_rebuilds_even_when_the_league_name_already_matches() {
+        assert!(
+            view_needs_rebuild("forbiddenrites", false, "forbiddenrites"),
+            "开局那份视图一行库都没读过,名字对上也得读一遍"
+        );
+        // 读过了、名字也没变:再读一遍纯属白跑一趟。
+        assert!(!view_needs_rebuild(
+            "forbiddenrites",
+            true,
+            "forbiddenrites"
+        ));
+        // 换了联赛(或者换了一代)就得换一份视图,读没读过都一样。
+        assert!(view_needs_rebuild("forbiddenrites", true, "allflame"));
+        assert!(view_needs_rebuild("forbiddenrites", false, "allflame"));
+        // 短名还认不出来(PoE1 留空、一次都没采过)也归"还没读过"这一档。
+        assert!(view_needs_rebuild("", false, ""));
     }
 
     /// 抬头上"哪一代 · 哪个联赛"两件事都要写出来。
