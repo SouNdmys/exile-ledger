@@ -1,5 +1,16 @@
-# The app icon is handed to rc.exe verbatim at build time. Git's binary
-# heuristic happens to guess right on an .ico, but core.autocrlf is on in this
-# repo and a guess that ever goes the other way costs the exe its icon with no
-# error louder than a cargo:warning.
-crates/pnd-app/assets/icon.ico binary
+# Store text with LF in the repository and let checkout decide the working-copy
+# line endings. Without one rule for everyone, the same file keeps flipping
+# wholesale depending on which contributor's platform touched it last.
+* text=auto eol=lf
+
+# These are handed to their consumers verbatim; Git must not touch a byte.
+#
+# The app icon goes straight to rc.exe at build time. Git's binary heuristic
+# happens to guess right on an .ico, but a guess that ever goes the other way
+# costs the exe its icon with no error louder than a cargo:warning. The alert
+# sound, the poe.ninja NDIC dictionary fixtures and any image are the same
+# story: a "corrected" newline in them is simply a broken file.
+*.ico binary
+*.wav binary
+*.ndic binary
+*.png binary

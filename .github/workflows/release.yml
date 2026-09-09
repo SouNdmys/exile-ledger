@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+# The job attaches a file to a GitHub Release, which is a write to the
+# repository's contents.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p pnd-app
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $asset = "exile-ledger-$env:GITHUB_REF_NAME-windows-x64.zip"
+          $files = @(
+            'target\release\exile-ledger.exe',
+            'README.md',
+            'LICENSE.md'
+          )
+          Compress-Archive -Force -Path $files -DestinationPath $asset
+          "ASSET=$asset" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
