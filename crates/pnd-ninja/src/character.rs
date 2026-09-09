@@ -368,8 +368,8 @@ mod character_tests {
     /// 外面套了角色对象最外层的字段。故意留着 `pathOfBuildingExport`、`sockets`
     /// 这些我们不声明的字段:它们就是"未知字段必须被忽略"的守门测试。
     const CHARACTER_JSON: &str = r#"{
-      "account": "heygyus-0416",
-      "name": "ResurrectForbidden",
+      "account": "player-0416",
+      "name": "ExileCharacter",
       "league": "Forbidden Rites",
       "level": 98,
       "class": "Gemling Legionnaire",
@@ -432,8 +432,8 @@ mod character_tests {
     #[test]
     fn parses_the_character_envelope() {
         let character: CharacterDetail = serde_json::from_str(CHARACTER_JSON).unwrap();
-        assert_eq!(character.account, "heygyus-0416");
-        assert_eq!(character.name, "ResurrectForbidden");
+        assert_eq!(character.account, "player-0416");
+        assert_eq!(character.name, "ExileCharacter");
         assert_eq!(character.league, "Forbidden Rites");
         assert_eq!(character.level, 98);
         assert_eq!(character.class, "Gemling Legionnaire");

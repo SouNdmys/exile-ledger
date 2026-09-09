@@ -6,7 +6,7 @@
 //! cargo run -p pnd-runtime --bin ninja_probe -- --search --league forbiddenrites --class "Gemling Legionnaire"
 //! cargo run -p pnd-runtime --bin ninja_probe -- --search --skills "Lightning Arrow" --items "Wake of Destruction"
 //! cargo run -p pnd-runtime --bin ninja_probe -- --economy --league "Forbidden Rites"
-//! cargo run -p pnd-runtime --bin ninja_probe -- --character --account heygyus-0416 --name ResurrectForbidden
+//! cargo run -p pnd-runtime --bin ninja_probe -- --character --account player-0416 --name ExileCharacter
 //! cargo run -p pnd-runtime --bin ninja_probe -- --raw https://poe.ninja/poe1/api/data/index-state
 //! ```
 //!

@@ -771,7 +771,7 @@ mod search_ref_tests {
     fn a_seller_filter_is_added_without_dropping_the_rest_of_the_query() {
         let body: Value = serde_json::from_str(&with_seller_filter(
             r#"{"name":"Choir of the Storm","filters":{"type_filters":{"filters":{"ilvl":{"min":68}}}}}"#,
-            "山箏#5319",
+            "Seller#1234",
         ))
         .unwrap();
         let query = &body["query"];
@@ -782,7 +782,7 @@ mod search_ref_tests {
         );
         assert_eq!(
             query["filters"]["trade_filters"]["filters"]["account"],
-            json!({ "input": "山箏#5319" })
+            json!({ "input": "Seller#1234" })
         );
         assert_eq!(body["sort"], json!({ "price": "asc" }));
     }

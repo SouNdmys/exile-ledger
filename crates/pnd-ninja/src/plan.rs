@@ -574,20 +574,20 @@ mod plan_tests {
     fn dedupe_keeps_the_class_tier_copy() {
         let rows = vec![
             sampled(
-                "ResurrectForbidden",
+                "ExileCharacter",
                 "class=Gemling Legionnaire",
                 PartitionTier::Class,
             ),
             sampled("KingPinUwU", "skills=Spark", PartitionTier::Skill),
             sampled(
-                "ResurrectForbidden",
+                "ExileCharacter",
                 "items=Wake of Destruction",
                 PartitionTier::Unique,
             ),
         ];
         let picked = select_sample(rows, 100);
         assert_eq!(picked.len(), 2);
-        assert_eq!(picked[0].name, "ResurrectForbidden");
+        assert_eq!(picked[0].name, "ExileCharacter");
         assert_eq!(picked[0].tier, PartitionTier::Class);
         assert_eq!(picked[0].from_partition, "class=Gemling Legionnaire");
         assert_eq!(picked[1].name, "KingPinUwU");

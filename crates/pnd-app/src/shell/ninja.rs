@@ -1121,20 +1121,18 @@ mod ninja_tests {
             pnd_ninja::plan::PartitionTier::Whole,
             Vec::new(),
         )];
-        let queued: Vec<pnd_ninja::plan::SampledCharacter> = [
-            ("heygyus-0416", "ResurrectForbidden"),
-            ("dota-1809", "King"),
-        ]
-        .iter()
-        .map(|(account, name)| pnd_ninja::plan::SampledCharacter {
-            account: (*account).to_owned(),
-            name: (*name).to_owned(),
-            class: "Deadeye".to_owned(),
-            level: 98,
-            from_partition: String::new(),
-            tier: pnd_ninja::plan::PartitionTier::Whole,
-        })
-        .collect();
+        let queued: Vec<pnd_ninja::plan::SampledCharacter> =
+            [("player-0416", "ExileCharacter"), ("dota-1809", "King")]
+                .iter()
+                .map(|(account, name)| pnd_ninja::plan::SampledCharacter {
+                    account: (*account).to_owned(),
+                    name: (*name).to_owned(),
+                    class: "Deadeye".to_owned(),
+                    level: 98,
+                    from_partition: String::new(),
+                    tier: pnd_ninja::plan::PartitionTier::Whole,
+                })
+                .collect();
 
         // 昨天抓了一个。
         store
@@ -1146,8 +1144,8 @@ mod ninja_tests {
         store
             .complete_character(
                 league,
-                "heygyus-0416",
-                "ResurrectForbidden",
+                "player-0416",
+                "ExileCharacter",
                 "yesterday",
                 "{}",
                 1_000,

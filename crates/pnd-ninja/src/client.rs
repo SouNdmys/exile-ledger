@@ -114,7 +114,7 @@ pub fn dictionary_url(game: Game, sha1: &str) -> String {
 }
 
 /// 账号名里的 `#` 要换成 `-`。搜索响应给回来的账号名已经是换过的,
-/// 所以这个替换是幂等的:用户手输的 `heygyus#0416` 和列里的 `heygyus-0416`
+/// 所以这个替换是幂等的:用户手输的 `player#0416` 和列里的 `player-0416`
 /// 都能走通同一条路。
 #[must_use]
 pub fn character_url(
@@ -451,12 +451,12 @@ mod client_tests {
             character_url(
                 Game::Poe2,
                 VERSION,
-                "heygyus#0416",
-                "ResurrectForbidden",
+                "player#0416",
+                "ExileCharacter",
                 "forbidden-rites"
             ),
             "https://poe.ninja/poe2/api/builds/1508-20260906-55820/character\
-             ?account=heygyus-0416&name=ResurrectForbidden&overview=forbidden-rites&timeMachine="
+             ?account=player-0416&name=ExileCharacter&overview=forbidden-rites&timeMachine="
         );
     }
 
@@ -467,15 +467,15 @@ mod client_tests {
             character_url(
                 Game::Poe2,
                 VERSION,
-                "heygyus-0416",
-                "ResurrectForbidden",
+                "player-0416",
+                "ExileCharacter",
                 "forbidden-rites"
             ),
             character_url(
                 Game::Poe2,
                 VERSION,
-                "heygyus#0416",
-                "ResurrectForbidden",
+                "player#0416",
+                "ExileCharacter",
                 "forbidden-rites"
             )
         );

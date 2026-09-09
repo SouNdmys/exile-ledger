@@ -152,7 +152,7 @@ fn main() -> ExitCode {
 fn sample_text() -> Result<CardText, pnd_platform_win::CardTextError> {
     CardText::new(
         "Choir of the Storm · 15 divine",
-        "Tongzii#6639 · online · listed 1 hour ago",
+        "Seller#1234 · online · listed 1 hour ago",
         "cap 20 divine · +2 more listings",
         "search 6h 41/299 · fetch 6h 88/499",
         ["Open trade", "Copy whisper", "Hideout", "Dismiss"],

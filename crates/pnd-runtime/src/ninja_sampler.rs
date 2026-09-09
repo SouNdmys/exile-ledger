@@ -1860,7 +1860,7 @@ mod ninja_sampler_tests {
             )
             .expect("enqueue");
         let queued: Vec<SampledCharacter> = [
-            ("heygyus-0416", "ResurrectForbidden"),
+            ("player-0416", "ExileCharacter"),
             ("dota2enjoyer-1809", "KingPinUwU"),
         ]
         .iter()
@@ -2001,7 +2001,7 @@ mod ninja_sampler_tests {
                 Column {
                     id: "name".to_owned(),
                     strings: vec![
-                        "ResurrectForbidden".to_owned(),
+                        "ExileCharacter".to_owned(),
                         "KingPinUwU".to_owned(),
                         // 没名字的行没法去抓详情,该被扔掉。
                         String::new(),
@@ -2011,7 +2011,7 @@ mod ninja_sampler_tests {
                 Column {
                     id: "account".to_owned(),
                     strings: vec![
-                        "heygyus-0416".to_owned(),
+                        "player-0416".to_owned(),
                         "dota2enjoyer-1809".to_owned(),
                         "nobody-0000".to_owned(),
                     ],
@@ -2087,8 +2087,8 @@ mod ninja_sampler_tests {
         assert_eq!(
             rows[0],
             SampledCharacter {
-                account: "heygyus-0416".to_owned(),
-                name: "ResurrectForbidden".to_owned(),
+                account: "player-0416".to_owned(),
+                name: "ExileCharacter".to_owned(),
                 class: "Gemling Legionnaire".to_owned(),
                 level: 98,
                 from_partition: "class=Gemling Legionnaire".to_owned(),

@@ -340,7 +340,7 @@ impl NinjaStore {
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
-        // 第一次启动时 `%LOCALAPPDATA%\PoeNinjaData` 还不存在,SQLite 不会替你建目录。
+        // 第一次启动时 `%LOCALAPPDATA%\ExileLedger` 还不存在,SQLite 不会替你建目录。
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -1470,7 +1470,7 @@ mod ninja_tests {
             ("skills".to_owned(), "Spark".to_owned(), 3_000),
         ];
         let characters = vec![
-            sampled("heygyus-0416", "ResurrectForbidden", PartitionTier::Whole),
+            sampled("player-0416", "ExileCharacter", PartitionTier::Whole),
             sampled("dota2enjoyer-1809", "KingPinUwU", PartitionTier::Whole),
         ];
         store
@@ -1733,7 +1733,7 @@ mod ninja_tests {
             .enqueue_partitions(LEAGUE, VERSION, &partitions())
             .expect("enqueue");
         let characters = vec![
-            sampled("heygyus-0416", "ResurrectForbidden", PartitionTier::Class),
+            sampled("player-0416", "ExileCharacter", PartitionTier::Class),
             sampled("dota2enjoyer-1809", "KingPinUwU", PartitionTier::Skill),
             sampled("elinskiy2002-4257", "sqvoznyak", PartitionTier::Unique),
         ];
@@ -1743,7 +1743,7 @@ mod ninja_tests {
 
         let queue = store.pending_characters(LEAGUE, 2).expect("pending");
         assert_eq!(queue.len(), 2, "limit 说了几个就给几个");
-        assert_eq!(queue[0].name, "ResurrectForbidden");
+        assert_eq!(queue[0].name, "ExileCharacter");
         assert_eq!(queue[0].tier, PartitionTier::Class);
         assert_eq!(queue[0].level, 98);
         assert_eq!(queue[0].from_partition, "class=Gemling Legionnaire");
@@ -1754,10 +1754,10 @@ mod ninja_tests {
         store
             .complete_character(
                 LEAGUE,
-                "heygyus-0416",
-                "ResurrectForbidden",
+                "player-0416",
+                "ExileCharacter",
                 VERSION,
-                r#"{"name":"ResurrectForbidden"}"#,
+                r#"{"name":"ExileCharacter"}"#,
                 6_000,
             )
             .expect("done");
@@ -1772,7 +1772,7 @@ mod ninja_tests {
 
         assert_eq!(
             store.done_character_details(LEAGUE).expect("details"),
-            vec![r#"{"name":"ResurrectForbidden"}"#.to_owned()],
+            vec![r#"{"name":"ExileCharacter"}"#.to_owned()],
             "只有抓到手的才进聚合"
         );
     }
@@ -1785,8 +1785,8 @@ mod ninja_tests {
             .enqueue_partitions(LEAGUE, VERSION, &partitions())
             .expect("enqueue");
         let characters = vec![sampled(
-            "heygyus-0416",
-            "ResurrectForbidden",
+            "player-0416",
+            "ExileCharacter",
             PartitionTier::Class,
         )];
         store
@@ -1795,8 +1795,8 @@ mod ninja_tests {
         store
             .complete_character(
                 LEAGUE,
-                "heygyus-0416",
-                "ResurrectForbidden",
+                "player-0416",
+                "ExileCharacter",
                 VERSION,
                 "{}",
                 6_000,
@@ -1838,7 +1838,7 @@ mod ninja_tests {
             .enqueue_partitions(LEAGUE, "yesterday", &partitions())
             .expect("enqueue");
         let yesterday = vec![
-            sampled("heygyus-0416", "ResurrectForbidden", PartitionTier::Whole),
+            sampled("player-0416", "ExileCharacter", PartitionTier::Whole),
             sampled("dota2enjoyer-1809", "KingPinUwU", PartitionTier::Whole),
         ];
         store
@@ -1847,10 +1847,10 @@ mod ninja_tests {
         store
             .complete_character(
                 LEAGUE,
-                "heygyus-0416",
-                "ResurrectForbidden",
+                "player-0416",
+                "ExileCharacter",
                 "yesterday",
-                r#"{"name":"ResurrectForbidden"}"#,
+                r#"{"name":"ExileCharacter"}"#,
                 1_000,
             )
             .expect("done");
@@ -1884,7 +1884,7 @@ mod ninja_tests {
         assert_eq!(store.character_counts(LEAGUE).expect("counts"), (2, 1, 0));
         assert_eq!(
             store.done_character_details(LEAGUE).expect("details"),
-            vec![r#"{"name":"ResurrectForbidden"}"#.to_owned()]
+            vec![r#"{"name":"ExileCharacter"}"#.to_owned()]
         );
 
         // 今天再抓一个,昨天那个还在。

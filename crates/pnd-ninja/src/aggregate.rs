@@ -401,8 +401,8 @@ mod aggregate_tests {
     fn alpha() -> CharacterDetail {
         serde_json::from_str(
             r#"{
-              "account": "heygyus-0416",
-              "name": "ResurrectForbidden",
+              "account": "player-0416",
+              "name": "ExileCharacter",
               "items": [
                 {"itemSlot": 8, "itemData": {"inventoryId": "Ring", "rarity": "Rare",
                   "mods": {"explicit": [
