@@ -290,6 +290,70 @@ pub fn with_stat_filter(query_json: &str, stat_id: &str) -> String {
     query.to_string()
 }
 
+/// 一组词缀条件的口径:那一组里的每一条都要有,还是凑够几条就行。
+///
+/// 交易站的 `stats` 是一个数组,每一项是一"组",而组自己带一个 `type`:
+/// `and` 是全都要,`count` 配 `{"value":{"min":N}}` 是"这组里至少中 N 条"。
+/// 碑牌最多只带两条后缀,而值钱的后缀有四五种 —— 那种货天生就是
+/// "这四条里凑够两条",不是"这四条都要"(那样一件都搜不出来)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatMatch {
+    #[default]
+    All,
+    AtLeast(u32),
+}
+
+/// 在查询上**新加一组**词缀条件,原有的组一个字不动。
+///
+/// 为什么是新加一组而不是往第一组里塞([`with_stat_filter`] 做的那样):
+/// 观察自己那条查询里的那一组是用户在网页上筛好的("这是什么货"),而这里
+/// 加的是"我这次要它带哪几条词缀" —— 塞进同一组就会和人家的条件搅在一起,
+/// 而 `count` 那种口径更是只对整组成立。
+///
+/// 组内去重:交易站把两格一样的筛选当成"这条词缀要有两次",于是搜出来一件
+/// 都没有。要求的条数两头夹回 `1..=id 个数` —— 比篮子还多的条数永远凑不齐,
+/// 而 0 条等于没筛。
+///
+/// 一条 id 都没有时一组都不加:空的 `count` 组一件都搜不出来,而空的 `and`
+/// 组是句废话,两种都不如原样把查询交回去。
+pub fn with_stat_group(query_json: &str, stat_ids: &[String], matching: StatMatch) -> String {
+    let mut query = query_part(query_json);
+    if !query.is_object() {
+        query = json!({});
+    }
+    // 保序去重:篮子里的先后顺序就是用户加进去的顺序,读起来比排序过的顺手。
+    let mut ids: Vec<&str> = Vec::new();
+    for id in stat_ids {
+        if !ids.contains(&id.as_str()) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return query.to_string();
+    }
+    let filters: Vec<Value> = ids.iter().map(|id| json!({ "id": id })).collect();
+    let group = match matching {
+        StatMatch::All => json!({ "type": "and", "filters": filters }),
+        StatMatch::AtLeast(min) => {
+            let count = u32::try_from(ids.len()).unwrap_or(u32::MAX);
+            json!({ "type": "count", "value": { "min": min.clamp(1, count) }, "filters": filters })
+        }
+    };
+    let stats = query
+        .as_object_mut()
+        .expect("just made it an object")
+        .entry("stats".to_string())
+        .or_insert_with(|| json!([]));
+    if !stats.is_array() {
+        *stats = json!([]);
+    }
+    stats
+        .as_array_mut()
+        .expect("just made it an array")
+        .push(group);
+    query.to_string()
+}
+
 /// 搜索自己带的名字,拿来当备注名的默认值。
 ///
 /// 为什么不直接用搜索 id 的前缀:`H4sIAAAAA` 对人来说是一串噪音,而查询里
@@ -855,6 +919,118 @@ mod search_ref_tests {
         .unwrap();
         assert_eq!(unwrapped["name"], "Mageblood");
         assert!(unwrapped.get("sort").is_none(), "{unwrapped}");
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    /// 一篮子词缀做成一条搜索,"全都要"就是一组 `and`。
+    ///
+    /// 新的一组追加在后面,而不是塞进第一组:第一组是观察自己那条查询带的
+    /// (用户在网页上筛好的"这是什么货"),两件事不能搅在一起。
+    #[test]
+    fn a_basket_of_ids_becomes_one_and_group() {
+        let query: Value = serde_json::from_str(&with_stat_group(
+            FIXTURE_QUERY,
+            &ids(&["explicit.a", "explicit.b"]),
+            StatMatch::All,
+        ))
+        .unwrap();
+        assert_eq!(query["name"], "Choir of the Storm", "原来的条件一个不能掉");
+        assert_eq!(query["status"]["option"], "online");
+        assert_eq!(query["stats"][0], json!({ "type": "and", "filters": [] }));
+        assert_eq!(
+            query["stats"][1],
+            json!({
+                "type": "and",
+                "filters": [{ "id": "explicit.a" }, { "id": "explicit.b" }]
+            })
+        );
+        // 出来的是查询本身(不是请求体),因为它下一步要被压成搜索 id。
+        assert!(query.get("query").is_none(), "{query}");
+    }
+
+    /// "四条里凑够两条"是交易站的 `count` 组。碑牌最多只带两条后缀,而
+    /// 认下的好后缀有四条 —— 写成 `and` 一件都搜不出来。
+    #[test]
+    fn at_least_n_becomes_a_count_group() {
+        let query: Value = serde_json::from_str(&with_stat_group(
+            FIXTURE_QUERY,
+            &ids(&["explicit.a", "explicit.b", "explicit.c", "explicit.d"]),
+            StatMatch::AtLeast(2),
+        ))
+        .unwrap();
+        assert_eq!(query["stats"][1]["type"], "count");
+        assert_eq!(query["stats"][1]["value"], json!({ "min": 2 }));
+        assert_eq!(
+            query["stats"][1]["filters"],
+            json!([
+                { "id": "explicit.a" },
+                { "id": "explicit.b" },
+                { "id": "explicit.c" },
+                { "id": "explicit.d" }
+            ])
+        );
+    }
+
+    /// 要求的条数比篮子还多就永远凑不齐,0 条又等于没筛 —— 两头夹回来。
+    /// 同一个 id 只留一格:重复的筛选会被当成"这条词缀要有两次"。
+    #[test]
+    fn the_minimum_is_clamped_and_the_ids_are_deduplicated() {
+        let two = ids(&["explicit.a", "explicit.b"]);
+        let too_many: Value =
+            serde_json::from_str(&with_stat_group(FIXTURE_QUERY, &two, StatMatch::AtLeast(9)))
+                .unwrap();
+        assert_eq!(too_many["stats"][1]["value"], json!({ "min": 2 }));
+        let none_at_all: Value =
+            serde_json::from_str(&with_stat_group(FIXTURE_QUERY, &two, StatMatch::AtLeast(0)))
+                .unwrap();
+        assert_eq!(none_at_all["stats"][1]["value"], json!({ "min": 1 }));
+
+        let duplicated = ids(&["explicit.a", "explicit.a", "explicit.b"]);
+        let deduped: Value = serde_json::from_str(&with_stat_group(
+            FIXTURE_QUERY,
+            &duplicated,
+            StatMatch::AtLeast(3),
+        ))
+        .unwrap();
+        assert_eq!(
+            deduped["stats"][1]["filters"],
+            json!([{ "id": "explicit.a" }, { "id": "explicit.b" }])
+        );
+        assert_eq!(
+            deduped["stats"][1]["value"],
+            json!({ "min": 2 }),
+            "去重之后只剩两条,要求的条数也得跟着降"
+        );
+
+        // 一条 id 都没有就一组都不加:空的 count 组一件都搜不出来。
+        let empty: Value =
+            serde_json::from_str(&with_stat_group(FIXTURE_QUERY, &[], StatMatch::AtLeast(2)))
+                .unwrap();
+        assert_eq!(empty["stats"].as_array().unwrap().len(), 1);
+    }
+
+    /// 查询里本来就有的那一组一个字不动:那是"这是什么货",而新的一组是
+    /// "我要它带哪几条词缀"。
+    #[test]
+    fn an_existing_stat_group_is_left_alone() {
+        let existing = r#"{"type":"Precursor Tablet","stats":[{"type":"and","filters":[{"id":"explicit.keep"}]}]}"#;
+        let json = with_stat_group(existing, &ids(&["explicit.a"]), StatMatch::All);
+        let query: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(query["type"], "Precursor Tablet");
+        assert_eq!(query["stats"].as_array().unwrap().len(), 2, "{query}");
+        assert_eq!(
+            query["stats"][0]["filters"],
+            json!([{ "id": "explicit.keep" }])
+        );
+        assert_eq!(
+            query["stats"][1]["filters"],
+            json!([{ "id": "explicit.a" }])
+        );
+        // 下一步就是压成搜索 id,压回来得还是同一段。
+        assert_eq!(decode_search_id(&encode_search_id(&json)).unwrap(), json);
     }
 
     #[test]

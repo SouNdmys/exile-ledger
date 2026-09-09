@@ -31,12 +31,12 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 use gpui_component::switch::Switch;
-use gpui_component::{Selectable as _, Sizable as _, Size, StyledExt as _};
+use gpui_component::{Disableable as _, Selectable as _, Sizable as _, Size, StyledExt as _};
 
 use pnd_domain::{
-    CurrencyRates, Game, GoneClass, ObservationId, Price, PriceBucket, RateSource, RateSources,
-    SUB_DIVINE_BUCKET_MILLI, decode_search_id, default_label_for, encode_search_id,
-    parse_search_reference, with_stat_filter,
+    Currency, CurrencyRates, Game, GoneClass, ObservationId, Price, PriceBucket, RateSource,
+    RateSources, SUB_DIVINE_BUCKET_MILLI, StatMatch, decode_search_id, default_label_for,
+    encode_search_id, parse_search_reference, with_stat_group,
 };
 use pnd_runtime::{LiveRunState, ObservationStatus, RuntimeCommand, now_secs};
 use pnd_settings::{AppSettings, ObservationEntry};
@@ -71,6 +71,9 @@ const STREAM_MOD_LINES: usize = 4;
 /// 收藏过的词缀前面挂的那颗星。不走 i18n:它不是一句话,两种语言下都是
 /// 同一颗星。
 const FAVOURITE_MARK: &str = "★ ";
+
+/// 筛选篮里"拿掉这一条"的那个叉。同上,不走 i18n:它不是一句话。
+const BASKET_REMOVE_MARK: &str = "×";
 
 /// 一键蹲价拼出来的备注名里,词缀最多留几个字。
 ///
@@ -498,6 +501,192 @@ impl FavouriteMods {
     }
 }
 
+/// 筛选篮里的一条词缀。
+///
+/// 从 [`ModOutcome`] 上摘下来的一份快照,而不是借着那一行:篮子要跨好几次
+/// 重排、重读活着,而 `self.observe.mods` 每读一次库就整份换掉。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BasketItem {
+    pub mod_kind: String,
+    pub template: String,
+    /// 交易站认的那个词缀 id。`None` = 存下来的挂单原文里没找着
+    /// ([`pnd_storage::WatchStore::stat_id_for_template`]),这一条筛不了,
+    /// 但仍旧留在篮子里 —— 悄悄丢掉的话,用户看到的是"我加了它却没进去"。
+    pub stat_id: Option<String>,
+    /// 卖掉的那些的中位价,连着它是用哪种货币算的。
+    pub sold_median: Option<(i64, Currency)>,
+    /// 还挂着的那些的中位价,同上。
+    pub asking_median: Option<(i64, Currency)>,
+}
+
+impl BasketItem {
+    /// 词缀表上的一行 + 当场查出来的 id。
+    #[must_use]
+    pub fn from_outcome(outcome: &ModOutcome, stat_id: Option<String>) -> BasketItem {
+        let currency = Currency::parse(&outcome.currency);
+        BasketItem {
+            mod_kind: outcome.mod_kind.clone(),
+            template: outcome.template.clone(),
+            stat_id,
+            sold_median: outcome
+                .median_gone_price_milli
+                .map(|milli| (milli, currency.clone())),
+            asking_median: outcome
+                .median_active_price_milli
+                .map(|milli| (milli, currency)),
+        }
+    }
+}
+
+/// 攒着"这条蹲价要哪几条词缀"的篮子。
+///
+/// 为什么要它:碑牌最多只带两条后缀,而值钱的后缀有四条 —— 一次只筛一条
+/// 词缀会漏掉另外三条里出的好货,四条全要又一件都搜不出来。这个篮子就是
+/// 让那句"这四条里凑够两条"说得出口。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModBasket {
+    pub items: Vec<BasketItem>,
+    pub matching: StatMatch,
+}
+
+impl ModBasket {
+    /// 加一条。已经在篮子里就什么都不做,返回 `false`。
+    ///
+    /// 加完把口径拉回默认(见 [`ModBasket::default_matching`]):四条里要三条,
+    /// 加进第五条之后"三条"这个数多半也该跟着变。真要别的数,那对 −/+ 随时能改。
+    pub fn add(&mut self, item: BasketItem) -> bool {
+        if self.contains(&item.mod_kind, &item.template) {
+            return false;
+        }
+        self.items.push(item);
+        self.matching = self.default_matching();
+        true
+    }
+
+    /// 拿掉第几条。行号越界就什么都不做 —— 手上这份行号是画面上那一份,
+    /// 它可能比篮子旧一帧。
+    pub fn remove(&mut self, index: usize) {
+        if index >= self.items.len() {
+            return;
+        }
+        self.items.remove(index);
+        self.matching = self.default_matching();
+    }
+
+    pub fn clear(&mut self) {
+        *self = ModBasket::default();
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    #[must_use]
+    pub fn contains(&self, mod_kind: &str, template: &str) -> bool {
+        self.items
+            .iter()
+            .any(|item| item.mod_kind == mod_kind && item.template == template)
+    }
+
+    /// 篮子这么大时,默认要求凑够几条。
+    ///
+    /// **少一条**:装进篮子的都是"我认下的好词缀",而一件货身上很难全中 ——
+    /// 差一条就搜不出来的筛选,等于把篮子的意义抹掉。只有一条时"至少一条"
+    /// 和"全都要"是同一件事,写成 `All` 读起来更直白。
+    #[must_use]
+    pub fn default_matching(&self) -> StatMatch {
+        let count = self.count();
+        if count >= 2 {
+            return StatMatch::AtLeast(count - 1);
+        }
+        StatMatch::All
+    }
+
+    /// 那对 −/+ 现在该显示几。当前口径是"全都要"时给出默认的那个数,
+    /// 好让用户按下"至少 N 条"就直接落在一个像样的数上。
+    #[must_use]
+    pub fn at_least_n(&self) -> u32 {
+        match (self.matching, self.default_matching()) {
+            (StatMatch::AtLeast(n), _) | (StatMatch::All, StatMatch::AtLeast(n)) => n,
+            (StatMatch::All, StatMatch::All) => 1,
+        }
+    }
+
+    /// 换成"至少 N 条",N 夹在 `1..=篮子条数` 之间。
+    pub fn set_at_least(&mut self, n: u32) {
+        let count = self.count();
+        if count == 0 {
+            return;
+        }
+        self.matching = StatMatch::AtLeast(n.clamp(1, count));
+    }
+
+    /// 篮子里有几条,数成 `u32` —— 上面那几个数都要和 [`StatMatch::AtLeast`]
+    /// 里的那个数比大小。
+    fn count(&self) -> u32 {
+        u32::try_from(self.items.len()).unwrap_or(u32::MAX)
+    }
+
+    /// 蹲价上限该填多少。
+    ///
+    /// 取篮子里**最低**的那个成交价中位:篮子是"这几条随便中几条都算好货",
+    /// 而上限只有一个 —— 挑最低那条,贵的那几条自然也在上限之内。一条成交价
+    /// 都没有才退到在售价(在售价是"卖不掉的人开的价")。
+    ///
+    /// 币种跟着被挑中的那一条走。同一条观察里偶尔混着两种货币,这时候两个数
+    /// 本来就不可比,而挑一个总比留空强 —— 用户在表单里看得见、改得动。
+    #[must_use]
+    pub fn min_price_for_cap(&self) -> Option<(i64, Currency)> {
+        // 只要**有一条**卖掉过,就整篮子按成交价来:哪怕它比别人的在售价还高,
+        // 那也是真有人付过的价,而在售价只是开价。
+        self.lowest(|item| item.sold_median.as_ref())
+            .or_else(|| self.lowest(|item| item.asking_median.as_ref()))
+    }
+
+    /// 挑出最低的那个价。
+    fn lowest<'a>(
+        &'a self,
+        pick: impl Fn(&'a BasketItem) -> Option<&'a (i64, Currency)>,
+    ) -> Option<(i64, Currency)> {
+        self.items
+            .iter()
+            .filter_map(pick)
+            .min_by_key(|(milli, _)| *milli)
+            .cloned()
+    }
+
+    /// 真能拿去筛的那几个 id。查不到 id 的那几条留在篮子里给人看,
+    /// 但拼查询的时候一定要跳过 —— 拼进去就是一格空筛选。
+    #[must_use]
+    pub fn stat_ids(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .filter_map(|item| item.stat_id.clone())
+            .collect()
+    }
+}
+
+/// 换了一条观察就把篮子倒空。
+///
+/// 词缀 id 是从**那一条**观察的挂单原文里翻出来的,换一条之后同一句词缀未必
+/// 还查得到 id;何况"上一条搜索攒的篮子"跟着过来,做出来的蹲价就是一条
+/// 张冠李戴的搜索。
+pub fn retarget_basket(
+    basket: &mut ModBasket,
+    from: Option<&ObservationId>,
+    to: Option<&ObservationId>,
+) {
+    if from != to {
+        basket.clear();
+    }
+}
+
 /// 蹲价表单该被填成什么样。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WatchDraft {
@@ -508,34 +697,44 @@ pub struct WatchDraft {
     pub currency: String,
 }
 
-/// 词缀表上选中的那一行 → 一份蹲价草稿。
+/// 筛选篮 → 一份蹲价草稿。
 ///
-/// 搜索是**观察自己那条查询再加一格词缀筛选**,不是从零拼一条:观察那条
+/// 搜索是**观察自己那条查询再加一组词缀筛选**,不是从零拼一条:观察那条
 /// 查询里还写着底子、物品等级、在线与否这些条件,丢掉它们就变成"全服所有
-/// 带这条词缀的东西",一天能响几百次。
+/// 带这几条词缀的东西",一天能响几百次。
 ///
-/// 上限取**成交价**中位,没有才退到在售价中位:在售价是"卖不掉的人开的价",
-/// 拿它当蹲价上限等于永远在等一个没人接的价。两个都没有就留空 —— 凭空猜一个
-/// 数出来,用户按下"新增"就是照着那个数在蹲。
+/// 备注名写头一条词缀,后面还有几条就缀一个 `+K` —— 蹲价表那一列只有
+/// 200 像素,四条词缀的全名怎么排都放不下,而"是哪一篮"靠头一条加个数
+/// 已经认得出来。
 #[must_use]
 pub fn watch_draft(
     observation: &ObservationEntry,
     query_json: &str,
-    outcome: &ModOutcome,
-    stat_id: &str,
+    basket: &ModBasket,
 ) -> WatchDraft {
+    let cap = basket.min_price_for_cap();
     WatchDraft {
-        search_id: encode_search_id(&with_stat_filter(query_json, stat_id)),
+        search_id: encode_search_id(&with_stat_group(
+            query_json,
+            &basket.stat_ids(),
+            basket.matching,
+        )),
         league: observation.league.clone(),
-        label: format!(
-            "{} · {}",
-            observation.label,
-            short_template(&outcome.template)
-        ),
-        cap_milli: outcome
-            .median_gone_price_milli
-            .or(outcome.median_active_price_milli),
-        currency: outcome.currency.clone(),
+        label: basket_label(&observation.label, basket),
+        cap_milli: cap.as_ref().map(|(milli, _)| *milli),
+        currency: cap.map_or_else(String::new, |(_, currency)| currency.code().to_owned()),
+    }
+}
+
+/// "观察名 · 头一条词缀 +还有几条"。
+fn basket_label(observation_label: &str, basket: &ModBasket) -> String {
+    let Some(first) = basket.items.first() else {
+        return observation_label.to_owned();
+    };
+    let head = format!("{observation_label} · {}", short_template(&first.template));
+    match basket.items.len() - 1 {
+        0 => head,
+        more => format!("{head} +{more}"),
     }
 }
 
@@ -1028,13 +1227,17 @@ impl AppShell {
                             .flex_col()
                             .gap(px(6.))
                             .child(self.observations_aggregate_panel(cx))
-                            .child(self.observations_mod_actions(cx)),
+                            .child(self.observations_mod_actions(cx))
+                            .child(self.observations_basket_panel(cx)),
                     )
                     .child(self.observations_stream_panel(cx)),
             )
     }
 
-    /// 词缀表里选中一行之后能对它做的两件事:收藏,或者把它做成一条蹲价。
+    /// 词缀表里选中一行之后能对它做的两件事:收藏,或者把它加进筛选篮。
+    ///
+    /// 「做成蹲价」不在这儿:它作用的是**整个篮子**,不是选中这一行 ——
+    /// 摆在这排按钮里会读成"把选中这条做成蹲价"。
     ///
     /// 为什么不做成表格里的按钮:上游的表格不支持在格子里放控件(同蹲价页
     /// 那排按钮的理由)。
@@ -1084,22 +1287,135 @@ impl AppShell {
                         this.toggle_selected_mod_favourite(cx);
                     })),
             )
-            .children(
-                make_watch_offered(
-                    self.observe
-                        .selected
-                        .as_ref()
-                        .and_then(|id| self.settings.observation(id)),
-                )
-                .then(|| {
-                    Button::new("obs-make-watch")
-                        .label(text.obs_make_watch)
-                        .with_size(Size::Small)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.make_watch_from_selected_mod(window, cx);
-                        }))
-                }),
+            .child(
+                Button::new("obs-basket-add")
+                    .label(text.obs_basket_add)
+                    .with_size(Size::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.add_selected_mod_to_basket(cx);
+                    })),
             )
+    }
+
+    /// 筛选篮:这一条蹲价要哪几条词缀,以及要中几条。
+    ///
+    /// 空着也照常画出来:那句"先把词缀加入筛选篮"就是「做成蹲价」按不动的
+    /// 理由 —— 一个灰着的按钮不说明自己为什么灰,比按钮不在还费解。
+    fn observations_basket_panel(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        let text = self.text();
+        let empty = self.obs_basket.is_empty();
+        let all = self.obs_basket.matching == StatMatch::All;
+        let at_least = self.obs_basket.at_least_n();
+        let offered = make_watch_offered(
+            self.observe
+                .selected
+                .as_ref()
+                .and_then(|id| self.settings.observation(id)),
+        );
+        let lines: Vec<gpui::Div> = self
+            .obs_basket
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| basket_row(index, item, text, cx))
+            .collect();
+        panel()
+            .flex_none()
+            .px(px(10.))
+            .py(px(6.))
+            .gap(px(3.))
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .text_size(fs(FS_11_5))
+                            .text_color(muted())
+                            .child(text.obs_basket_title),
+                    )
+                    .child(
+                        Button::new("obs-basket-add-favourites")
+                            .ghost()
+                            .xsmall()
+                            .label(text.obs_basket_add_favourites)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.add_favourites_to_basket(cx);
+                            })),
+                    )
+                    .child(div().flex_grow())
+                    // 两档口径。碑牌最多只带两条后缀,所以"四条里凑够两条"
+                    // 才是常态,而"全都要"是一件都搜不出来的那一档。
+                    .child(
+                        Button::new("obs-basket-all")
+                            .ghost()
+                            .xsmall()
+                            .selected(all)
+                            .label(text.obs_basket_all)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.obs_basket.matching = StatMatch::All;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("obs-basket-at-least")
+                            .ghost()
+                            .xsmall()
+                            .selected(!all)
+                            .label(SharedString::from(i18n::fill(
+                                text.obs_basket_at_least,
+                                &[&at_least.to_string()],
+                            )))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.obs_basket.set_at_least(at_least);
+                                cx.notify();
+                            })),
+                    )
+                    // 那对 −/+ 只在"至少 N 条"那一档出现:另一档没有 N 可调。
+                    .children((!all).then(|| {
+                        Button::new("obs-basket-fewer")
+                            .ghost()
+                            .xsmall()
+                            .label("−")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.obs_basket.set_at_least(at_least.saturating_sub(1));
+                                cx.notify();
+                            }))
+                    }))
+                    .children((!all).then(|| {
+                        Button::new("obs-basket-more")
+                            .ghost()
+                            .xsmall()
+                            .label("+")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.obs_basket.set_at_least(at_least + 1);
+                                cx.notify();
+                            }))
+                    }))
+                    .child(
+                        Button::new("obs-basket-clear")
+                            .ghost()
+                            .xsmall()
+                            .disabled(empty)
+                            .label(text.obs_basket_clear)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.obs_basket.clear();
+                                cx.notify();
+                            })),
+                    )
+                    .children(offered.then(|| {
+                        Button::new("obs-make-watch")
+                            .label(text.obs_make_watch)
+                            .with_size(Size::Small)
+                            .disabled(empty)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.make_watch_from_basket(window, cx);
+                            }))
+                    })),
+            )
+            .children(empty.then(|| hint(text.obs_basket_empty)))
+            .children(lines)
     }
 
     /// 表单:新增一条观察,或者改选中的那一条。两种模式共用同一组框,
@@ -1548,7 +1864,7 @@ impl AppShell {
         self.obs_remove_armed = false;
         self.observations_form.load(&entry, window, cx);
         if self.observe.selected.as_ref() != Some(&entry.id) {
-            self.observe.selected = Some(entry.id);
+            self.select_observation(Some(entry.id));
             self.reload_observation();
         }
     }
@@ -1584,7 +1900,7 @@ impl AppShell {
             entry.label, entry.league
         ));
         // 加完就把下面两块切到它:新加的那条是用户此刻正在看的东西。
-        self.observe.selected = Some(entry.id.clone());
+        self.select_observation(Some(entry.id.clone()));
         self.settings.observations.push(entry);
 
         self.obs_error.clear();
@@ -1739,7 +2055,7 @@ impl AppShell {
             self.push_log(format!("could not delete the observation data: {error}"));
         }
         if self.observe.selected.as_ref() == Some(&removed.id) {
-            self.observe.selected = None;
+            self.select_observation(None);
         }
         if self.save_and_apply() {
             self.set_notice(text.obs_removed.to_owned());
@@ -1843,31 +2159,92 @@ impl AppShell {
         });
     }
 
-    /// 一键蹲价:把选中那条词缀做成一份蹲价草稿,翻到蹲价页填进表单。
+    /// 把选中那条词缀加进筛选篮。
     ///
-    /// **只填,不加**:按下"新增"的永远是用户自己 —— 一条自动加进去的搜索
-    /// 会立刻开始花限速预算,而它是不是用户要的还没人确认过。
-    fn make_watch_from_selected_mod(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 筛选 id 在**加进去的这一刻**就查出来存下:那一步要翻几十条挂单原文,
+    /// 而按下「做成蹲价」时篮子里可能已经有四条 —— 那时候再一条条翻,
+    /// 就是让人对着一个没反应的按钮等。
+    fn add_selected_mod_to_basket(&mut self, cx: &mut Context<Self>) {
         let text = self.text();
         let (Some(row), Some(obs_id)) = (self.selected_mod(cx), self.observe.selected.clone())
         else {
             self.select_an_observation_first(cx);
             return;
         };
+        let stat_id = self.stat_id_for(&obs_id, &row);
+        // 查不到 id 的那一条也加进去,但要当场说清它筛不了 —— 悄悄丢掉的话,
+        // 用户看到的是"我按了却什么都没发生"。
+        let notice = if stat_id.is_some() {
+            i18n::fill(text.obs_basket_added, &[&row.template])
+        } else {
+            text.obs_no_stat_id.to_owned()
+        };
+        if self.obs_basket.add(BasketItem::from_outcome(&row, stat_id)) {
+            self.set_notice(notice);
+        }
+        cx.notify();
+    }
+
+    /// 把这个联赛收藏过、而且这份聚合里有的词缀全加进篮子。
+    ///
+    /// 这正是篮子最常见的用法:认下的那几条好后缀本来就是一起挑的,
+    /// 一条条点四遍纯属重复劳动。
+    fn add_favourites_to_basket(&mut self, cx: &mut Context<Self>) {
+        let text = self.text();
+        let Some(obs_id) = self.observe.selected.clone() else {
+            self.select_an_observation_first(cx);
+            return;
+        };
+        let favourites = self.observation_favourites();
+        // 用表上那套筛选("只看收藏",样本门槛放到最低):收藏了却没在这份
+        // 聚合里出现过的词缀查不到 id,加进来也是一条筛不了的空条目。
+        let rows: Vec<ModOutcome> = mod_filtered(&self.observe.mods, "", 1, &favourites, true)
+            .into_iter()
+            .cloned()
+            .collect();
+        let mut added = 0;
+        for row in rows {
+            let stat_id = self.stat_id_for(&obs_id, &row);
+            if self.obs_basket.add(BasketItem::from_outcome(&row, stat_id)) {
+                added += 1;
+            }
+        }
+        self.set_notice(i18n::fill(
+            text.obs_basket_favourites_added,
+            &[&added.to_string()],
+        ));
+        cx.notify();
+    }
+
+    /// 词缀筛选认的是 stat id,而库里只有模板 —— id 得回物品原文里翻。
+    fn stat_id_for(&self, obs_id: &ObservationId, row: &ModOutcome) -> Option<String> {
+        self.alerts_store.as_ref().and_then(|store| {
+            store
+                .stat_id_for_template(obs_id, &row.mod_kind, &row.template)
+                .unwrap_or_default()
+        })
+    }
+
+    /// 一键蹲价:把整篮子词缀做成一份蹲价草稿,翻到蹲价页填进表单。
+    ///
+    /// **只填,不加**:按下"新增"的永远是用户自己 —— 一条自动加进去的搜索
+    /// 会立刻开始花限速预算,而它是不是用户要的还没人确认过。
+    fn make_watch_from_basket(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.text();
+        let Some(obs_id) = self.observe.selected.clone() else {
+            self.select_an_observation_first(cx);
+            return;
+        };
         let Some(entry) = self.settings.observation(&obs_id).cloned() else {
             return;
         };
-        // 词缀筛选认的是 stat id,而库里只有模板 —— id 得回物品原文里翻。
-        let stat_id = self.alerts_store.as_ref().and_then(|store| {
-            store
-                .stat_id_for_template(&obs_id, &row.mod_kind, &row.template)
-                .unwrap_or_default()
-        });
-        let Some(stat_id) = stat_id else {
-            self.set_notice(text.obs_no_stat_id.to_owned());
+        // 篮子里一条带 id 的都没有:做出来的会是一条和观察一模一样的搜索,
+        // 那不是用户按这个按钮想要的东西。
+        if self.obs_basket.stat_ids().is_empty() {
+            self.set_notice(text.obs_basket_no_stat_ids.to_owned());
             cx.notify();
             return;
-        };
+        }
         // 查询原文优先用库里存的那份(actor 每轮都写);它还没写过(刚加的
         // 观察)就当场从搜索 id 解一份出来 —— 两条路解出来的是同一段。
         let query_json = self
@@ -1882,8 +2259,12 @@ impl AppShell {
             return;
         };
 
-        let draft = watch_draft(&entry, &query_json, &row, &stat_id);
-        self.push_log(format!("watch draft from modifier: {}", draft.label));
+        let draft = watch_draft(&entry, &query_json, &self.obs_basket);
+        self.push_log(format!(
+            "watch draft from {} modifiers: {}",
+            self.obs_basket.len(),
+            draft.label
+        ));
         self.prefill_add_form(draft, window, cx);
         self.show_page(crate::shell::Page::Watches);
         self.set_notice(text.watches_prefilled.to_owned());
@@ -1898,6 +2279,17 @@ impl AppShell {
 
     // ---- 读库 --------------------------------------------------------
 
+    /// 改选中的是哪一条观察。**换观察只走这一个门**:筛选篮跟着选中那条走,
+    /// 而"谁把 `observe.selected` 换掉了"散在四处的话,总有一处会忘了倒篮子。
+    pub(crate) fn select_observation(&mut self, id: Option<ObservationId>) {
+        retarget_basket(
+            &mut self.obs_basket,
+            self.observe.selected.as_ref(),
+            id.as_ref(),
+        );
+        self.observe.selected = id;
+    }
+
     /// 把选中那条观察的账、聚合表和两栏挂单流整份读进内存。
     ///
     /// 一次读齐,理由同 ninja 那两页:换筛选器、换栏、换语言都不该再打一次库。
@@ -1911,11 +2303,12 @@ impl AppShell {
             .as_ref()
             .is_some_and(|id| self.settings.observation(id).is_some());
         if !still_there {
-            self.observe.selected = self
+            let first = self
                 .settings
                 .observations
                 .first()
                 .map(|entry| entry.id.clone());
+            self.select_observation(first);
         }
         // 先清空:读不动的时候屏幕上该是"什么都没有",而不是上一条观察的数据。
         let selected = self.observe.selected.clone();
@@ -1978,6 +2371,48 @@ impl AppShell {
     }
 }
 
+/// 筛选篮里的一条:词缀原文、查不到 id 时的那个标记,以及拿掉它的那个叉。
+fn basket_row(
+    index: usize,
+    item: &BasketItem,
+    text: &'static Text,
+    cx: &mut Context<AppShell>,
+) -> gpui::Div {
+    div()
+        .h_flex()
+        .items_center()
+        .gap(px(6.))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_size(fs(FS_11))
+                .text_color(c(TEXT_SECONDARY))
+                .child(SharedString::from(item.template.clone())),
+        )
+        // 查不到筛选 id 的那一条照样留在篮子里(悄悄丢掉会让人以为按钮没反应),
+        // 但它拼不进查询 —— 所以得在脸上写着。
+        .children(item.stat_id.is_none().then(|| {
+            div()
+                .flex_none()
+                .text_size(fs(FS_10_5))
+                .text_color(c(DANGER_TEXT))
+                .child(text.obs_basket_no_id)
+        }))
+        .child(
+            Button::new(("obs-basket-remove", index))
+                .ghost()
+                .xsmall()
+                .label(BASKET_REMOVE_MARK)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.obs_basket.remove(index);
+                    cx.notify();
+                })),
+        )
+}
+
 /// 挂单流里的一条。
 fn stream_row(
     entry: &StreamEntry,
@@ -2033,7 +2468,6 @@ fn input_text(input: &Entity<InputState>, cx: &App) -> String {
 #[cfg(test)]
 mod observations_page_tests {
     use gpui_component::select::SelectItem as _;
-    use pnd_domain::Currency;
     use pnd_storage::{ObservedListingRow, ObservedStatus, PriceOutcome};
 
     use super::*;
@@ -2566,56 +3000,230 @@ mod observations_page_tests {
         );
     }
 
-    /// 一键蹲价:选中的词缀 + 这条观察自己的查询 = 一条能直接粘回交易站的搜索。
-    ///
-    /// 上限取**成交价**中位,不取在售价:在售价是"卖不掉的人开的价",拿它当
-    /// 蹲价上限等于永远在等一个没人接的价。
+    /// 一条词缀 + 它的 id → 篮子里的一条。
+    fn item(template: &str, stat_id: Option<&str>) -> BasketItem {
+        BasketItem::from_outcome(
+            &outcome(template, "explicit", 30, 22, 20),
+            stat_id.map(str::to_owned),
+        )
+    }
+
+    /// 装满一篮子,顺序就是加进去的顺序。
+    fn basket(templates: &[(&str, Option<&str>)]) -> ModBasket {
+        let mut basket = ModBasket::default();
+        for (template, stat_id) in templates {
+            basket.add(item(template, *stat_id));
+        }
+        basket
+    }
+
+    /// 同一条词缀加两遍只算一条:交易站会把两格一样的筛选当成"这条要有两次",
+    /// 于是一件都搜不出来。
     #[test]
-    fn a_watch_draft_carries_the_filtered_search_the_label_and_the_sold_median() {
+    fn a_modifier_goes_into_the_basket_once() {
+        let mut basket = ModBasket::default();
+        assert!(basket.is_empty());
+        assert!(basket.add(item("+# to maximum Life", Some("explicit.a"))));
+        assert!(
+            !basket.add(item("+# to maximum Life", Some("explicit.a"))),
+            "第二遍不进去"
+        );
+        assert_eq!(basket.len(), 1);
+        assert!(basket.contains("explicit", "+# to maximum Life"));
+        assert!(
+            !basket.contains("implicit", "+# to maximum Life"),
+            "类型也是键的一部分"
+        );
+
+        assert!(basket.add(item("+#% to Fire Resistance", Some("explicit.b"))));
+        basket.remove(0);
+        assert_eq!(basket.len(), 1);
+        assert_eq!(basket.items[0].template, "+#% to Fire Resistance");
+        // 画面上那份行号可能比篮子旧一帧,越界就当没按过。
+        basket.remove(9);
+        assert_eq!(basket.len(), 1);
+
+        basket.clear();
+        assert!(basket.is_empty());
+        assert_eq!(basket.matching, StatMatch::All);
+    }
+
+    /// 查不到 id 的那一条照样进篮子(不然用户会以为按钮没反应),但拼查询的
+    /// 时候跳过 —— 拼进去就是一格空筛选。
+    #[test]
+    fn a_modifier_without_a_filter_id_stays_in_the_basket_but_out_of_the_query() {
+        let basket = basket(&[
+            ("+# to maximum Life", Some("explicit.a")),
+            ("+# to Spirit", None),
+        ]);
+        assert_eq!(basket.len(), 2);
+        assert_eq!(basket.stat_ids(), vec!["explicit.a".to_string()]);
+        assert!(basket.items[1].stat_id.is_none());
+    }
+
+    /// 默认要求**少一条**:装进篮子的都是"我认下的好词缀",而一件货身上很难
+    /// 全中 —— 差一条就搜不出来的筛选等于把篮子的意义抹掉。只有一条时
+    /// "至少一条"和"全都要"是同一件事。
+    #[test]
+    fn the_basket_asks_for_all_but_one_by_default() {
+        assert_eq!(ModBasket::default().default_matching(), StatMatch::All);
+        let one = basket(&[("+# to maximum Life", Some("explicit.a"))]);
+        assert_eq!(one.default_matching(), StatMatch::All);
+        assert_eq!(one.matching, StatMatch::All);
+
+        let four = basket(&[
+            ("a", Some("explicit.a")),
+            ("b", Some("explicit.b")),
+            ("c", Some("explicit.c")),
+            ("d", Some("explicit.d")),
+        ]);
+        assert_eq!(four.default_matching(), StatMatch::AtLeast(3));
+        assert_eq!(four.matching, StatMatch::AtLeast(3), "加完就跟着走");
+        assert_eq!(four.at_least_n(), 3);
+
+        // 那对 −/+ 夹在 1..=篮子条数 之间:比篮子还多的条数永远凑不齐。
+        let mut four = four;
+        four.set_at_least(9);
+        assert_eq!(four.matching, StatMatch::AtLeast(4));
+        four.set_at_least(0);
+        assert_eq!(four.matching, StatMatch::AtLeast(1));
+        // "全都要"那一档也要记得住 N,好让用户按回"至少 N 条"时落在原处。
+        four.set_at_least(2);
+        four.matching = StatMatch::All;
+        assert_eq!(four.at_least_n(), 3, "回到默认那个数,而不是 1");
+    }
+
+    /// 上限取篮子里**最低**的那个成交价中位:篮子是"随便中几条都算好货",
+    /// 而上限只有一个 —— 挑最低的,贵的那几条自然也在上限之内。
+    #[test]
+    fn the_basket_cap_is_the_lowest_sold_median() {
+        let mut basket = ModBasket::default();
+        let mut cheap = outcome("+# to maximum Life", "explicit", 30, 22, 20);
+        cheap.median_gone_price_milli = Some(8_000);
+        let mut dear = outcome("+#% to Fire Resistance", "explicit", 30, 22, 20);
+        dear.median_gone_price_milli = Some(30_000);
+        basket.add(BasketItem::from_outcome(&dear, Some("explicit.b".into())));
+        basket.add(BasketItem::from_outcome(&cheap, Some("explicit.a".into())));
+        assert_eq!(
+            basket.min_price_for_cap(),
+            Some((8_000, Currency::Exalted)),
+            "加进去的顺序不影响挑出来的那一个"
+        );
+
+        // 一条成交价都没有才退到在售价 —— 在售价是"卖不掉的人开的价"。
+        let mut unsold = ModBasket::default();
+        let mut a = outcome("a", "explicit", 30, 0, 0);
+        a.median_gone_price_milli = None;
+        a.median_active_price_milli = Some(25_000);
+        let mut b = outcome("b", "explicit", 30, 0, 0);
+        b.median_gone_price_milli = None;
+        b.median_active_price_milli = Some(19_000);
+        unsold.add(BasketItem::from_outcome(&a, Some("explicit.a".into())));
+        unsold.add(BasketItem::from_outcome(&b, Some("explicit.b".into())));
+        assert_eq!(
+            unsold.min_price_for_cap(),
+            Some((19_000, Currency::Exalted))
+        );
+        // 只要有**一条**卖掉过,就按成交价来 —— 哪怕它比别人的在售价高。
+        unsold.add(BasketItem::from_outcome(&dear, Some("explicit.c".into())));
+        assert_eq!(
+            unsold.min_price_for_cap(),
+            Some((30_000, Currency::Exalted))
+        );
+
+        // 两个中位价都没有的一篮子就把上限留空:凭空猜一个数出来,用户按下
+        // "新增"就是照着那个数在蹲。
+        let mut priceless = outcome("c", "explicit", 5, 0, 0);
+        priceless.median_gone_price_milli = None;
+        priceless.median_active_price_milli = None;
+        priceless.currency = String::new();
+        let mut nothing = ModBasket::default();
+        nothing.add(BasketItem::from_outcome(
+            &priceless,
+            Some("explicit.a".into()),
+        ));
+        assert_eq!(nothing.min_price_for_cap(), None);
+        assert_eq!(ModBasket::default().min_price_for_cap(), None);
+    }
+
+    /// 一键蹲价:一篮子词缀 + 这条观察自己的查询 = 一条能直接粘回交易站的搜索。
+    ///
+    /// 备注名写头一条词缀,后面还有几条就缀一个 `+K`:蹲价表那一列只有
+    /// 200 像素,四条词缀的全名怎么排都放不下。
+    #[test]
+    fn a_basket_draft_labels_the_first_modifier_and_counts_the_rest() {
         let settings = settings();
-        let observation = &settings.observations[0];
+        let mut basket = basket(&[
+            ("+#% to Lightning Resistance", Some("explicit.stat_167")),
+            ("+# to maximum Life", Some("explicit.stat_388")),
+            ("+#% to Fire Resistance", Some("explicit.stat_444")),
+        ]);
+        basket.items[0].sold_median = Some((12_500, Currency::Exalted));
+        basket.items[1].sold_median = Some((9_000, Currency::Exalted));
+        basket.items[2].sold_median = Some((30_000, Currency::Exalted));
+
+        let draft = watch_draft(&settings.observations[0], FIXTURE_QUERY, &basket);
+        assert_eq!(draft.league, "Forbidden Rites");
+        assert_eq!(
+            draft.label,
+            "Precursor Tablets · +#% to Lightning Resistance +2"
+        );
+        assert_eq!(draft.cap_milli, Some(9_000), "最低的那个成交价中位");
+        assert_eq!(draft.currency, "exalted");
+
+        // 搜索 id 解开之后:原来的查询,外加一组"三条里凑够两条"。
+        let query: serde_json::Value =
+            serde_json::from_str(&decode_search_id(&draft.search_id).expect("decode")).unwrap();
+        assert_eq!(query["name"], "Choir of the Storm", "原来的条件一个不能掉");
+        assert_eq!(
+            query["stats"][0],
+            serde_json::json!({ "type": "and", "filters": [] })
+        );
+        assert_eq!(query["stats"][1]["type"], "count");
+        assert_eq!(query["stats"][1]["value"], serde_json::json!({ "min": 2 }));
+        assert_eq!(
+            query["stats"][1]["filters"],
+            serde_json::json!([
+                { "id": "explicit.stat_167" },
+                { "id": "explicit.stat_388" },
+                { "id": "explicit.stat_444" }
+            ])
+        );
+    }
+
+    /// 篮子里只有一条时,备注名后面不缀数字,那一组也是"全都要" ——
+    /// 一条词缀的篮子就是原来那个"选中一条做成蹲价"。
+    #[test]
+    fn a_one_item_basket_reads_like_the_old_single_modifier_watch() {
+        let settings = settings();
+        let mut one = ModBasket::default();
         let mut row = outcome("+#% to Lightning Resistance", "explicit", 30, 22, 20);
         row.median_gone_price_milli = Some(12_500);
         row.median_active_price_milli = Some(20_000);
+        one.add(BasketItem::from_outcome(&row, Some("explicit.a".into())));
 
-        let draft = watch_draft(observation, FIXTURE_QUERY, &row, "explicit.stat_1671376347");
-        assert_eq!(draft.league, "Forbidden Rites");
+        let draft = watch_draft(&settings.observations[0], FIXTURE_QUERY, &one);
         assert_eq!(
             draft.label,
             "Precursor Tablets · +#% to Lightning Resistance"
         );
-        assert_eq!(draft.cap_milli, Some(12_500));
-        assert_eq!(draft.currency, "exalted");
-
-        // 搜索 id 解开之后,是原来的查询加上那一格词缀筛选。
+        assert_eq!(draft.cap_milli, Some(12_500), "成交价中位");
         let query: serde_json::Value =
             serde_json::from_str(&decode_search_id(&draft.search_id).expect("decode")).unwrap();
-        assert_eq!(query["name"], "Choir of the Storm");
         assert_eq!(
-            query["stats"][0]["filters"],
-            serde_json::json!([{ "id": "explicit.stat_1671376347" }])
+            query["stats"][1],
+            serde_json::json!({ "type": "and", "filters": [{ "id": "explicit.a" }] })
         );
-    }
 
-    /// 一条都还没卖掉的词缀没有成交价中位,退到在售价中位;两个都没有就
-    /// 把上限那一格留空 —— 猜一个数出来,用户按下新增就是照着它蹲。
-    #[test]
-    fn a_watch_draft_falls_back_to_the_asking_median_then_to_nothing() {
-        let settings = settings();
-        let observation = &settings.observations[0];
-        let mut unsold = outcome("+# to maximum Life", "explicit", 30, 0, 0);
+        // 一条都还没卖掉时退到在售价中位。
+        let mut unsold = row.clone();
         unsold.median_gone_price_milli = None;
+        let mut basket = ModBasket::default();
+        basket.add(BasketItem::from_outcome(&unsold, Some("explicit.a".into())));
         assert_eq!(
-            watch_draft(observation, FIXTURE_QUERY, &unsold, "explicit.a").cap_milli,
+            watch_draft(&settings.observations[0], FIXTURE_QUERY, &basket).cap_milli,
             Some(20_000)
         );
-
-        let mut priceless = unsold.clone();
-        priceless.median_active_price_milli = None;
-        priceless.currency = String::new();
-        let draft = watch_draft(observation, FIXTURE_QUERY, &priceless, "explicit.a");
-        assert_eq!(draft.cap_milli, None);
-        assert!(draft.currency.is_empty());
     }
 
     /// 长词缀要截断:备注名那一列只有 200 像素,而"观察名 · 一整句词缀"
@@ -2623,18 +3231,11 @@ mod observations_page_tests {
     #[test]
     fn a_watch_draft_label_keeps_the_template_short() {
         let settings = settings();
-        let long = outcome(
-            "#% increased Quantity of Items found in this Area and #% increased Rarity",
-            "explicit",
-            30,
-            22,
-            20,
-        );
+        let long = "#% increased Quantity of Items found in this Area and #% increased Rarity";
         let draft = watch_draft(
             &settings.observations[0],
             FIXTURE_QUERY,
-            &long,
-            "explicit.a",
+            &basket(&[(long, Some("explicit.a"))]),
         );
         let tail = draft
             .label
@@ -2642,7 +3243,29 @@ mod observations_page_tests {
             .expect("the observation name leads");
         assert_eq!(tail.chars().count(), DRAFT_TEMPLATE_CHARS);
         assert!(tail.ends_with('…'), "{tail}");
-        assert!(long.template.starts_with(tail.trim_end_matches('…')));
+        assert!(long.starts_with(tail.trim_end_matches('…')));
+    }
+
+    /// 换一条观察就把篮子倒空:词缀 id 是从**那一条**观察的挂单原文里翻出来的,
+    /// 而"上一条搜索攒的篮子"跟着过来,做出来的蹲价就是张冠李戴。
+    #[test]
+    fn changing_the_selected_observation_empties_the_basket() {
+        let (one, two) = (
+            ObservationId("o-1".to_string()),
+            ObservationId("o-2".to_string()),
+        );
+        let mut carried = basket(&[("+# to maximum Life", Some("explicit.a"))]);
+        // 还是同一条(重读一次库、翻回这一页)—— 篮子不该被倒掉。
+        retarget_basket(&mut carried, Some(&one), Some(&one));
+        assert_eq!(carried.len(), 1);
+
+        retarget_basket(&mut carried, Some(&one), Some(&two));
+        assert!(carried.is_empty(), "换了一条就空");
+
+        // 最后一条观察被删掉(没有选中的了)也一样。
+        let mut orphaned = basket(&[("+# to maximum Life", Some("explicit.a"))]);
+        retarget_basket(&mut orphaned, Some(&one), None);
+        assert!(orphaned.is_empty());
     }
 
     /// 类型下拉从库里长出来,而且交易站那七种都得有中文写法 ——

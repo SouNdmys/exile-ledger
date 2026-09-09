@@ -584,6 +584,30 @@ catalogue! {
     log_empty,
     /// "写到 {}"
     log_file_path,
+
+    // -- 市场观察页:词缀筛选篮 --
+    // 一条蹲价可以一次要好几条词缀:碑牌最多只带两条后缀,而认下的好后缀有
+    // 四条 —— 那种货天生就是"这四条里凑够两条",不是"这四条都要"。
+    /// 词缀那排按钮上的"把选中这条加进篮子"。
+    obs_basket_add,
+    /// "这个联赛收藏过、而且这份聚合里有的,全加进来"。
+    obs_basket_add_favourites,
+    obs_basket_title,
+    obs_basket_clear,
+    /// 篮子空着时那句话,同时是「做成蹲价」按不动的理由。
+    obs_basket_empty,
+    /// 篮子里那一条查不到交易站的筛选 id:留着给人看,但拼不进查询。
+    obs_basket_no_id,
+    /// 两档口径。"至少 {} 条"里的 `{}` 是那个数,`−`/`+` 改的就是它。
+    obs_basket_all,
+    obs_basket_at_least,
+    /// "已加入筛选篮:{}"
+    obs_basket_added,
+    /// "已把 {} 条收藏加入筛选篮。"
+    obs_basket_favourites_added,
+    /// 篮子里一条带 id 的都没有 —— 这么做出来的蹲价和原来那条搜索一模一样,
+    /// 所以宁可什么都不做,把话说清楚。
+    obs_basket_no_stat_ids,
 }
 
 /// 支持的语言码。设置里存的就是这两个字符串。
@@ -1020,6 +1044,18 @@ pub static ENGLISH: Text = Text {
     log_copied: "Log copied to the clipboard.",
     log_empty: "Nothing logged yet.",
     log_file_path: "written to {}",
+
+    obs_basket_add: "Add to basket",
+    obs_basket_add_favourites: "Add all favourites",
+    obs_basket_title: "Modifier basket",
+    obs_basket_clear: "Clear",
+    obs_basket_empty: "Add modifiers to the basket first.",
+    obs_basket_no_id: "no filter id",
+    obs_basket_all: "All of them",
+    obs_basket_at_least: "At least {}",
+    obs_basket_added: "Added to the basket: {}",
+    obs_basket_favourites_added: "Added {} favourites to the basket.",
+    obs_basket_no_stat_ids: "None of the modifiers in the basket has a filter id, so the watch would be the same search as the observation.",
 };
 
 pub static SIMPLIFIED_CHINESE: Text = Text {
@@ -1411,6 +1447,18 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     log_copied: "日志已复制到剪贴板。",
     log_empty: "还没有日志。",
     log_file_path: "写到 {}",
+
+    obs_basket_add: "加入筛选",
+    obs_basket_add_favourites: "收藏全部入篮",
+    obs_basket_title: "筛选篮",
+    obs_basket_clear: "清空",
+    obs_basket_empty: "先把词缀加入筛选篮",
+    obs_basket_no_id: "无筛选 id",
+    obs_basket_all: "全部都要",
+    obs_basket_at_least: "至少 {} 条",
+    obs_basket_added: "已加入筛选篮:{}",
+    obs_basket_favourites_added: "已把 {} 条收藏加入筛选篮。",
+    obs_basket_no_stat_ids: "篮子里一条带筛选 id 的词缀都没有,这么做出来的蹲价和原来那条搜索一模一样。",
 };
 
 #[cfg(test)]

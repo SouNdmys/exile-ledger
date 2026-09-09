@@ -343,6 +343,12 @@ pub struct AppShell {
     pub(crate) obs_price_mode: pnd_storage::PriceMode,
     /// 挂单流现在看的是哪一栏。
     pub(crate) obs_stream_tab: pages::observations::StreamTab,
+    /// 攒着"下一条蹲价要哪几条词缀"的篮子,跟着选中那条观察走
+    /// (换一条就倒空,见 [`pages::observations::retarget_basket`])。
+    ///
+    /// 不存进 `settings.json`:它是一次"挑词缀 → 做成蹲价"当中的草稿,
+    /// 做完就没用了,而真正要留下来的是做出来的那条蹲价。
+    pub(crate) obs_basket: pages::observations::ModBasket,
     /// 删除观察的按钮已经按过第一下了。删掉的东西找不回来,所以要按两下。
     pub(crate) obs_remove_armed: bool,
     /// 挂单流那块滚动区。
@@ -660,6 +666,7 @@ impl AppShell {
             obs_agg_tab: pages::observations::AggregateTab::default(),
             obs_price_mode: pnd_storage::PriceMode::default(),
             obs_stream_tab: pages::observations::StreamTab::default(),
+            obs_basket: pages::observations::ModBasket::default(),
             obs_remove_armed: false,
             obs_stream_scroll: ScrollHandle::new(),
             watches_form_load: None,
