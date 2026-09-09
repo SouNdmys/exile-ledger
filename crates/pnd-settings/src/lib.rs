@@ -577,8 +577,16 @@ impl SettingsStore {
 
     /// 同上,但根目录由调用方给 —— 测试因此永远不会碰到真的用户目录。
     pub fn release_default_from(local_app_data: &Path) -> Self {
+        Self::in_dir(&local_app_data.join(APP_DIR_NAME))
+    }
+
+    /// 数据目录由调用方给,文件名还归这里管。
+    ///
+    /// 给的是"老目录搬不动的那次启动":`pnd-app` 得把设置文件指回老目录,
+    /// 但 `settings.json` 这个名字不该在那边再写一遍。
+    pub fn in_dir(data_dir: &Path) -> Self {
         Self {
-            path: local_app_data.join(APP_DIR_NAME).join(SETTINGS_FILE_NAME),
+            path: data_dir.join(SETTINGS_FILE_NAME),
         }
     }
 

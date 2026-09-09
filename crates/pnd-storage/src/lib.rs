@@ -58,19 +58,54 @@ pub fn data_dir_migration(new_exists: bool, old_exists: bool) -> DataDirMigratio
     }
 }
 
-/// 真去搬一次。搬成了返回 `(老路径, 新路径)`,好让调用方记一行日志。
+/// 启动时那一次搬家到底怎么了。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataDirMove {
+    /// 搬过去了,这次启动用新目录。
+    Moved { old: PathBuf, new: PathBuf },
+    /// 没什么可搬的(全新安装,或者早就搬过了)。
+    NotNeeded,
+    /// 该搬,但改名失败了 —— 最常见的原因是老版本还开着,
+    /// 它把老目录里的两个 sqlite 和 `app.log` 占住了,而 Windows 不让
+    /// 改名一个还有人开着文件的文件夹。
+    Failed {
+        old: PathBuf,
+        new: PathBuf,
+        error: String,
+    },
+}
+
+/// 真去搬一次。
 ///
 /// **一次文件夹改名就够了**:`settings.json`、两个 sqlite、`app.log`、
 /// `panic.log`、登录窗那份 webview2 状态本来就都躺在这一个文件夹里,
 /// 所以它们是一起走的,没有"搬到一半"这种中间状态。
-pub fn migrate_data_dir() -> Option<(PathBuf, PathBuf)> {
+pub fn migrate_data_dir() -> DataDirMove {
     let new = default_data_dir();
     let old = legacy_data_dir();
     if data_dir_migration(new.exists(), old.exists()) != DataDirMigration::Rename {
-        return None;
+        return DataDirMove::NotNeeded;
     }
-    std::fs::rename(&old, &new).ok()?;
-    Some((old, new))
+    match std::fs::rename(&old, &new) {
+        Ok(()) => DataDirMove::Moved { old, new },
+        Err(error) => DataDirMove::Failed {
+            old,
+            new,
+            error: error.to_string(),
+        },
+    }
+}
+
+/// 搬完之后,这次启动该往哪个目录写。纯判定,不碰盘,所以测得起来。
+///
+/// 只有"该搬却没搬动"这一种情况回老目录:数据还在那儿,这次就直接在那儿跑,
+/// 顺带不把新目录建出来 —— 新目录一旦存在,下次启动就不会再试着搬了。
+#[must_use]
+pub fn data_dir_after(outcome: &DataDirMove) -> PathBuf {
+    match outcome {
+        DataDirMove::Failed { old, .. } => old.clone(),
+        DataDirMove::Moved { .. } | DataDirMove::NotNeeded => default_data_dir(),
+    }
 }
 
 /// 蹲价库。ninja 那个库是可以随手删的缓存,这个不是 —— 提醒历史只有这一份。
@@ -125,6 +160,33 @@ mod data_dir_tests {
     #[test]
     fn a_fresh_install_has_nothing_to_move() {
         assert_eq!(data_dir_migration(false, false), DataDirMigration::Leave);
+    }
+
+    /// 搬失败的那次启动**留在老目录里跑**。
+    ///
+    /// 老版本还开着的时候改名一定失败;这时候要是照旧用新目录,新目录就被
+    /// 设置和 sqlite 现建出来了 —— 搬家条件(新目录不存在)从此永远不成立,
+    /// 用户的会话、搜索列表、提醒历史就永远留在老目录里没人读,界面看着
+    /// 像一次全新安装。所以这一次先将就用老目录,下次启动再搬。
+    #[test]
+    fn a_failed_move_keeps_this_run_in_the_old_folder() {
+        let outcome = DataDirMove::Failed {
+            old: legacy_data_dir(),
+            new: default_data_dir(),
+            error: "文件正由另一进程使用".to_owned(),
+        };
+        assert_eq!(data_dir_after(&outcome), legacy_data_dir());
+    }
+
+    /// 搬成了、或者本来就没什么可搬的:都用新目录。
+    #[test]
+    fn every_other_outcome_uses_the_new_folder() {
+        assert_eq!(data_dir_after(&DataDirMove::NotNeeded), default_data_dir());
+        let moved = DataDirMove::Moved {
+            old: legacy_data_dir(),
+            new: default_data_dir(),
+        };
+        assert_eq!(data_dir_after(&moved), default_data_dir());
     }
 
     /// 两个目录只差最后那一段名字 —— 搬家搬的就是这一段。

@@ -8,12 +8,12 @@
 use std::path::PathBuf;
 
 /// `%LOCALAPPDATA%\ExileLedger\panic.log`:和两个数据库同一个目录,
-/// 所以 `EXILE_LEDGER_DATA_DIR` 也把它一起搬走。
+/// 所以 `EXILE_LEDGER_DATA_DIR`、以及"老目录没搬动"那次退回老目录,
+/// 都把它一起带走。
+///
+/// 路径是**崩的时候**才算的,不是装 hook 的时候 —— 装 hook 排在搬家之前。
 pub fn panic_log_path() -> PathBuf {
-    crate::redirect(
-        &pnd_storage::default_data_dir().join("panic.log"),
-        crate::DATA_DIR_ENV,
-    )
+    crate::data_dir().join("panic.log")
 }
 
 /// 一次 panic 一行:时间、版本、位置、消息。版本在最前面 —— 报告回来的

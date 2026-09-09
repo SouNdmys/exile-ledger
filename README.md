@@ -82,7 +82,11 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
 
 Everything the program writes lives in one folder: `%LOCALAPPDATA%\ExileLedger\`
 — settings, the two SQLite databases, the logs and the login window's browser
-profile. Delete that folder and you are back to a fresh install.
+profile. Delete that folder and you are back to a fresh install. The folder used
+to be called `PoeNinjaData`; the first new-version start renames it. **Quit the
+old version first** (tray icon → quit) — while it is running it holds those files
+open, Windows refuses to rename the folder, and this run falls back to the old
+folder (your data is all there) and retries the move on the next start.
 
 When something looks wrong, the **log** button in the top right opens a drawer
 with the live contents of `app.log`. If the window vanished instead, read
@@ -281,6 +285,12 @@ poe.ninja 自己会说,不用你每三个月回来改一次。
 
 程序改名之前这个文件夹叫 `PoeNinjaData`。第一次开新版本时它会自己整个改名搬过来,
 日志里会写一行 `data dir: moved …`;老数据一个字节都不用你手动搬。
+
+**第一次开新版本之前,先把老版本退干净**(通知区图标 → 退出程序)。老版本还开着的话
+它占着老文件夹里的两个 sqlite 和 `app.log`,Windows 不让改名一个还有人开着文件的
+文件夹,搬家就会失败 —— 这时候日志里写的是 `data dir: could not move …`,
+这一次启动直接就在老文件夹里跑(数据一样是全的),等你把老版本退掉、下次再开
+就自动搬过来了。
 
 | 文件 | 是什么 |
 | --- | --- |

@@ -433,6 +433,9 @@ impl AppShell {
         // 数据目录搬家(PoeNinjaData → ExileLedger)排在最前面,比读设置还早:
         // 只要有谁先开了新目录里的文件,新目录就存在了,搬家条件再也不成立,
         // 老数据就静默留在原地 —— 用户看到的是"我的搜索列表全没了"。
+        //
+        // 它同时定下这次启动用哪个目录(搬不动就留在老目录里跑),所以下面
+        // 每一句要路径的话都得排在它后面。
         if let Some(line) = crate::migrate_data_dir() {
             boot_log.push(line);
         }
