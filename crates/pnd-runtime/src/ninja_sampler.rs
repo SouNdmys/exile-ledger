@@ -1936,7 +1936,9 @@ mod ninja_sampler_tests {
     #[test]
     fn the_window_forgets_requests_older_than_an_hour() {
         let mut budget = HourlyBudget::new(100, Duration::from_secs(2));
-        let now = Instant::now();
+        // 锚点往未来挪一天:Windows 上 Instant 从开机计时,开机不到 62
+        // 分钟的机器直接减 3,700 秒会下溢 panic,往未来挪一天就永远够减。
+        let now = Instant::now() + Duration::from_secs(24 * 3_600);
         assert_eq!(budget.used(now), 0);
 
         // 两个是 61 分钟前发的(已经滚出去了),一个是 10 分钟前。
