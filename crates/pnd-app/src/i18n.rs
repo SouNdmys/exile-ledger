@@ -375,6 +375,15 @@ catalogue! {
     uniques_make_watch,
     /// 填完表单之后状态行上那句话。
     uniques_prefilled,
+    /// 把选中那件暗金的名字抄到剪贴板 —— 光看名字认不出是什么东西的时候,
+    /// 拿它去别处查(wiki、交易站的搜索框)总得先有这几个字。
+    uniques_copy_name,
+    /// 复制完了状态行上那句话。
+    uniques_name_copied,
+    /// 在浏览器里开一张已经填好这件暗金的交易站搜索页。
+    uniques_open_trade,
+    /// 设置里那个联赛还空着,交易站的搜索页地址就拼不出来。
+    uniques_no_league,
 
     // -- 词缀热度页 --
     mods_heading,
@@ -1091,6 +1100,10 @@ pub static ENGLISH: Text = Text {
     uniques_row_actions: "Selected unique",
     uniques_make_watch: "Make a watch",
     uniques_prefilled: "Filled in from that unique. Nothing has been added yet — check it over, then press Add.",
+    uniques_copy_name: "Copy name",
+    uniques_name_copied: "Name copied to the clipboard.",
+    uniques_open_trade: "Open on trade site",
+    uniques_no_league: "Fill in the league on the Settings page first — a trade search page needs one.",
 };
 
 pub static SIMPLIFIED_CHINESE: Text = Text {
@@ -1506,6 +1519,10 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     uniques_row_actions: "选中的暗金",
     uniques_make_watch: "做成蹲价",
     uniques_prefilled: "已按那件暗金填好表单。还没有新增任何东西 —— 检查一遍再按新增。",
+    uniques_copy_name: "复制名字",
+    uniques_name_copied: "名字已复制到剪贴板。",
+    uniques_open_trade: "去市集看",
+    uniques_no_league: "先去设置页填上联赛名 —— 交易站的搜索页地址里非有一个联赛不可。",
 };
 
 #[cfg(test)]

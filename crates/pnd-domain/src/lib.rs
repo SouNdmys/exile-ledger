@@ -18,5 +18,6 @@ pub use price::{
 pub use search_ref::{
     Game, SearchIdError, SearchRef, StatMatch, decode_search_id, default_label_for,
     encode_league_path, encode_search_id, live_page_url, parse_search_reference, search_page_url,
-    search_request_body, with_seller_filter, with_sort, with_stat_filter, with_stat_group,
+    search_request_body, unique_search_page_url, with_seller_filter, with_sort, with_stat_filter,
+    with_stat_group,
 };

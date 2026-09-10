@@ -22,6 +22,9 @@ use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// 交易站网页的根。两代同一个站,只有 marker 那一段不同。
+const TRADE_SITE_BASE: &str = "https://www.pathofexile.com";
+
 /// PoE2 搜索页 URL 里固定不变的那一段,靠它把联赛和 id 从任意写法的链接里切出来。
 const SEARCH_PATH_MARKER_POE2: &str = "/trade2/search/poe2/";
 
@@ -159,7 +162,7 @@ pub fn parse_search_reference(input: &str, default_league: &str) -> Option<Searc
 /// 搜索页地址。卡片上"打开交易页"按钮就是把这个丢给 `ShellExecuteW`。
 pub fn search_page_url(r: &SearchRef) -> String {
     format!(
-        "https://www.pathofexile.com{}{}/{}",
+        "{TRADE_SITE_BASE}{}{}/{}",
         r.game.search_path_marker(),
         encode_league_path(&r.league),
         r.search_id
@@ -171,13 +174,46 @@ pub fn live_page_url(r: &SearchRef) -> String {
     format!("{}/live", search_page_url(r))
 }
 
-/// 按 RFC 3986 的 unreserved 集合做百分号编码(空格 → `%20`)。
+/// 一件暗金 → 交易站上"已经替你填好这条搜索"的网页地址。
+///
+/// 和 [`search_page_url`] 走的是两条路:那一条要先有搜索 id(服务端存过、
+/// 或者本地压出来的),而这一条谁都不需要 —— 交易站的搜索页认一个
+/// `?q=<查询JSON>` 参数,poe.ninja 自己那些 "trade" 链接就是这么开的。
+/// 榜上随便点一件暗金就能开出它的行情页,不必先在本地造一条搜索。
+///
+/// 查询里只写名字,和一键蹲价那条(`unique_watch_draft`)是同一个口径:
+/// 底子名是 poe.ninja 那边的写法,多写一个对不上的条件就是零件。
+pub fn unique_search_page_url(game: Game, league: &str, name: &str) -> String {
+    // `json!` 的键会按字母重排(serde_json 的对象是有序表)—— 这里正好就是
+    // 交易站网页发出去的那个顺序,所以不必像蹲价那条一样手拼字符串。
+    let query = json!({
+        "query": { "name": name, "status": { "option": "online" } },
+        "sort": { "price": "asc" }
+    });
+    format!(
+        "{TRADE_SITE_BASE}{}{}?q={}",
+        game.search_path_marker(),
+        encode_league_path(league),
+        percent_encode_unreserved(&query.to_string())
+    )
+}
+
+/// 联赛名 → URL 里那一段。
 ///
 /// 不用 `+` 代空格:路径段里的 `+` 是字面加号,只有查询串才把 `+` 当空格。
 pub fn encode_league_path(league: &str) -> String {
+    percent_encode_unreserved(league)
+}
+
+/// 按 RFC 3986 的 unreserved 集合(`A-Z a-z 0-9 - _ . ~`)做百分号编码,
+/// 别的字节一律 `%XX`。
+///
+/// 这一套对路径段和查询值都成立,所以联赛名和那段查询 JSON 共用它:
+/// 少一套编码规则,就少一个"这里为什么和那里不一样"的坑。
+fn percent_encode_unreserved(value: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(league.len());
-    for b in league.bytes() {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
             out.push(b as char);
         } else {
@@ -715,6 +751,54 @@ mod search_ref_tests {
         let old: SearchRef =
             serde_json::from_str(r#"{"league":"Standard","search_id":"abcd1234"}"#).unwrap();
         assert_eq!(old.game, Game::Poe2);
+    }
+
+    /// `?q=` 那一段解回来是什么。测试专用:把百分号解码 + 解析 JSON 两步并了。
+    fn query_param_of(url: &str) -> Value {
+        let raw = url.split_once("?q=").expect("URL 上有 ?q=").1;
+        let json = percent_decode_plus(raw).expect("百分号编码是完整的");
+        serde_json::from_str(&json).expect("解出来是一段 JSON")
+    }
+
+    /// 交易站网页那条 `?q=<查询JSON>`:开出来的搜索页已经填好了这件暗金。
+    ///
+    /// 联赛名里的空格要编码,否则整条地址在 `Forbidden` 之后就断了。
+    #[test]
+    fn a_unique_gets_a_trade_search_url_with_the_query_already_filled_in() {
+        let url = unique_search_page_url(Game::Poe2, "Forbidden Rites", "Wake of Destruction");
+        assert!(
+            url.starts_with("https://www.pathofexile.com/trade2/search/poe2/Forbidden%20Rites?q="),
+            "{url}"
+        );
+        assert_eq!(
+            query_param_of(&url),
+            json!({
+                "query": { "name": "Wake of Destruction", "status": { "option": "online" } },
+                "sort": { "price": "asc" }
+            })
+        );
+    }
+
+    /// PoE1 的搜索页在另一条路径上,而且联赛前面**没有** `poe2/` 那一层。
+    #[test]
+    fn a_poe1_unique_url_drops_the_trade2_base_and_the_poe2_segment() {
+        let url = unique_search_page_url(Game::Poe1, "Standard", "Mageblood");
+        assert!(
+            url.starts_with("https://www.pathofexile.com/trade/search/Standard?q="),
+            "{url}"
+        );
+        assert_eq!(query_param_of(&url)["query"]["name"], "Mageblood");
+    }
+
+    /// 暗金名里的撇号(`Lavianga's Spirits`)必须原样走完一个来回。
+    ///
+    /// 这是最容易翻车的一格:撇号在 URL 里要编码,而它在 JSON 里又不用转义 ——
+    /// 哪一头搞错了,交易站收到的就是另一个名字,搜出来零件。
+    #[test]
+    fn an_apostrophe_in_the_name_survives_the_round_trip() {
+        let url = unique_search_page_url(Game::Poe2, "Forbidden Rites", "Lavianga's Spirits");
+        assert!(!url.contains('\''), "撇号在 URL 里得编码:{url}");
+        assert_eq!(query_param_of(&url)["query"]["name"], "Lavianga's Spirits");
     }
 
     #[test]

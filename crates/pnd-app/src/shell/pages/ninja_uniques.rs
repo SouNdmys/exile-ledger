@@ -8,13 +8,14 @@
 //! 穿着某件暗金 / 职业+技能)。换一个分区,占比的**分母也跟着换** ——
 //! "Deadeye 里有 41% 的人穿它"和"全联赛 11%"是两句不同的话。
 
-use gpui::{Context, ParentElement, SharedString, Styled, Window, div, px};
+use gpui::{ClipboardItem, Context, ParentElement, SharedString, Styled, Window, div, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::switch::Switch;
 use gpui_component::{Disableable as _, Selectable as _, Sizable as _, Size, StyledExt as _};
 use serde_json::Value;
 
-use pnd_domain::{Currency, CurrencyRates, Game, encode_search_id};
+use pnd_domain::{Currency, CurrencyRates, Game, encode_search_id, unique_search_page_url};
+use pnd_platform_win::open_url;
 use pnd_runtime::now_secs;
 
 use super::observations::WatchDraft;
@@ -627,10 +628,15 @@ impl AppShell {
             )
     }
 
-    /// 选中那件暗金能做的一件事:一键做成蹲价。
+    /// 选中那件暗金能做的三件事:复制名字、去交易站看行情、一键做成蹲价。
     ///
-    /// PoE1 上整条不出现:本地拼搜索 id 只对 PoE2 成立(PoE1 的 id 只有
-    /// 服务端发得出来),做出来的草稿粘到蹲价页也用不了 —— 同观察页那个
+    /// 前两件两代都有 —— 榜上只有一个名字,认不出那是什么东西的时候,
+    /// 要么把名字抄走自己去查,要么直接开一张填好的搜索页看看长什么样、
+    /// 现在卖多少。
+    ///
+    /// **一键蹲价那个按钮 PoE1 上不出现**:本地拼搜索 id 只对 PoE2 成立
+    /// (PoE1 的 id 只有服务端发得出来),做出来的草稿粘到蹲价页也用不了 ——
+    /// 同观察页那个
     /// [`make_watch_offered`](super::observations::make_watch_offered)。
     fn uniques_row_actions(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let text = self.text();
@@ -661,6 +667,22 @@ impl AppShell {
                     .text_size(fs(FS_11_5))
                     .text_color(c(TEXT_SECONDARY))
                     .child(SharedString::from(label)),
+            )
+            .child(
+                Button::new("uniques-copy-name")
+                    .label(text.uniques_copy_name)
+                    .with_size(Size::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.copy_unique_name(cx);
+                    })),
+            )
+            .child(
+                Button::new("uniques-open-trade")
+                    .label(text.uniques_open_trade)
+                    .with_size(Size::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_unique_on_trade(cx);
+                    })),
             )
             .children(offered.then(|| {
                 Button::new("uniques-make-watch")
@@ -715,6 +737,59 @@ impl AppShell {
         visible_rows(&self.ninja.uniques, self.uniques_view())
             .get(row)
             .map(|shown| shown.row.clone())
+    }
+
+    /// 把选中那件暗金的名字抄到剪贴板。
+    ///
+    /// 榜上给的只有一个名字,而"这到底是件什么东西"得拿这几个字去别处问 ——
+    /// 手抄一个 `Lavianga's Spirits` 是很容易抄错一个字母的活。走的是复制
+    /// 私聊那条同样的路([`AppShell::copy_whisper`]):写剪贴板 + 状态行说一声。
+    fn copy_unique_name(&mut self, cx: &mut Context<Self>) {
+        let text = self.text();
+        let Some(row) = self.selected_unique(cx) else {
+            self.set_notice(text.common_select_row.to_owned());
+            cx.notify();
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(row.name));
+        self.set_notice(text.uniques_name_copied.to_owned());
+        cx.notify();
+    }
+
+    /// 在浏览器里开一张已经填好这件暗金的交易站搜索页。
+    ///
+    /// 参考价那一列只是一个中位数,而"现在挂着的都长什么样、便宜的那几件
+    /// 差在哪"只有交易站答得出。查询是本地拼的(`?q=` 那一段),不占任何
+    /// 限速预算 —— 开出来之后是浏览器在跟交易站说话,不是这个程序。
+    ///
+    /// 联赛留空时不开:PoE1 的联赛名默认是空的("用当季挑战联赛"),而
+    /// 交易站的搜索页地址里非有一个联赛不可,拼出来的会是一条打不开的链接。
+    fn open_unique_on_trade(&mut self, cx: &mut Context<Self>) {
+        let text = self.text();
+        let Some(row) = self.selected_unique(cx) else {
+            self.set_notice(text.common_select_row.to_owned());
+            cx.notify();
+            return;
+        };
+        let game = self.ninja_game();
+        let league = ninja_league_name(&self.settings, game).to_owned();
+        if league.is_empty() {
+            self.set_notice(text.uniques_no_league.to_owned());
+            cx.notify();
+            return;
+        }
+        let url = unique_search_page_url(game, &league, &row.name);
+        match open_url(&url) {
+            Ok(()) => {
+                self.push_log(format!("opened {url}"));
+                self.set_notice(text.notice_opened_trade.to_owned());
+            }
+            Err(error) => {
+                self.push_log(format!("could not open {url}: {error}"));
+                self.set_notice(i18n::fill(text.notice_open_failed, &[&error.to_string()]));
+            }
+        }
+        cx.notify();
     }
 
     /// 一键蹲价:把选中那件暗金做成一份草稿,翻到蹲价页填进表单。
