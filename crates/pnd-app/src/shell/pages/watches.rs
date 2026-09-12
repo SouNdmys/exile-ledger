@@ -19,7 +19,10 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::switch::Switch;
 use gpui_component::{Sizable as _, Size, StyledExt as _};
 
-use pnd_domain::{Price, WatchId, decode_search_id, default_label_for, parse_search_reference};
+use pnd_domain::{
+    Price, SearchRef, WatchId, decode_search_id, default_label_for, parse_search_reference,
+    search_page_url,
+};
 use pnd_runtime::{LiveOffReason, LiveRunState, RuntimeCommand, WatchRunState, WatchStatus};
 use pnd_settings::{AppSettings, WatchEntry};
 use pnd_trade::{FETCH_POLICY, SEARCH_POLICY};
@@ -338,6 +341,20 @@ fn label_for(typed: &str, search_id: &str) -> String {
         .unwrap_or_else(|| search_id.chars().take(LABEL_FROM_ID_CHARS).collect())
 }
 
+/// 选中那条搜索在交易站上的那一页。
+///
+/// 拆成一个纯函数是为了能测:一条搜索记着自己是哪一代游戏,而两代的搜索页
+/// 在两条不同的路径上(`/trade2/search/poe2/…` 和 `/trade/search/…`),
+/// 联赛名里的空格还得编码 —— 哪一段拼错了,开出来都是一张 404,而按下按钮
+/// 的那一刻没人会回头核对地址栏。
+fn watch_trade_page_url(entry: &WatchEntry) -> String {
+    search_page_url(&SearchRef {
+        game: entry.game,
+        league: entry.league.clone(),
+        search_id: entry.search_id.clone(),
+    })
+}
+
 /// 表下面那一句"倒计时怎么突然变长了"。
 ///
 /// 为什么不写进状态那一格:那一列只有 430 像素,而这句话对每一条连上秒推的
@@ -547,7 +564,7 @@ impl AppShell {
             .children(is_editing.then(|| hint(text.watches_edit_search_locked)))
     }
 
-    /// 选中一行之后能对它做的四件事。
+    /// 选中一行之后能对它做的五件事。
     fn watches_row_actions(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let text = self.text();
         let selected = self.selected_watch(cx).cloned();
@@ -597,6 +614,14 @@ impl AppShell {
                     })),
             )
             .child(div().flex_grow())
+            .child(
+                Button::new("watch-open-trade")
+                    .label(text.common_open_trade_site)
+                    .with_size(Size::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_selected_watch_on_trade(cx);
+                    })),
+            )
             .child(
                 Button::new("watch-poll-now")
                     .label(text.watches_poll_now)
@@ -926,6 +951,19 @@ impl AppShell {
         cx.notify();
     }
 
+    /// 在浏览器里开选中那条搜索的交易站页面。
+    ///
+    /// 省掉的是"把 id 抄下来、拼一条地址、粘进浏览器"这一串手活。开出来之后
+    /// 是浏览器在跟交易站说话,不占这个程序的任何限速预算。
+    fn open_selected_watch_on_trade(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.selected_watch(cx).cloned() else {
+            self.select_a_row_first(cx);
+            return;
+        };
+        self.open_trade_url(&watch_trade_page_url(&entry));
+        cx.notify();
+    }
+
     fn select_a_row_first(&mut self, cx: &mut Context<Self>) {
         let text = self.text();
         self.set_notice(text.common_select_row.to_owned());
@@ -1109,6 +1147,29 @@ mod watches_page_tests {
         // 没跑过就没有上次轮询,也没有今日命中,这两格不能空着。
         assert_eq!(rows[1][4].text(), "never");
         assert_eq!(rows[1][5].text(), "—");
+    }
+
+    /// "去市集看"按钮开的是哪一条地址。
+    ///
+    /// 两代的搜索页在两条不同的路径上(`/trade2/search/poe2/…` 和
+    /// `/trade/search/…`),而联赛名里的空格非编码不可 —— 拼错任何一段,
+    /// 开出来就是一张 404,而按下按钮的那一刻没人会去核对地址栏。
+    #[test]
+    fn a_watch_turns_into_the_trade_page_for_its_own_game() {
+        let mut settings = settings();
+        settings.watches[0].search_id = "abcd1234".to_string();
+        assert_eq!(
+            watch_trade_page_url(&settings.watches[0]),
+            "https://www.pathofexile.com/trade2/search/poe2/Forbidden%20Rites/abcd1234"
+        );
+
+        settings.watches[0].game = pnd_domain::Game::Poe1;
+        settings.watches[0].league = "Standard".to_string();
+        settings.watches[0].search_id = "Rj3mL5Sw".to_string();
+        assert_eq!(
+            watch_trade_page_url(&settings.watches[0]),
+            "https://www.pathofexile.com/trade/search/Standard/Rj3mL5Sw"
+        );
     }
 
     /// 备注名留空时,名字从搜索自己身上取 —— `H4sIAAAAA` 认不出是什么东西。

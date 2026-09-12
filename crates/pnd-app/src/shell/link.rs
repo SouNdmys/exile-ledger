@@ -688,13 +688,22 @@ impl AppShell {
 
     /// 打开官方交易页。按价升序,想要那件在最上面。
     pub(crate) fn open_trade_page(&mut self, game: Game, league: &str, search_id: &str) {
-        let text = self.text();
         let url = search_page_url(&SearchRef {
             game,
             league: league.to_owned(),
             search_id: search_id.to_owned(),
         });
-        match open_url(&url) {
+        self.open_trade_url(&url);
+    }
+
+    /// 把一条已经拼好的交易站地址交给默认浏览器,结果说在状态行上。
+    ///
+    /// 单拎出来是因为"这一条地址怎么来的"每一页不一样(卡片按的是提醒里那条
+    /// 搜索,蹲价页和市场观察页按的是选中那一行),而"开不开得起来、开不起来
+    /// 怎么说"三处必须一模一样。
+    pub(crate) fn open_trade_url(&mut self, url: &str) {
+        let text = self.text();
+        match open_url(url) {
             Ok(()) => {
                 self.push_log(format!("opened {url}"));
                 self.set_notice(text.notice_opened_trade.to_owned());

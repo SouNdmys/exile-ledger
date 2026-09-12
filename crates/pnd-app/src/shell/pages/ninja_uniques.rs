@@ -678,7 +678,7 @@ impl AppShell {
             )
             .child(
                 Button::new("uniques-open-trade")
-                    .label(text.uniques_open_trade)
+                    .label(text.common_open_trade_site)
                     .with_size(Size::Small)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.open_unique_on_trade(cx);

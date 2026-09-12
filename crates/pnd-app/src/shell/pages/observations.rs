@@ -35,8 +35,8 @@ use gpui_component::{Disableable as _, Selectable as _, Sizable as _, Size, Styl
 
 use pnd_domain::{
     Currency, CurrencyRates, Game, GoneClass, ObservationId, Price, PriceBucket, RateSource,
-    RateSources, SUB_DIVINE_BUCKET_MILLI, StatMatch, decode_search_id, default_label_for,
-    encode_search_id, parse_search_reference, with_stat_group,
+    RateSources, SUB_DIVINE_BUCKET_MILLI, SearchRef, StatMatch, decode_search_id,
+    default_label_for, encode_search_id, parse_search_reference, search_page_url, with_stat_group,
 };
 use pnd_runtime::{LiveRunState, ObservationStatus, RuntimeCommand, now_secs};
 use pnd_settings::{AppSettings, ObservationEntry};
@@ -366,6 +366,16 @@ pub fn observation_rows(
 #[must_use]
 pub fn make_watch_offered(entry: Option<&ObservationEntry>) -> bool {
     entry.is_none_or(|entry| entry.game == Game::Poe2)
+}
+
+/// 选中那条观察在交易站上的那一页。理由同蹲价页的 `watch_trade_page_url`:
+/// 两代的搜索页在两条不同的路径上,联赛名还得编码,所以这一段值得单独测。
+fn observation_trade_page_url(entry: &ObservationEntry) -> String {
+    search_page_url(&SearchRef {
+        game: entry.game,
+        league: entry.league.clone(),
+        search_id: entry.search_id.clone(),
+    })
 }
 
 /// 计数那两格。"—" 只留给"还没有状态可说";已经在跑却一条都没记下来是个
@@ -1518,7 +1528,7 @@ impl AppShell {
             .children(is_editing.then(|| hint(text.obs_edit_search_locked)))
     }
 
-    /// 选中一行之后能对它做的三件事。
+    /// 选中一行之后能对它做的四件事。
     ///
     /// 删除要按两下:一条观察攒的全部结论就在那几张表里,删掉不留任何东西
     /// ([`pnd_storage::WatchStore::delete_observation`]),手滑一下没法撤销。
@@ -1560,6 +1570,14 @@ impl AppShell {
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
                         let checked = *checked;
                         this.update_selected_observation(cx, |entry| entry.enabled = checked);
+                    })),
+            )
+            .child(
+                Button::new("obs-open-trade")
+                    .label(text.common_open_trade_site)
+                    .with_size(Size::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_selected_observation_on_trade(cx);
                     })),
             )
             .child(
@@ -1999,6 +2017,20 @@ impl AppShell {
             self.observations_form.enabled = self.settings.observations[index].enabled;
         }
         self.observations_dirty = true;
+        cx.notify();
+    }
+
+    /// 在浏览器里开选中那条观察的交易站页面。
+    ///
+    /// 聚合表给的是"这一类货卖得怎么样"的结论,而"现在挂着的都长什么样"
+    /// 只有交易站答得出。同蹲价页那一颗按钮:开出来之后是浏览器在跟交易站
+    /// 说话,不占这个程序的限速预算。
+    fn open_selected_observation_on_trade(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.selected_observation(cx).cloned() else {
+            self.select_an_observation_first(cx);
+            return;
+        };
+        self.open_trade_url(&observation_trade_page_url(&entry));
         cx.notify();
     }
 
@@ -2536,6 +2568,26 @@ mod observations_page_tests {
         let mut poe1 = settings.observations[0].clone();
         poe1.game = pnd_domain::Game::Poe1;
         assert!(!make_watch_offered(Some(&poe1)));
+    }
+
+    /// "去市集看"按钮开的是哪一条地址,理由同蹲价页那一条:两代的搜索页在
+    /// 两条不同的路径上,而联赛名里的空格非编码不可。
+    #[test]
+    fn an_observation_turns_into_the_trade_page_for_its_own_game() {
+        let mut settings = settings();
+        settings.observations[0].search_id = "abcd1234".to_string();
+        assert_eq!(
+            observation_trade_page_url(&settings.observations[0]),
+            "https://www.pathofexile.com/trade2/search/poe2/Forbidden%20Rites/abcd1234"
+        );
+
+        settings.observations[0].game = pnd_domain::Game::Poe1;
+        settings.observations[0].league = "Standard".to_string();
+        settings.observations[0].search_id = "Rj3mL5Sw".to_string();
+        assert_eq!(
+            observation_trade_page_url(&settings.observations[0]),
+            "https://www.pathofexile.com/trade/search/Standard/Rj3mL5Sw"
+        );
     }
 
     fn status() -> BTreeMap<ObservationId, ObservationStatus> {

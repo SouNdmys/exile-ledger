@@ -67,6 +67,9 @@ catalogue! {
     common_currency_chaos,
     /// 表格上的动作按钮作用在选中的那一行,没选中就说这一句。
     common_select_row,
+    /// 在浏览器里开一张交易站的搜索页。三页共用一句:暗金热度页开的是
+    /// 那件暗金,蹲价页和市场观察页开的是选中那条搜索自己。
+    common_open_trade_site,
     /// 两张热度榜上那个"连冷门的也铺出来"开关。
     common_show_all,
     /// "已隐藏 {} 条占比不足 {} 的" —— 藏了东西必须说出来。
@@ -380,8 +383,6 @@ catalogue! {
     uniques_copy_name,
     /// 复制完了状态行上那句话。
     uniques_name_copied,
-    /// 在浏览器里开一张已经填好这件暗金的交易站搜索页。
-    uniques_open_trade,
     /// 设置里那个联赛还空着,交易站的搜索页地址就拼不出来。
     uniques_no_league,
 
@@ -714,6 +715,7 @@ pub static ENGLISH: Text = Text {
     common_currency_exalted: "ex",
     common_currency_chaos: "chaos",
     common_select_row: "Select a row first.",
+    common_open_trade_site: "Open on trade site",
     common_show_all: "Show all",
     common_hidden_rows: "{} rows below {} hidden",
     common_age_just_now: "just now",
@@ -1102,7 +1104,6 @@ pub static ENGLISH: Text = Text {
     uniques_prefilled: "Filled in from that unique. Nothing has been added yet — check it over, then press Add.",
     uniques_copy_name: "Copy name",
     uniques_name_copied: "Name copied to the clipboard.",
-    uniques_open_trade: "Open on trade site",
     uniques_no_league: "Fill in the league on the Settings page first — a trade search page needs one.",
 };
 
@@ -1133,6 +1134,7 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     common_currency_exalted: "ex",
     common_currency_chaos: "chaos",
     common_select_row: "先在表里选中一行。",
+    common_open_trade_site: "去市集看",
     common_show_all: "显示全部",
     common_hidden_rows: "已隐藏 {} 条占比不足 {} 的",
     common_age_just_now: "刚刚",
@@ -1521,7 +1523,6 @@ pub static SIMPLIFIED_CHINESE: Text = Text {
     uniques_prefilled: "已按那件暗金填好表单。还没有新增任何东西 —— 检查一遍再按新增。",
     uniques_copy_name: "复制名字",
     uniques_name_copied: "名字已复制到剪贴板。",
-    uniques_open_trade: "去市集看",
     uniques_no_league: "先去设置页填上联赛名 —— 交易站的搜索页地址里非有一个联赛不可。",
 };
 
